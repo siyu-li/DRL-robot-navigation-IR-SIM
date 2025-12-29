@@ -2,6 +2,9 @@ import irsim
 import numpy as np
 import random
 import torch
+import logging
+# Suppress IRSim warnings
+logging.getLogger('irsim').setLevel(logging.ERROR)
 
 from robot_nav.SIM_ENV.sim_env import SIM_ENV
 
@@ -164,10 +167,15 @@ class MARL_SIM(SIM_ENV):
 
             if combined_weights is not None:
                 i_weights = combined_weights[i].tolist()
+                weight_idx = 0  # Index for accessing i_weights (excluding self)
 
             for j in range(self.num_robots):
                 if combined_weights is not None:
-                    weight = i_weights[j]
+                    if i == j:
+                        # Skip self-connection (no weight for i->i)
+                        continue
+                    weight = i_weights[weight_idx]
+                    weight_idx += 1
                     # else:
                     #     weight = 1
                     other_robot_state = self.env.robot_list[j].state
@@ -177,9 +185,9 @@ class MARL_SIM(SIM_ENV):
                     ]
                     rx = [position[0], other_pos[0]]
                     ry = [position[1], other_pos[1]]
-                    self.env.draw_trajectory(
-                        np.array([rx, ry]), refresh=True, linewidth=weight * 2
-                    )
+                    # self.env.draw_trajectory(
+                    #     np.array([rx, ry]), refresh=True, linewidth=weight * 2
+                    # )
 
             if goal:
                 self.env.robot_list[i].set_random_goal(

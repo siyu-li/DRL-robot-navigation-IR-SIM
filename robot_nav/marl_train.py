@@ -4,8 +4,12 @@ from robot_nav.models.MARL.marlTD3.marlTD3 import TD3
 
 import torch
 import numpy as np
+import logging
 from robot_nav.SIM_ENV.marl_sim import MARL_SIM
 from utils import get_buffer
+
+# Suppress IRSim warnings
+logging.getLogger('irsim').setLevel(logging.ERROR)
 
 
 def outside_of_bounds(poses):
@@ -38,7 +42,7 @@ def main(args=None):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # using cuda if it is available, cpu otherwise
-    max_epochs = 160  # max number of epochs
+    max_epochs = 10000  # max number of epochs
     epoch = 1  # starting epoch number
     episode = 0  # starting episode number
     train_every_n = 10  # train and update network parameters every n episodes
@@ -71,7 +75,7 @@ def main(args=None):
         model_name="TDR-MARL-train",
         load_model_name="saved_model",
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
-        attention="iga",
+        attention="g2anet",
     )  # instantiate a model
 
     # ---- Setup replay buffer and initial connections ----

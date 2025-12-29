@@ -311,11 +311,11 @@ def main(args=None):
     max_steps = 600  # maximum number of steps in single episode
     steps = 0  # starting step number
     save_every = 5  # save the model every n training cycles
-    test_scenarios = 100
+    test_scenarios = 10  # reduced for visual observation (change back to 100 for full test)
 
     # ---- Instantiate simulation environment and model ----
     sim = SINGLE_SIM(
-        world_file="worlds/circle_world.yaml", disable_plotting=True, reward_phase=2
+        world_file="worlds/circle_world.yaml", disable_plotting=False, reward_phase=2
     )  # instantiate environment
 
     model = TD3(
@@ -329,7 +329,7 @@ def main(args=None):
         model_name="TDR-MARL-test",
         load_model_name="TDR-MARL-train",
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
-        attention="igs",
+        attention="g2anet",
     )  # instantiate a model
 
     connections = torch.tensor(
