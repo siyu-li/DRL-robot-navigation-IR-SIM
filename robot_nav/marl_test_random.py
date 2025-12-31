@@ -3,12 +3,12 @@ from pathlib import Path
 
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from robot_nav.models.MARL.marlTD3.marlTD3 import TD3
-
+# from robot_nav.models.MARL.marlTD3.marlTD3 import TD3
+from robot_nav.models.MARL.marlTD3.marlTD3_centralized import marlTD3_centralized as TD3
 import torch
 import numpy as np
-from robot_nav.SIM_ENV.marl_sim import MARL_SIM
-
+# from robot_nav.SIM_ENV.marl_sim import MARL_SIM
+from robot_nav.SIM_ENV.marl_centralized_sim import MARL_SIM
 
 def outside_of_bounds(poses):
     """
@@ -34,7 +34,8 @@ def main(args=None):
     """Main training function"""
 
     # ---- Hyperparameters and setup ----
-    action_dim = 2  # number of actions produced by the model
+    # action_dim = 2  # number of actions produced by the model
+    joint_action_dim = 8
     max_action = 1  # maximum absolute value of output actions
     state_dim = 11  # number of input values in the neural network (vector length of state input)
     device = torch.device(
@@ -56,16 +57,18 @@ def main(args=None):
 
     model = TD3(
         state_dim=state_dim,
-        action_dim=action_dim,
+        joint_action_dim=joint_action_dim,
         max_action=max_action,
         num_robots=sim.num_robots,
         device=device,
         save_every=save_every,
         load_model=True,
-        model_name="TDR-MARL-test",
-        load_model_name="TDR-MARL-train",
+        # model_name="TDR-MARL-test",
+        # load_model_name="TDR-MARL-train",
+        model_name="TDR-MARL-centralized-test",
+        load_model_name="TDR-MARL-centralized-train",
         # load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/centralized/checkpoint"),  # Alternate path
+        load_directory=Path("robot_nav/models/MARL/marlTD3_centralized/checkpoint"),  # Alternate path
         attention="g2anet",
     )  # instantiate a model
 
@@ -74,7 +77,7 @@ def main(args=None):
     )
 
     # ---- Take initial step in environment ----
-    poses, distance, cos, sin, collision, goal, a, reward, positions, goal_positions = (
+    poses, distance, cos, sin, collision, goal, a, reward, positions, goal_positions, episode_done = (
         sim.step([[0, 0] for _ in range(sim.num_robots)], connections)
     )  # get the initial step state
     running_goals = 0
@@ -91,7 +94,7 @@ def main(args=None):
     epsilon = 1e-6
     pbar = tqdm(total=test_scenarios)
     while episode < test_scenarios:
-        state, terminal = model.prepare_state(
+        state = model.prepare_state(
             poses, distance, cos, sin, collision, a, goal_positions
         )
         action, connection, combined_weights = model.get_action(
@@ -129,6 +132,7 @@ def main(args=None):
             reward,
             positions,
             goal_positions,
+            episode_done
         ) = sim.step(
             a_in, connection, combined_weights
         )  # get data from the environment
