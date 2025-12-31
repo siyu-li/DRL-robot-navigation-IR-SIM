@@ -12,3 +12,4 @@
 /robot_nav/models/RCPG/__pycache__
 /robot_nav/SIM_ENV/__pycache__
 robot_nav/.DS_Store
+*.pth

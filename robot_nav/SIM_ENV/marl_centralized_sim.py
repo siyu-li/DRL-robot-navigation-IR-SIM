@@ -306,7 +306,7 @@ class MARL_SIM(SIM_ENV):
         con = torch.tensor(
             [[0.0 for _ in range(self.num_robots - 1)] for _ in range(self.num_robots)]
         )
-        poses, distance, cos, sin, _, _, action, reward, positions, goal_positions = (
+        poses, distance, cos, sin, _, _, action, reward, positions, goal_positions, _ = (
             self.step(action, con)
         )
         return (

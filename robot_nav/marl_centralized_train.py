@@ -1,15 +1,17 @@
+import logging
+
+# Suppress IRSim warnings - irsim uses loguru, not standard logging
+from loguru import logger
+logger.disable("irsim")
+
 from pathlib import Path
 
-from robot_nav.models.MARL.marlTD3.marlTD3 import TD3
+from robot_nav.models.MARL.marlTD3.marlTD3_centralized import marlTD3_centralized as TD3
 
 import torch
 import numpy as np
-import logging
-from robot_nav.SIM_ENV.marl_sim import MARL_SIM
-from utils import get_buffer
-
-# Suppress IRSim warnings
-logging.getLogger('irsim').setLevel(logging.ERROR)
+from robot_nav.SIM_ENV.marl_centralized_sim import MARL_SIM
+from robot_nav.utils import get_buffer
 
 
 def outside_of_bounds(poses):
@@ -42,7 +44,7 @@ def main(args=None):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # using cuda if it is available, cpu otherwise
-    max_epochs = 10000  # max number of epochs
+    max_epochs = 50000  # max number of epochs
     epoch = 1  # starting epoch number
     episode = 0  # starting episode number
     train_every_n = 10  # train and update network parameters every n episodes
@@ -59,20 +61,20 @@ def main(args=None):
 
     # ---- Instantiate simulation environment and model ----
     sim = MARL_SIM(
-        world_file="worlds/multi_robot_world.yaml",
+        world_file="robot_nav/worlds/multi_robot_world.yaml",
         disable_plotting=True,
         reward_phase=1,
     )  # instantiate environment
 
     model = TD3(
         state_dim=state_dim,
-        action_dim=action_dim,
+        joint_action_dim=action_dim * sim.num_robots,
         max_action=max_action,
         num_robots=sim.num_robots,
         device=device,
         save_every=save_every,
         load_model=False,
-        model_name="TDR-MARL-train",
+        model_name="TDR-MARL-centralized-train",
         load_model_name="saved_model",
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
         attention="g2anet",
