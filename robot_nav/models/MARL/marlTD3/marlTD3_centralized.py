@@ -131,6 +131,10 @@ class marlTD3_centralized(object):
         load_model_name=None,
         load_directory=Path("robot_nav/models/MARL/marlTD3_centralized/checkpoint"),
         attention="g2anet",
+        load_pretrained_attention=False,
+        pretrained_attention_model_name=None,
+        pretrained_attention_directory=None,
+        freeze_attention=False,
     ):
         # Initialize the Actor network
         if attention not in ["igs", "g2anet"]:
@@ -170,6 +174,25 @@ class marlTD3_centralized(object):
             load_model_name = model_name
         if load_model:
             self.load(filename=load_model_name, directory=load_directory)
+        
+        # Load pretrained attention weights from decentralized model
+        if load_pretrained_attention:
+            if pretrained_attention_model_name is None:
+                raise ValueError(
+                    "pretrained_attention_model_name must be provided when "
+                    "load_pretrained_attention=True"
+                )
+            if pretrained_attention_directory is None:
+                raise ValueError(
+                    "pretrained_attention_directory must be provided when "
+                    "load_pretrained_attention=True"
+                )
+            self.load_pretrained_attention(
+                filename=pretrained_attention_model_name,
+                directory=pretrained_attention_directory,
+                freeze_attention=freeze_attention,
+            )
+        
         self.save_every = save_every
         self.model_name = model_name
         self.save_directory = save_directory
@@ -444,25 +467,49 @@ class marlTD3_centralized(object):
         if self.save_every > 0 and self.iter_count % self.save_every == 0:
             self.save(filename=self.model_name, directory=self.save_directory)
 
-    def save(self, filename, directory):
+    def save(self, filename, directory, epoch=None):
         """
         Saves the current model parameters to the specified directory.
 
         Args:
             filename (str): Base filename for saved files.
             directory (Path): Path to save the model files.
+            epoch (int, optional): If provided, appends epoch number to filename
+                for versioned checkpoints (e.g., "model_epoch_2000_actor.pth").
         """
         Path(directory).mkdir(parents=True, exist_ok=True)
-        torch.save(self.actor.state_dict(), "%s/%s_actor.pth" % (directory, filename))
+        
+        # Create versioned filename if epoch is provided
+        if epoch is not None:
+            save_name = f"{filename}_epoch_{epoch}"
+        else:
+            save_name = filename
+            
+        torch.save(self.actor.state_dict(), "%s/%s_actor.pth" % (directory, save_name))
         torch.save(
             self.actor_target.state_dict(),
-            "%s/%s_actor_target.pth" % (directory, filename),
+            "%s/%s_actor_target.pth" % (directory, save_name),
         )
-        torch.save(self.critic.state_dict(), "%s/%s_critic.pth" % (directory, filename))
+        torch.save(self.critic.state_dict(), "%s/%s_critic.pth" % (directory, save_name))
         torch.save(
             self.critic_target.state_dict(),
-            "%s/%s_critic_target.pth" % (directory, filename),
+            "%s/%s_critic_target.pth" % (directory, save_name),
         )
+        
+        if epoch is not None:
+            print(f"Saved checkpoint at epoch {epoch} to: {directory}/{save_name}")
+
+    def save_checkpoint(self, epoch):
+        """
+        Save a versioned checkpoint with the epoch number in the filename.
+        
+        This creates separate checkpoint files that won't be overwritten,
+        useful for saving milestones during training.
+        
+        Args:
+            epoch (int): Current epoch number to include in filename.
+        """
+        self.save(filename=self.model_name, directory=self.save_directory, epoch=epoch)
 
     def load(self, filename, directory):
         """
@@ -485,6 +532,128 @@ class marlTD3_centralized(object):
             torch.load("%s/%s_critic_target.pth" % (directory, filename))
         )
         print(f"Loaded weights from: {directory}")
+
+    def load_pretrained_attention(self, filename, directory, freeze_attention=False):
+        """
+        Load pretrained attention network weights from a decentralized MARL model.
+
+        This method loads only the attention module weights from a pretrained
+        decentralized marlTD3 model into the centralized actor and critic networks.
+        The policy head and critic Q-network layers are left with their current
+        (randomly initialized) weights.
+
+        Args:
+            filename (str): Base filename for the pretrained model files
+                (e.g., "TDR-MARL-train").
+            directory (Path or str): Path to the directory containing the
+                pretrained model files.
+            freeze_attention (bool, optional): If True, freezes the attention
+                network parameters so they are not updated during training.
+                Defaults to False.
+
+        Example:
+            >>> model.load_pretrained_attention(
+            ...     filename="TDR-MARL-train",
+            ...     directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
+            ...     freeze_attention=True
+            ... )
+        """
+        # Load pretrained actor state dict (from decentralized model)
+        pretrained_actor_path = "%s/%s_actor.pth" % (directory, filename)
+        pretrained_actor_state = torch.load(
+            pretrained_actor_path, map_location=self.device
+        )
+
+        # Load pretrained critic state dict (from decentralized model)
+        pretrained_critic_path = "%s/%s_critic.pth" % (directory, filename)
+        pretrained_critic_state = torch.load(
+            pretrained_critic_path, map_location=self.device
+        )
+
+        # Extract only attention-related keys from actor
+        attention_keys_actor = {
+            k: v for k, v in pretrained_actor_state.items() if k.startswith("attention.")
+        }
+
+        # Extract only attention-related keys from critic
+        attention_keys_critic = {
+            k: v for k, v in pretrained_critic_state.items() if k.startswith("attention.")
+        }
+
+        # Load attention weights into actor
+        actor_state = self.actor.state_dict()
+        actor_state.update(attention_keys_actor)
+        self.actor.load_state_dict(actor_state)
+
+        # Load attention weights into actor_target
+        actor_target_state = self.actor_target.state_dict()
+        actor_target_state.update(attention_keys_actor)
+        self.actor_target.load_state_dict(actor_target_state)
+
+        # Load attention weights into critic
+        critic_state = self.critic.state_dict()
+        critic_state.update(attention_keys_critic)
+        self.critic.load_state_dict(critic_state)
+
+        # Load attention weights into critic_target
+        critic_target_state = self.critic_target.state_dict()
+        critic_target_state.update(attention_keys_critic)
+        self.critic_target.load_state_dict(critic_target_state)
+
+        print(f"Loaded pretrained attention weights from: {directory}/{filename}")
+        print(f"  Actor attention keys loaded: {len(attention_keys_actor)}")
+        print(f"  Critic attention keys loaded: {len(attention_keys_critic)}")
+
+        # Optionally freeze attention parameters
+        if freeze_attention:
+            self._freeze_attention_parameters()
+            print("  Attention parameters frozen (will not be updated during training)")
+
+    def _freeze_attention_parameters(self):
+        """
+        Freeze attention network parameters to prevent updates during training.
+
+        This is useful when you want to use pretrained attention weights and
+        only train the policy head and critic Q-networks.
+        """
+        for param in self.actor.attention.parameters():
+            param.requires_grad = False
+        for param in self.actor_target.attention.parameters():
+            param.requires_grad = False
+        for param in self.critic.attention.parameters():
+            param.requires_grad = False
+        for param in self.critic_target.attention.parameters():
+            param.requires_grad = False
+
+        # Update optimizer to only include trainable parameters
+        self.attn_params = []  # Clear attention params from optimizer
+        self.actor_optimizer = torch.optim.Adam(
+            self.policy_params, lr=self.actor_optimizer.defaults['lr']
+        )
+
+    def unfreeze_attention_parameters(self):
+        """
+        Unfreeze attention network parameters to allow updates during training.
+
+        Call this after initially training with frozen attention if you want to
+        fine-tune the full model.
+        """
+        for param in self.actor.attention.parameters():
+            param.requires_grad = True
+        for param in self.actor_target.attention.parameters():
+            param.requires_grad = True
+        for param in self.critic.attention.parameters():
+            param.requires_grad = True
+        for param in self.critic_target.attention.parameters():
+            param.requires_grad = True
+
+        # Update optimizer to include attention parameters again
+        self.attn_params = list(self.actor.attention.parameters())
+        self.actor_optimizer = torch.optim.Adam(
+            self.policy_params + self.attn_params,
+            lr=self.actor_optimizer.defaults['lr']
+        )
+        print("Attention parameters unfrozen (will be updated during training)")
 
     def prepare_state(
         self, poses, distance, cos, sin, collision, action, goal_positions

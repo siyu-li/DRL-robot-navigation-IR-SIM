@@ -44,7 +44,7 @@ def main(args=None):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # using cuda if it is available, cpu otherwise
-    max_epochs = 50000  # max number of epochs
+    max_epochs = 10000  # max number of epochs
     epoch = 1  # starting epoch number
     episode = 0  # starting episode number
     train_every_n = 10  # train and update network parameters every n episodes
@@ -57,7 +57,8 @@ def main(args=None):
     pretraining_iterations = (
         10  # number of training iterations to run during pre-training
     )
-    save_every = 5  # save the model every n training cycles
+    save_every = 5  # save the model every n training cycles (overwrites previous)
+    checkpoint_every = 2000  # save versioned checkpoint every n epochs (keeps all)
 
     # ---- Instantiate simulation environment and model ----
     sim = MARL_SIM(
@@ -78,6 +79,11 @@ def main(args=None):
         load_model_name="saved_model",
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
         attention="g2anet",
+        # Load pretrained attention weights from decentralized model
+        load_pretrained_attention=True,
+        pretrained_attention_model_name="TDR-MARL-train",
+        pretrained_attention_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
+        freeze_attention=True,  # Set to True to freeze attention during training
     )  # instantiate a model
 
     # ---- Setup replay buffer and initial connections ----
@@ -174,6 +180,10 @@ def main(args=None):
                     iterations=training_iterations,
                     batch_size=batch_size,
                 )  # train the model and update its parameters
+                
+                # Save versioned checkpoint every checkpoint_every epochs
+                if epoch % checkpoint_every == 0:
+                    model.save_checkpoint(epoch)
 
             steps = 0
         else:
