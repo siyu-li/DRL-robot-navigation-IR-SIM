@@ -49,7 +49,7 @@ def main(args=None):
 
     # ---- Instantiate simulation environment and model ----
     sim = MARL_SIM(
-        world_file="worlds/multi_robot_world.yaml",
+        world_file="robot_nav/worlds/multi_robot_world.yaml",
         disable_plotting=False,
         reward_phase=2,
     )  # instantiate environment
@@ -64,7 +64,8 @@ def main(args=None):
         load_model=True,
         model_name="TDR-MARL-test",
         load_model_name="TDR-MARL-train",
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
+        # load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/centralized/checkpoint"),  # Alternate path
         attention="g2anet",
     )  # instantiate a model
 
