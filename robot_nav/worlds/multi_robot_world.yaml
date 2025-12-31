@@ -1,8 +1,8 @@
 world:
   height: 12  # the height of the world
   width: 12   # the height of the world
-  step_time: 0.3  # Calculate each step
-  sample_time: 0.3  # For render and data extraction
+  step_time: 1  # Calculate each step
+  sample_time: 1  # For render and data extraction
   collision_mode: 'reactive'
 
 robot:
@@ -21,3 +21,9 @@ robot:
 
     plot:
       show_trajectory: true
+
+# obstacle:
+#   - number: 3
+#     shape: {name: 'circle', radius: 0.3}
+#     distribution: {name: 'random', x_range: [1, 11], y_range: [1, 11]}
+#     color: 'saddlebrown'
