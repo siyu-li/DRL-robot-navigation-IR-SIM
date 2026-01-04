@@ -3,9 +3,6 @@ import numpy as np
 import random
 import torch
 import logging
-# Suppress IRSim warnings
-logging.getLogger('irsim').setLevel(logging.ERROR)
-
 from robot_nav.SIM_ENV.sim_env import SIM_ENV
 
 
@@ -185,9 +182,9 @@ class MARL_SIM(SIM_ENV):
                     ]
                     rx = [position[0], other_pos[0]]
                     ry = [position[1], other_pos[1]]
-                    # self.env.draw_trajectory(
-                    #     np.array([rx, ry]), refresh=True, linewidth=weight * 2
-                    # )
+                    self.env.draw_trajectory(
+                        np.array([rx, ry]), refresh=True, linewidth=weight * 2
+                    )
 
             if goal:
                 self.env.robot_list[i].set_random_goal(
@@ -245,8 +242,14 @@ class MARL_SIM(SIM_ENV):
                 goal_positions (list): Initial goal [x, y] for each robot,
             )
         """
+        # Use dynamic world bounds with 1-unit padding from edges
+        x_min = self.x_range[0] + 1
+        x_max = self.x_range[1] - 1
+        y_min = self.y_range[0] + 1
+        y_max = self.y_range[1] - 1
+
         if robot_state is None:
-            robot_state = [[random.uniform(3, 9)], [random.uniform(3, 9)], [0]]
+            robot_state = [[random.uniform(x_min, x_max)], [random.uniform(y_min, y_max)], [0]]
 
         init_states = []
         for robot in self.env.robot_list:
@@ -254,8 +257,8 @@ class MARL_SIM(SIM_ENV):
             while conflict:
                 conflict = False
                 robot_state = [
-                    [random.uniform(3, 9)],
-                    [random.uniform(3, 9)],
+                    [random.uniform(x_min, x_max)],
+                    [random.uniform(y_min, y_max)],
                     [random.uniform(-3.14, 3.14)],
                 ]
                 pos = [robot_state[0][0], robot_state[1][0]]

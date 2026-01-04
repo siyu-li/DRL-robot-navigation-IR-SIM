@@ -40,7 +40,7 @@ def main(args=None):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # using cuda if it is available, cpu otherwise
-    max_epochs = 160  # max number of epochs
+    max_epochs = 10000  # max number of epochs
     epoch = 1  # starting epoch number
     episode = 0  # starting episode number
     train_every_n = 10  # train and update network parameters every n episodes
@@ -59,7 +59,7 @@ def main(args=None):
     sim = MARL_SIM(
         world_file="robot_nav/worlds/multi_robot_world.yaml",
         disable_plotting=True,
-        reward_phase=1,
+        reward_phase=2,  # Use phase 2 reward for curriculum learning
     )  # instantiate environment
 
     model = TD3(
@@ -69,9 +69,9 @@ def main(args=None):
         num_robots=sim.num_robots,
         device=device,
         save_every=save_every,
-        load_model=False,
-        model_name="TDR-MARL-train",
-        load_model_name="saved_model",
+        load_model=True,  # Load the previously trained Phase 1 model
+        model_name="TDR-MARL-train-phase2",  # New name for Phase 2 checkpoints
+        load_model_name="TDR-MARL-train",  # Load from Phase 1 trained model
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
         attention="igs",
     )  # instantiate a model

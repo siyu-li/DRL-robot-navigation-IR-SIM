@@ -3,9 +3,6 @@ import numpy as np
 import random
 import torch
 import logging
-# Suppress IRSim warnings
-logging.getLogger('irsim').setLevel(logging.ERROR)
-
 from robot_nav.SIM_ENV.sim_env import SIM_ENV
 
 
