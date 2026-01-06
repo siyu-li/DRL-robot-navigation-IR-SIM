@@ -2,7 +2,7 @@ import logging
 
 # Suppress IRSim warnings - irsim uses loguru, not standard logging
 from loguru import logger
-logger.disable("irsim")
+# logger.disable("irsim")
 
 from pathlib import Path
 
@@ -78,7 +78,7 @@ def main(args=None):
         model_name="TDR-MARL-centralized-train",
         load_model_name="saved_model",
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
-        attention="g2anet",
+        attention="igs",
         # Load pretrained attention weights from decentralized model
         load_pretrained_attention=True,
         pretrained_attention_model_name="TDR-MARL-train",

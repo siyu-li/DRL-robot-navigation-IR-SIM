@@ -3,11 +3,9 @@ from pathlib import Path
 
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-# from robot_nav.models.MARL.marlTD3.marlTD3 import TD3
 from robot_nav.models.MARL.marlTD3.marlTD3_centralized import marlTD3_centralized as TD3
 import torch
 import numpy as np
-# from robot_nav.SIM_ENV.marl_sim import MARL_SIM
 from robot_nav.SIM_ENV.marl_centralized_sim import MARL_SIM
 
 def outside_of_bounds(poses):
@@ -35,7 +33,7 @@ def main(args=None):
 
     # ---- Hyperparameters and setup ----
     action_dim = 2  # number of actions produced by the model
-    joint_action_dim = 8
+    joint_action_dim = 10
     max_action = 1  # maximum absolute value of output actions
     state_dim = 11  # number of input values in the neural network (vector length of state input)
     device = torch.device(
@@ -63,12 +61,9 @@ def main(args=None):
         device=device,
         save_every=save_every,
         load_model=True,
-        model_name="TDR-MARL-test",
-        load_model_name="TDR-MARL-train",
-        # model_name="TDR-MARL-centralized-test",
-        # load_model_name="TDR-MARL-centralized-train",
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
-        # load_directory=Path("robot_nav/models/MARL/marlTD3_centralized/checkpoint"),  # Alternate path
+        model_name="TDR-MARL-centralized-test",
+        load_model_name="TDR-MARL-centralized-train",
+        load_directory=Path("robot_nav/models/MARL/marlTD3_centralized/checkpoint"),  # Alternate path
         attention="igs",
     )  # instantiate a model
 

@@ -1,12 +1,12 @@
 world:
-  height: 10  # the height of the world
-  width: 10   # the height of the world
+  height: 12  # the height of the world
+  width: 12   # the height of the world
   step_time: 0.3  # Calculate each step
   sample_time: 0.3  # For render and data extraction
   collision_mode: 'reactive'
 
 robot:
-  - number: 4
+  - number: 5
     kinematics: {name: 'diff'}
     distribution: {name: 'circle', radius: 4, center: [4, 4]}
     shape: {name: 'circle', radius: 0.2}
