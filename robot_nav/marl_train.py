@@ -7,7 +7,7 @@ import numpy as np
 import logging
 from robot_nav.SIM_ENV.marl_sim import MARL_SIM
 from robot_nav.utils import get_buffer
-
+from robot_nav.utils import MARLDataSaver
 # Suppress IRSim warnings
 logging.getLogger('irsim').setLevel(logging.ERROR)
 
@@ -40,7 +40,7 @@ def main(args=None):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # using cuda if it is available, cpu otherwise
-    max_epochs = 160  # max number of epochs
+    max_epochs = 2000  # max number of epochs
     epoch = 1  # starting epoch number
     episode = 0  # starting episode number
     train_every_n = 10  # train and update network parameters every n episodes
@@ -54,6 +54,8 @@ def main(args=None):
         10  # number of training iterations to run during pre-training
     )
     save_every = 5  # save the model every n training cycles
+    save_data = True  # whether to save experience data to YAML for centralized pretraining
+    data_save_path = "robot_nav/assets/marl_data.yml"  # path to save experience data
 
     # ---- Instantiate simulation environment and model ----
     sim = MARL_SIM(
@@ -89,6 +91,11 @@ def main(args=None):
     connections = torch.tensor(
         [[0.0 for _ in range(sim.num_robots - 1)] for _ in range(sim.num_robots)]
     )
+
+    # ---- Setup data saver for centralized pretraining ----
+    data_saver = None
+    if save_data:
+        data_saver = MARLDataSaver(filepath=data_save_path)
 
     # ---- Take initial step in environment ----
     poses, distance, cos, sin, collision, goal, a, reward, positions, goal_positions = (
@@ -135,6 +142,20 @@ def main(args=None):
         replay_buffer.add(
             state, action, reward, terminal, next_state
         )  # add experience to the replay buffer
+        
+        # Save data for centralized pretraining
+        if data_saver is not None:
+            data_saver.add(
+                poses=poses,
+                distances=distance,
+                cos_vals=cos,
+                sin_vals=sin,
+                collisions=collision,
+                goals=goal,
+                actions=action,  # raw model output [-1, 1], NOT a_in
+                goal_positions=goal_positions,
+            )
+        
         outside = outside_of_bounds(poses, sim)
         if (
             any(terminal) or steps == max_steps or outside
@@ -172,6 +193,11 @@ def main(args=None):
             steps = 0
         else:
             steps += 1
+
+    # ---- Save collected experience data ----
+    if data_saver is not None:
+        data_saver.save()
+        print(f"Training complete. Data saved to {data_save_path}")
 
 
 if __name__ == "__main__":

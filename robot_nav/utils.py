@@ -31,6 +31,137 @@ class Pretraining:
         self.replay_buffer = replay_buffer
         self.reward_function = reward_function
 
+    def load_buffer_centralized(self, num_robots=5, reward_phase=1):
+        """
+        Load samples from MARL data files and populate the replay buffer for centralized training.
+
+        Expected YAML format per sample (saved after each sim.step):
+            poses: [[x, y, theta], ...] - state AFTER taking actions
+            distances: [d1, d2, ...] per robot
+            cos: [c1, c2, ...] per robot  
+            sin: [s1, s2, ...] per robot
+            collisions: [bool, ...] per robot
+            goals: [bool, ...] per robot
+            actions: [[lin_vel, ang_vel], ...] - action that LED TO this state
+            goal_positions: [[gx, gy], ...] per robot
+
+        Data interpretation:
+            sample[i].poses = state after taking sample[i].actions
+            To form (state, action, next_state):
+                state = sample[i].poses
+                action = sample[i+1].actions  (action taken FROM sample[i] to reach sample[i+1])
+                next_state = sample[i+1].poses
+
+        Terminal condition: ANY robot collision = episode terminal.
+        Reward: Per-robot rewards based on resulting state.
+
+        Args:
+            num_robots (int): Number of robots in the data. Defaults to 5.
+            reward_phase (int): Reward function phase (1 or 2). Defaults to 1.
+
+        Returns:
+            (object): The populated replay buffer.
+        """
+        import numpy as np
+
+        for file_name in self.file_names:
+            print("Loading file: ", file_name)
+            with open(file_name, "r") as file:
+                samples = yaml.full_load(file)
+                
+                for i in tqdm(range(1, len(samples) - 1)):
+                    sample = samples[i]
+                    next_sample = samples[i + 1]
+                    
+                    # Current state (from sample[i])
+                    poses = sample["poses"]
+                    distances = sample["distances"]
+                    cos_vals = sample["cos"]
+                    sin_vals = sample["sin"]
+                    collisions = sample["collisions"]
+                    goals = sample["goals"]
+                    goal_positions = sample["goal_positions"]
+                    
+                    # Action that transitions from sample[i] to sample[i+1]
+                    # This is stored in sample[i+1] as the action that led to that state
+                    actions = next_sample["actions"]
+
+                    # Terminal if ANY robot collided in current state
+                    terminal = any(collisions)
+                    
+                    if terminal:
+                        continue
+
+                    # Prepare current state using model's prepare_state
+                    # Note: prepare_state needs an action for the state vector (last action taken)
+                    # Use sample[i].actions since that's what led to sample[i].poses
+                    # Convert raw actions [-1,1] to a_in format: [(a[0]+1)/4, a[1]]
+                    current_actions_raw = sample["actions"]
+                    current_actions_converted = [
+                        [(a[0] + 1) / 4, a[1]] for a in current_actions_raw
+                    ]
+                    state = self.model.prepare_state(
+                        poses, distances, cos_vals, sin_vals, collisions, 
+                        current_actions_converted, goal_positions
+                    )
+
+                    # Next state data (from sample[i+1])
+                    next_poses = next_sample["poses"]
+                    next_distances = next_sample["distances"]
+                    next_cos = next_sample["cos"]
+                    next_sin = next_sample["sin"]
+                    next_collisions = next_sample["collisions"]
+                    next_goals = next_sample["goals"]
+                    next_goal_positions = next_sample["goal_positions"]
+
+                    # Terminal if ANY robot collided in next state
+                    next_terminal = any(next_collisions)
+
+                    # Convert actions (raw [-1,1]) to a_in format: [(a[0]+1)/4, a[1]]
+                    actions_converted = [
+                        [(a[0] + 1) / 4, a[1]] for a in actions
+                    ]
+
+                    # Prepare next state
+                    next_state = self.model.prepare_state(
+                        next_poses, next_distances, next_cos, next_sin,
+                        next_collisions, actions_converted, next_goal_positions
+                    )
+
+                    # Calculate per-robot rewards based on next state
+                    rewards = []
+                    robot_positions = [[p[0], p[1]] for p in next_poses]
+                    
+                    for r in range(num_robots):
+                        # Calculate distances to other robots
+                        closest_robots = []
+                        for other_r in range(num_robots):
+                            if other_r != r:
+                                dist = np.linalg.norm([
+                                    robot_positions[other_r][0] - robot_positions[r][0],
+                                    robot_positions[other_r][1] - robot_positions[r][1]
+                                ])
+                                closest_robots.append(dist)
+                        
+                        reward = self.reward_function(
+                            next_goals[r],
+                            next_collisions[r],
+                            actions[r],  # action that caused this transition
+                            closest_robots,
+                            next_distances[r],
+                            reward_phase,
+                        )
+                        rewards.append(reward)
+
+                    # Create terminal flag list (same value for all robots, as centralized expects)
+                    terminal_flags = [next_terminal] * num_robots
+
+                    self.replay_buffer.add(
+                        state, actions, rewards, terminal_flags, next_state
+                    )
+
+        return self.replay_buffer
+
     def load_buffer(self):
         """
         Load samples from the specified files and populate the replay buffer.
@@ -251,3 +382,73 @@ def get_max_bound(
         -1, 1
     )
     return max_bound
+
+
+class MARLDataSaver:
+    """
+    Saves MARL experience data to YAML files for later use in pretraining.
+    
+    The data format is compatible with Pretraining.load_buffer_centralized().
+    """
+    
+    def __init__(self, filepath="robot_nav/assets/marl_data.yml"):
+        """
+        Initialize the MARL data saver.
+        
+        Args:
+            filepath (str): Path to save the YAML file.
+        """
+        self.filepath = filepath
+        self.samples = {}
+        self.sample_count = 0
+    
+    def _to_list(self, data):
+        """Convert numpy arrays to nested lists for YAML serialization."""
+        import numpy as np
+        if isinstance(data, np.ndarray):
+            return data.tolist()
+        elif isinstance(data, list):
+            return [self._to_list(item) for item in data]
+        elif isinstance(data, (np.floating, np.integer)):
+            return float(data)
+        elif isinstance(data, (np.bool_, bool)):
+            return bool(data)
+        else:
+            return data
+    
+    def add(self, poses, distances, cos_vals, sin_vals, collisions, goals, actions, goal_positions):
+        """
+        Add a sample to the data collection.
+        
+        Args:
+            poses: List of [x, y, theta] for each robot.
+            distances: List of distances to goal for each robot.
+            cos_vals: List of cos(heading error) for each robot.
+            sin_vals: List of sin(heading error) for each robot.
+            collisions: List of collision flags for each robot.
+            goals: List of goal reached flags for each robot.
+            actions: List of [lin_vel, ang_vel] for each robot (raw model output, [-1, 1] range).
+            goal_positions: List of [gx, gy] for each robot.
+        """
+        self.sample_count += 1
+        self.samples[self.sample_count] = {
+            "poses": self._to_list(poses),
+            "distances": self._to_list(distances),
+            "cos": self._to_list(cos_vals),
+            "sin": self._to_list(sin_vals),
+            "collisions": self._to_list(collisions),
+            "goals": self._to_list(goals),
+            "actions": self._to_list(actions),
+            "goal_positions": self._to_list(goal_positions),
+        }
+    
+    def save(self):
+        """Save all collected samples to the YAML file."""
+        with open(self.filepath, "w") as f:
+            yaml.dump(self.samples, f)
+        print(f"Saved {self.sample_count} samples to {self.filepath}")
+    
+    def clear(self):
+        """Clear all collected samples."""
+        self.samples = {}
+        self.sample_count = 0

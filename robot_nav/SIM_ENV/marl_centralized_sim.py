@@ -184,11 +184,21 @@ class MARL_SIM(SIM_ENV):
                     ]
                     rx = [position[0], other_pos[0]]
                     ry = [position[1], other_pos[1]]
-                    # self.env.draw_trajectory(
-                    #     np.array([rx, ry]), refresh=True, linewidth=weight * 2
-                    # )
+                    self.env.draw_trajectory(
+                        np.array([rx, ry]), refresh=True, linewidth=weight * 2
+                    )
 
-            if goal:
+            # if goal:
+            #     self.env.robot_list[i].set_random_goal(
+            #         obstacle_list=self.env.obstacle_list,
+            #         init=True,
+            #         range_limits=[
+            #             [self.x_range[0] + 1, self.y_range[0] + 1, -3.141592653589793],
+            #             [self.x_range[1] - 1, self.y_range[1] - 1, 3.141592653589793],
+            #         ],
+            #     )
+        if all(goals):
+            for i in range(self.num_robots):
                 self.env.robot_list[i].set_random_goal(
                     obstacle_list=self.env.obstacle_list,
                     init=True,
@@ -197,6 +207,7 @@ class MARL_SIM(SIM_ENV):
                         [self.x_range[1] - 1, self.y_range[1] - 1, 3.141592653589793],
                     ],
                 )
+                
         # Compute episode done: ANY collision OR ALL goals reached
         episode_done = any(collisions) or all(goals)
         return (

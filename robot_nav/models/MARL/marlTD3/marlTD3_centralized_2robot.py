@@ -41,12 +41,21 @@ class TwoRobotCentralizedActor(nn.Module):
         
         self.policy_head = nn.Sequential(
             nn.Linear(embedding_dim * 2 * 2, 256),
+            nn.LayerNorm(256),
             nn.LeakyReLU(),
             nn.Linear(256, 128),
+            nn.LayerNorm(128),
             nn.LeakyReLU(),
             nn.Linear(128, output_dim),
             nn.Tanh(),
         )
+        
+        # Initialize policy head weights
+        for layer in self.policy_head:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_uniform_(layer.weight, nonlinearity="leaky_relu")
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
     
     def forward(self, obs, detach_attn=False):
         """
@@ -104,15 +113,19 @@ class TwoRobotCentralizedCritic(nn.Module):
         
         action_dim = 3 if coupled_mode else 4
         
-        # Twin Q-networks for 2 active robots
+        # Twin Q-networks for 2 active robots with layer normalization
         self.q1_layer1 = nn.Linear(embedding_dim * 2 * 2, 256)
+        self.q1_ln1 = nn.LayerNorm(256)
         self.q1_layer2_s = nn.Linear(256, 128)
         self.q1_layer2_a = nn.Linear(action_dim, 128)
+        self.q1_ln2 = nn.LayerNorm(128)
         self.q1_layer3 = nn.Linear(128, 1)
         
         self.q2_layer1 = nn.Linear(embedding_dim * 2 * 2, 256)
+        self.q2_ln1 = nn.LayerNorm(256)
         self.q2_layer2_s = nn.Linear(256, 128)
         self.q2_layer2_a = nn.Linear(action_dim, 128)
+        self.q2_ln2 = nn.LayerNorm(128)
         self.q2_layer3 = nn.Linear(128, 1)
         
         # Initialize weights
@@ -143,14 +156,14 @@ class TwoRobotCentralizedCritic(nn.Module):
         active_embeddings = attn_out[:, self.active_robot_ids, :]
         active_embeddings = active_embeddings.view(batch_size, -1)
         
-        # Q1
-        s1 = F.leaky_relu(self.q1_layer1(active_embeddings))
-        s1 = F.leaky_relu(self.q1_layer2_s(s1) + self.q1_layer2_a(action))
+        # Q1 with layer normalization
+        s1 = self.q1_ln1(F.leaky_relu(self.q1_layer1(active_embeddings)))
+        s1 = self.q1_ln2(F.leaky_relu(self.q1_layer2_s(s1) + self.q1_layer2_a(action)))
         q1 = self.q1_layer3(s1)
         
-        # Q2
-        s2 = F.leaky_relu(self.q2_layer1(active_embeddings))
-        s2 = F.leaky_relu(self.q2_layer2_s(s2) + self.q2_layer2_a(action))
+        # Q2 with layer normalization
+        s2 = self.q2_ln1(F.leaky_relu(self.q2_layer1(active_embeddings)))
+        s2 = self.q2_ln2(F.leaky_relu(self.q2_layer2_s(s2) + self.q2_layer2_a(action)))
         q2 = self.q2_layer3(s2)
         
         return q1, q2, mean_entropy, hard_logits, unnorm_rel_dist, hard_weights
@@ -377,7 +390,7 @@ class marlTD3_2robot(object):
             
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 5.0)
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 7.0)
             self.critic_optimizer.step()
             
             av_critic_loss += critic_loss.item()
@@ -389,7 +402,7 @@ class marlTD3_2robot(object):
                 
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.policy_params, 5.0)
+                torch.nn.utils.clip_grad_norm_(self.policy_params, 7.0)
                 self.actor_optimizer.step()
                 
                 av_actor_loss += actor_loss.item()

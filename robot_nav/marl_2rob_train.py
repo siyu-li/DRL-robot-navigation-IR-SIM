@@ -39,6 +39,7 @@ def main():
     max_steps = 300
     steps = 0
     save_every = 5
+    reward_scale = 0.1  # Scale rewards to prevent Q-value explosion
     
     # ---- Create environment ----
     sim = MARL_2Robot_SIM(
@@ -84,15 +85,18 @@ def main():
     running_collisions = 0
     running_reward = 0
     
+    # Initialize previous action (scaled action format used in prepare_state)
+    prev_action = [[0, 0], [0, 0]] if not coupled_mode else [0, 0, 0]
+    
     pbar = tqdm(total=max_epochs, desc="Training")
     
     # ---- Main training loop ----
     while epoch < max_epochs:
         # Prepare state for all robots (for attention network)
-        dummy_action = [[0, 0], [0, 0]] if not coupled_mode else [0, 0, 0]
+        # Use the previous action from the last step
         state = model.prepare_state(
             all_poses, active_distances, active_coss, active_sins,
-            active_collisions, dummy_action, active_goal_positions
+            active_collisions, prev_action, active_goal_positions
         )
         
         # Get action for 2 active robots
@@ -102,8 +106,10 @@ def main():
         if coupled_mode:
             a_in = action  # [lin, ang1, ang2]
             a_in_scaled = [(a_in[0] + 1) / 4, a_in[1], a_in[2]]
+            prev_action = a_in_scaled  # Save for next state preparation
         else:
             a_in = [[(a[0] + 1) / 4, a[1]] for a in action]
+            prev_action = a_in  # Save for next state preparation
         
         # Step environment
         (
@@ -117,17 +123,17 @@ def main():
         running_reward += sum(active_rewards)
         steps += 1
         
-        # Prepare next state
+        # Prepare next state using the SCALED action (a_in), not raw action
         next_state = model.prepare_state(
             all_poses, active_distances, active_coss, active_sins,
-            active_collisions, action, active_goal_positions
+            active_collisions, a_in, active_goal_positions
         )
         
         # Flatten states and add to buffer
         flat_state = np.array(state).flatten()
         flat_next_state = np.array(next_state).flatten()
         flat_action = np.array(action).flatten() if not coupled_mode else np.array(action)
-        summed_reward = sum(active_rewards)
+        summed_reward = sum(active_rewards) * reward_scale  # Scale rewards to prevent Q explosion
         
         replay_buffer.add(
             flat_state, flat_action, summed_reward, episode_done, flat_next_state
@@ -144,6 +150,9 @@ def main():
                 active_collisions, active_goals, _, active_rewards,
                 active_positions, active_goal_positions, all_poses, _
             ) = sim.reset()
+            
+            # Reset previous action for the new episode
+            prev_action = [[0, 0], [0, 0]] if not coupled_mode else [0, 0, 0]
             
             # Training
             if episode % train_every_n == 0 and replay_buffer.size() > batch_size * 2:
