@@ -11,7 +11,8 @@ from robot_nav.models.MARL.marlTD3.marlTD3_centralized import marlTD3_centralize
 import torch
 import numpy as np
 from robot_nav.SIM_ENV.marl_centralized_sim import MARL_SIM
-from robot_nav.utils import get_buffer
+from robot_nav.utils import get_buffer, Pretraining
+from robot_nav.replay_buffer import ReplayBuffer
 
 
 def outside_of_bounds(poses):
@@ -44,19 +45,21 @@ def main(args=None):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # using cuda if it is available, cpu otherwise
-    max_epochs = 10000  # max number of epochs
+    max_epochs = 1000  # max number of epochs
     epoch = 1  # starting epoch number
     episode = 0  # starting episode number
     train_every_n = 10  # train and update network parameters every n episodes
     training_iterations = 80  # how many batches to use for single training cycle
-    batch_size = 16  # batch size for each training iteration
+    batch_size = 80  # batch size for each training iteration
     max_steps = 300  # maximum number of steps in single episode
     steps = 0  # starting step number
-    load_saved_buffer = False  # whether to load experiences from assets/data.yml
-    pretrain = False  # whether to use the loaded experiences to pre-train the model (load_saved_buffer must be True)
-    pretraining_iterations = (
-        10  # number of training iterations to run during pre-training
-    )
+    
+    # ---- Pretraining configuration ----
+    load_saved_buffer = True  # whether to load experiences from decentralized training data
+    pretrain = True  # whether to use the loaded experiences to pre-train the model (load_saved_buffer must be True)
+    pretraining_iterations = 100  # number of training iterations to run during pre-training
+    data_load_path = "robot_nav/assets/marl_data.yml"  # path to load experience data from decentralized training
+    
     save_every = 5  # save the model every n training cycles (overwrites previous)
     checkpoint_every = 2000  # save versioned checkpoint every n epochs (keeps all)
 
@@ -86,16 +89,46 @@ def main(args=None):
         freeze_attention=True,  # Set to True to freeze attention during training
     )  # instantiate a model
 
-    # ---- Setup replay buffer and initial connections ----
-    replay_buffer = get_buffer(
-        model,
-        sim,
-        load_saved_buffer,
-        pretrain,
-        pretraining_iterations,
-        training_iterations,
-        batch_size,
-    )
+    # ---- Setup replay buffer and pretraining ----
+    if load_saved_buffer and pretrain:
+        # Use custom pretraining for centralized with decentralized buffer
+        buffer_size = 50000
+        replay_buffer = ReplayBuffer(buffer_size=buffer_size, random_seed=666)
+        
+        pretraining = Pretraining(
+            file_names=[data_load_path],
+            model=model,
+            replay_buffer=replay_buffer,
+            reward_function=sim.get_reward,
+        )
+        
+        print("Loading buffer from decentralized training data...")
+        replay_buffer = pretraining.load_buffer_centralized(
+            num_robots=sim.num_robots,
+            reward_phase=1
+        )
+        
+        print("Running pretraining on centralized model...")
+        pretraining.train(
+            pretraining_iterations=pretraining_iterations,
+            replay_buffer=replay_buffer,
+            iterations=training_iterations,
+            batch_size=batch_size,
+        )
+        print("Pretraining complete!")
+    else:
+        # Use standard buffer setup
+        replay_buffer = get_buffer(
+            model,
+            sim,
+            load_saved_buffer=False,
+            pretrain=False,
+            pretraining_iterations=pretraining_iterations,
+            training_iterations=training_iterations,
+            batch_size=batch_size,
+        )
+    
+    # ---- Setup initial connections ----
     connections = torch.tensor(
         [[0.0 for _ in range(sim.num_robots - 1)] for _ in range(sim.num_robots)]
     )

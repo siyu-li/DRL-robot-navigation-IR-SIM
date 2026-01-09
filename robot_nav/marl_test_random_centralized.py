@@ -41,10 +41,10 @@ def main(args=None):
     )  # using cuda if it is available, cpu otherwise
     epoch = 1  # starting epoch number
     episode = 0
-    max_steps = 600  # maximum number of steps in single episode
+    max_steps = 300  # maximum number of steps in single episode
     steps = 0  # starting step number
     save_every = 5  # save the model every n training cycles
-    test_scenarios = 100
+    test_scenarios = 50
 
     # ---- Instantiate simulation environment and model ----
     sim = MARL_SIM(

@@ -40,7 +40,7 @@ def main(args=None):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # using cuda if it is available, cpu otherwise
-    max_epochs = 2000  # max number of epochs
+    max_epochs = 50  # max number of epochs
     epoch = 1  # starting epoch number
     episode = 0  # starting episode number
     train_every_n = 10  # train and update network parameters every n episodes
@@ -71,10 +71,10 @@ def main(args=None):
         num_robots=sim.num_robots,
         device=device,
         save_every=save_every,
-        load_model=False,
+        load_model=True,
         model_name="TDR-MARL-train",
-        load_model_name="saved_model",
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
+        load_model_name="TDR-MARL-train",
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/correct"),
         attention="igs",
     )  # instantiate a model
 
@@ -158,7 +158,7 @@ def main(args=None):
         
         outside = outside_of_bounds(poses, sim)
         if (
-            any(terminal) or steps == max_steps or outside
+            any(terminal) or steps == max_steps or outside or all(goal)
         ):  # reset environment of terminal state reached, or max_steps were taken
             (
                 poses,

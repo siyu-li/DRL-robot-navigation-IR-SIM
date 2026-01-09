@@ -313,12 +313,13 @@ class marlTD3_centralized(object):
                 .to(self.device)
                 .view(batch_size, self.joint_action_dim)
             )
-            # Aggregate rewards: sum across all robots for centralized Q-value
+            # Aggregate rewards: average across all robots for centralized Q-value
+            # Using mean instead of sum to keep reward scale stable
             reward = (
                 torch.Tensor(batch_rewards)
                 .to(self.device)
                 .view(batch_size, self.num_robots)
-                .sum(dim=1, keepdim=True)  # (B, 1) - total reward for joint action
+                .mean(dim=1, keepdim=True)  # (B, 1) - average reward for joint action
             )
             # Buffer stores [done, done, done, ...] - same value repeated for each robot
             # We just take the first one (all are identical)

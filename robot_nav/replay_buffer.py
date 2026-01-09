@@ -1,8 +1,6 @@
 import random
 from collections import deque
 import itertools
-import pickle
-from pathlib import Path
 
 import numpy as np
 
@@ -100,42 +98,6 @@ class ReplayBuffer(object):
         """
         self.buffer.clear()
         self.count = 0
-
-    def save(self, filepath):
-        """
-        Save the buffer contents to a pickle file.
-
-        Args:
-            filepath (str or Path): Path to save the buffer.
-        """
-        filepath = Path(filepath)
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        
-        data = {
-            'buffer': list(self.buffer),
-            'buffer_size': self.buffer_size,
-            'count': self.count,
-        }
-        
-        with open(filepath, 'wb') as f:
-            pickle.dump(data, f)
-        print(f"Saved buffer with {self.count} experiences to {filepath}")
-
-    def load(self, filepath):
-        """
-        Load buffer contents from a pickle file.
-
-        Args:
-            filepath (str or Path): Path to load the buffer from.
-        """
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
-        
-        self.buffer = deque(data['buffer'])
-        self.buffer_size = data['buffer_size']
-        self.count = data['count']
-        
-        print(f"Loaded buffer with {self.count} experiences from {filepath}")
 
 
 class RolloutReplayBuffer(object):

@@ -7,6 +7,7 @@ from robot_nav.models.MARL.marlTD3.marlTD3 import TD3
 import torch
 import numpy as np
 from robot_nav.SIM_ENV.marl_sim import MARL_SIM
+from robot_nav.utils import MARLDataSaver
 
 def outside_of_bounds(poses):
     """
@@ -44,7 +45,9 @@ def main(args=None):
     max_steps = 600  # maximum number of steps in single episode
     steps = 0  # starting step number
     save_every = 5  # save the model every n training cycles
-    test_scenarios = 100
+    test_scenarios = 200
+    save_data = False  # whether to save experience data to YAML
+    data_save_path = "robot_nav/assets/marl_test_data.yml"  # path to save experience data
 
     # ---- Instantiate simulation environment and model ----
     sim = MARL_SIM(
@@ -63,10 +66,7 @@ def main(args=None):
         load_model=True,
         model_name="TDR-MARL-test",
         load_model_name="TDR-MARL-train",
-        # model_name="TDR-MARL-centralized-test",
-        # load_model_name="TDR-MARL-centralized-train",
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
-        # load_directory=Path("robot_nav/models/MARL/marlTD3_centralized/checkpoint"),  # Alternate path
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/correct"),
         # attention="g2anet",
         attention="igs"
     )  # instantiate a model
@@ -74,6 +74,11 @@ def main(args=None):
     connections = torch.tensor(
         [[0.0 for _ in range(sim.num_robots - 1)] for _ in range(sim.num_robots)]
     )
+
+    # ---- Setup data saver ----
+    data_saver = None
+    if save_data:
+        data_saver = MARLDataSaver(filepath=data_save_path)
 
     # ---- Take initial step in environment ----
     poses, distance, cos, sin, collision, goal, a, reward, positions, goal_positions = (
@@ -138,13 +143,27 @@ def main(args=None):
         running_collisions += sum(collision) / 2
         running_reward += sum(reward)
         running_timesteps += 1
+        
+        # Save data for analysis
+        if data_saver is not None:
+            data_saver.add(
+                poses=poses,
+                distances=distance,
+                cos_vals=cos,
+                sin_vals=sin,
+                collisions=collision,
+                goals=goal,
+                actions=action,  # raw model output [-1, 1], NOT a_in
+                goal_positions=goal_positions,
+            )
+        
         for j in range(len(a_in)):
             lin_actions.append(a_in[j][0].item())
             ang_actions.append(a_in[j][1].item())
         outside = outside_of_bounds(poses)
 
         if (
-            sum(collision) > 0.5 or steps == max_steps or outside
+            sum(collision) > 0.5 or steps == max_steps or outside or all(goal)
         ):  # reset environment of terminal state reached, or max_steps were taken
             (
                 poses,
@@ -238,6 +257,11 @@ def main(args=None):
     ax.set_ylabel("Frequency (Log Scale)")
     ax.set_title("Histogram with Log Scale")
     model.writer.add_figure("test/ang_actions_hist", fig)
+
+    # ---- Save collected experience data ----
+    if data_saver is not None:
+        data_saver.save()
+        print(f"Test complete. Data saved to {data_save_path}")
 
 
 if __name__ == "__main__":
