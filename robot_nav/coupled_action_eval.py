@@ -11,13 +11,9 @@ Reports:
 - Average time-to-goal / progress per step
 
 Usage:
-    python -m robot_nav.coupled_action_eval \
-        --model_name coupled_action_supervised_best \
-        --test_scenarios 100 \
-        --max_steps 600
+    python -m robot_nav.coupled_action_eval
 """
 
-import argparse
 import logging
 import statistics
 from pathlib import Path
@@ -31,75 +27,36 @@ from robot_nav.models.MARL.marlTD3.coupled_action_policy import CoupledActionPol
 from robot_nav.SIM_ENV.marl_sim import MARL_SIM
 
 
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Evaluate coupled action policy in simulation"
-    )
-    
+# ============================================================================
+# Configuration Dictionary - Edit these values directly
+# ============================================================================
+CONFIG = {
     # Model configuration
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="coupled_action_supervised_best",
-        help="Name of trained coupled action model"
-    )
-    parser.add_argument(
-        "--model_directory",
-        type=str,
-        default="robot_nav/models/MARL/marlTD3/checkpoint",
-        help="Directory containing model weights"
-    )
-    parser.add_argument(
-        "--pretrained_model_name",
-        type=str,
-        default="TDR-MARL-train",
-        help="Name of pretrained decentralized model (for encoder weights)"
-    )
-    parser.add_argument(
-        "--pretrained_directory",
-        type=str,
-        default="robot_nav/models/MARL/marlTD3/checkpoint",
-        help="Directory containing pretrained encoder weights"
-    )
+    "model_name": "coupled_action_supervised_best",
+    "model_directory": "robot_nav/models/MARL/marlTD3/checkpoint",
+    "pretrained_model_name": "TDR-MARL-train",
+    "pretrained_directory": "robot_nav/models/MARL/marlTD3/checkpoint",
     
     # Evaluation configuration
-    parser.add_argument("--test_scenarios", type=int, default=100, help="Number of test episodes")
-    parser.add_argument("--max_steps", type=int, default=600, help="Max steps per episode")
-    parser.add_argument("--disable_plotting", action="store_true", help="Disable visualization")
+    "test_scenarios": 100,  # Number of test episodes
+    "max_steps": 600,  # Max steps per episode
+    "disable_plotting": False,  # Set to True to disable visualization
     
     # Policy configuration
-    parser.add_argument("--num_robots", type=int, default=5, help="Number of robots")
-    parser.add_argument("--state_dim", type=int, default=11, help="Per-robot state dimension")
-    parser.add_argument("--embedding_dim", type=int, default=256, help="Embedding dimension")
-    parser.add_argument(
-        "--attention",
-        type=str,
-        default="igs",
-        choices=["igs", "g2anet"],
-        help="Attention mechanism type"
-    )
-    parser.add_argument("--v_min", type=float, default=0.0, help="Minimum linear velocity")
-    parser.add_argument("--v_max", type=float, default=0.5, help="Maximum linear velocity")
+    "num_robots": 5,
+    "state_dim": 11,
+    "embedding_dim": 256,
+    "attention": "igs",  # Options: "igs" or "g2anet"
+    "v_min": 0.0,
+    "v_max": 0.5,
     
     # World configuration
-    parser.add_argument(
-        "--world_file",
-        type=str,
-        default="robot_nav/worlds/multi_robot_world.yaml",
-        help="Path to world configuration file"
-    )
+    "world_file": "robot_nav/worlds/multi_robot_world.yaml",
     
     # Output
-    parser.add_argument("--save_data", action="store_true", help="Save evaluation data")
-    parser.add_argument(
-        "--data_save_path",
-        type=str,
-        default="robot_nav/assets/coupled_action_eval_data.yml",
-        help="Path to save evaluation data"
-    )
-    
-    return parser.parse_args()
+    "save_data": False,  # Set to True to save evaluation results
+    "data_save_path": "robot_nav/assets/coupled_action_eval_data.yml",
+}
 
 
 def outside_of_bounds(poses: List[List[float]], center=(6, 6), half_size=10.5) -> bool:
@@ -280,7 +237,8 @@ def evaluate_policy(
 
 def main():
     """Main evaluation function."""
-    args = parse_args()
+    # Load configuration
+    config = CONFIG
     
     # Setup logging
     logging.basicConfig(level=logging.INFO)
@@ -293,53 +251,45 @@ def main():
     # Create simulation environment
     logger.info("Creating simulation environment...")
     sim = MARL_SIM(
-        world_file=args.world_file,
-        disable_plotting=args.disable_plotting,
+        world_file=config["world_file"],
+        disable_plotting=config["disable_plotting"],
         reward_phase=2
     )
-    
-    # Verify robot count
-    if sim.num_robots != args.num_robots:
-        logger.warning(
-            f"Simulation has {sim.num_robots} robots but model expects {args.num_robots}. "
-            f"Using {sim.num_robots}."
-        )
-        args.num_robots = sim.num_robots
     
     # Create and load policy
     logger.info("Loading coupled action policy...")
     policy = CoupledActionPolicy(
-        state_dim=args.state_dim,
-        num_robots=args.num_robots,
+        state_dim=config["state_dim"],
+        num_robots=num_robots,
         device=device,
-        embedding_dim=args.embedding_dim,
-        attention=args.attention,
-        v_min=args.v_min,
-        v_max=args.v_max,
+        embedding_dim=config["embedding_dim"],
+        attention=config["attention"],
+        v_min=config["v_min"],
+        v_max=config["v_max"],
         pooling="mean",
         load_pretrained_encoder=True,
-        pretrained_model_name=args.pretrained_model_name,
-        pretrained_directory=Path(args.pretrained_directory),
+        pretrained_model_name=config["pretrained_model_name"],
+        pretrained_directory=Path(config["pretrained_directory"]),
         freeze_encoder=True,
         freeze_omega=True,
-        model_name=args.model_name,
-        save_directory=Path(args.model_directory)
+        model_name=config["model_name"],
+        save_directory=Path(config["model_directory"])
     )
     
     # Load trained v_head weights
     try:
-        policy.load(filename=args.model_name, directory=Path(args.model_directory))
-        logger.info(f"Loaded trained model: {args.model_name}")
+        policy.load(filename=config["model_name"], directory=Path(config["model_directory"]))
+        logger.info(f"Loaded trained model: {config['model_name']}")
     except FileNotFoundError:
-        logger.warning(f"Could not load model {args.model_name}. Using freshly initialized v_head.")
+        logger.warning(f"Could not load model {config['model_name']}. Using freshly initialized v_head.")
     
     # Run evaluation
-    logger.info(f"Running evaluation for {args.test_scenarios} episodes...")
+    logger.info(f"Running evaluation for {config['test_scenarios']} episodes...")
     metrics = evaluate_policy(
         policy=policy,
         sim=sim,
-        num_episodes=args.test_scenarios,
-        max_steps=args.max_steps,
+        num_episodes=config["test_scenarios"],
+        max_steps=config["max_steps"],
         verbose=True
     )
     
@@ -360,11 +310,11 @@ def main():
     logger.info("=" * 50)
     
     # Save results if requested
-    if args.save_data:
+    if config["save_data"]:
         import yaml
-        with open(args.data_save_path, "w") as f:
+        with open(config["data_save_path"], "w") as f:
             yaml.dump(summary, f)
-        logger.info(f"Results saved to {args.data_save_path}")
+        logger.info(f"Results saved to {config['data_save_path']}")
 
 
 if __name__ == "__main__":
