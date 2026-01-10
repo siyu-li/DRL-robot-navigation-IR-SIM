@@ -35,11 +35,11 @@ CONFIG = {
     "model_name": "coupled_action_supervised_best",
     "model_directory": "robot_nav/models/MARL/marlTD3/checkpoint",
     "pretrained_model_name": "TDR-MARL-train",
-    "pretrained_directory": "robot_nav/models/MARL/marlTD3/checkpoint",
+    "pretrained_directory": "robot_nav/models/MARL/marlTD3/checkpoint/correct",
     
     # Evaluation configuration
-    "test_scenarios": 100,  # Number of test episodes
-    "max_steps": 600,  # Max steps per episode
+    "test_scenarios": 10,  # Number of test episodes
+    "max_steps": 1000,  # Max steps per episode
     "disable_plotting": False,  # Set to True to disable visualization
     
     # Policy configuration
@@ -260,7 +260,7 @@ def main():
     logger.info("Loading coupled action policy...")
     policy = CoupledActionPolicy(
         state_dim=config["state_dim"],
-        num_robots=num_robots,
+        num_robots= config["num_robots"],
         device=device,
         embedding_dim=config["embedding_dim"],
         attention=config["attention"],
