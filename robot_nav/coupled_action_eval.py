@@ -53,9 +53,6 @@ CONFIG = {
     # World configuration
     "world_file": "robot_nav/worlds/multi_robot_world.yaml",
     
-    # Output
-    "save_data": False,  # Set to True to save evaluation results
-    "data_save_path": "robot_nav/assets/coupled_action_eval_data.yml",
 }
 
 
@@ -308,13 +305,7 @@ def main():
     logger.info(f"Average v_shared: {summary['avg_v_shared']:.4f} ± {summary['std_v_shared']:.4f}")
     logger.info(f"Average progress/step: {summary['avg_progress_per_step']:.4f}")
     logger.info("=" * 50)
-    
-    # Save results if requested
-    if config["save_data"]:
-        import yaml
-        with open(config["data_save_path"], "w") as f:
-            yaml.dump(summary, f)
-        logger.info(f"Results saved to {config['data_save_path']}")
+
 
 
 if __name__ == "__main__":

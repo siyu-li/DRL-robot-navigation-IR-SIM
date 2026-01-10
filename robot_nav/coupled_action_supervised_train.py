@@ -37,7 +37,7 @@ CONFIG = {
     # Data paths
     "data_path": "robot_nav/assets/marl_data.yml",  # Can be comma-separated for multiple files
     "pretrained_model_name": "TDR-MARL-train",  # Name of pretrained decentralized model
-    "pretrained_directory": "robot_nav/models/MARL/marlTD3/checkpoint",
+    "pretrained_directory": "robot_nav/models/MARL/marlTD3/checkpoint/correct",
     
     # Training hyperparameters
     "epochs": 100,  # Number of training epochs
@@ -47,7 +47,7 @@ CONFIG = {
     "max_samples": None,  # Max samples to use (None = use all available)
     
     # V-label configuration
-    "v_label_mode": "p20",  # Aggregation mode: "p10", "p20", "p30", "mean", "min"
+    "v_label_mode": "mean",  # Aggregation mode: "p10", "p20", "p30", "mean", "min"
     "v_min": 0.0,  # Minimum linear velocity
     "v_max": 0.5,  # Maximum linear velocity
     
