@@ -485,6 +485,9 @@ class TD3WithLiDAR:
         av_loss = 0
         av_critic_loss = 0
 
+        # Calculate augmented state dimension
+        augmented_state_dim = self.state_dim + (self.lidar_num_beams if self.use_lidar else 0)
+
         for it in range(iterations):
             # Sample batch from original ReplayBuffer
             # States are already augmented (state + lidar concatenated)
@@ -496,12 +499,35 @@ class TD3WithLiDAR:
                 batch_next_states,
             ) = replay_buffer.sample_batch(batch_size)
 
-            # Convert to tensors - states are already augmented
-            state = torch.Tensor(batch_states).to(self.device)
-            next_state = torch.Tensor(batch_next_states).to(self.device)
-            action = torch.Tensor(batch_actions).to(self.device)
-            reward = torch.Tensor(batch_rewards).to(self.device).reshape(-1, 1)
-            done = torch.Tensor(batch_dones).to(self.device).reshape(-1, 1)
+            # Convert to tensors and reshape properly for attention
+            # State: (batch_size, num_robots, augmented_state_dim)
+            state = (
+                torch.Tensor(batch_states)
+                .to(self.device)
+                .view(batch_size, self.num_robots, augmented_state_dim)
+            )
+            next_state = (
+                torch.Tensor(batch_next_states)
+                .to(self.device)
+                .view(batch_size, self.num_robots, augmented_state_dim)
+            )
+            # Action: (batch_size * num_robots, action_dim)
+            action = (
+                torch.Tensor(batch_actions)
+                .to(self.device)
+                .view(batch_size * self.num_robots, self.action_dim)
+            )
+            # Reward and done: (batch_size * num_robots, 1)
+            reward = (
+                torch.Tensor(batch_rewards)
+                .to(self.device)
+                .view(batch_size * self.num_robots, 1)
+            )
+            done = (
+                torch.Tensor(batch_dones)
+                .to(self.device)
+                .view(batch_size * self.num_robots, 1)
+            )
 
             # Get next action from target (augmented state passed directly)
             with torch.no_grad():
