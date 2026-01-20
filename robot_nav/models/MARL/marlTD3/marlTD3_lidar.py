@@ -306,6 +306,11 @@ class TD3WithLiDAR:
         lidar_embed_dim: int = 12,  # Small for sector encoder
         lidar_encoder_kwargs: Optional[dict] = None,
         lidar_range_max: float = 7.0,
+        # Pretrained attention configuration
+        load_pretrained_attention: bool = False,
+        pretrained_attention_model_name: Optional[str] = None,
+        pretrained_attention_directory: Optional[Path] = None,
+        freeze_attention: bool = False,
     ):
         """
         Initialize TD3 with late LiDAR fusion.
@@ -331,6 +336,10 @@ class TD3WithLiDAR:
             lidar_embed_dim (int): LiDAR embedding dimension.
             lidar_encoder_kwargs (dict): Extra args for encoder.
             lidar_range_max (float): Max LiDAR range for normalization.
+            load_pretrained_attention (bool): Whether to load pretrained attention weights.
+            pretrained_attention_model_name (str, optional): Name of pretrained model.
+            pretrained_attention_directory (Path, optional): Directory containing pretrained weights.
+            freeze_attention (bool): Whether to freeze attention parameters during training.
         """
         self.num_robots = num_robots
         self.device = device
@@ -366,8 +375,25 @@ class TD3WithLiDAR:
         ).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
 
-        # Actor optimizer
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
+        # Store parameter groups for optimizer management
+        self.attn_params = list(self.actor.attention.parameters())
+        self.policy_params = list(self.actor.policy_head.parameters())
+        if use_lidar and self.actor.lidar_encoder is not None:
+            self.lidar_params = list(self.actor.lidar_encoder.parameters())
+        else:
+            self.lidar_params = []
+            
+        # Print parameter counts for debugging
+        print(f"Parameter counts:")
+        print(f"  Attention params: {sum(p.numel() for p in self.attn_params)}")
+        print(f"  Policy head params: {sum(p.numel() for p in self.policy_params)}")
+        print(f"  LiDAR encoder params: {sum(p.numel() for p in self.lidar_params)}")
+
+        # Actor optimizer includes attention, policy head, and lidar encoder
+        self.lr_actor = lr_actor  # Store for optimizer recreation
+        self.actor_optimizer = torch.optim.Adam(
+            self.policy_params + self.attn_params + self.lidar_params, lr=lr_actor
+        )
 
         # Initialize Critic with late fusion
         self.critic = CriticWithLiDAR(
@@ -403,6 +429,24 @@ class TD3WithLiDAR:
             load_model_name = model_name
         if load_model:
             self.load(filename=load_model_name, directory=load_directory)
+
+        # Load pretrained attention weights from decentralized model
+        if load_pretrained_attention:
+            if pretrained_attention_model_name is None:
+                raise ValueError(
+                    "pretrained_attention_model_name must be provided when "
+                    "load_pretrained_attention=True"
+                )
+            if pretrained_attention_directory is None:
+                raise ValueError(
+                    "pretrained_attention_directory must be provided when "
+                    "load_pretrained_attention=True"
+                )
+            self.load_pretrained_attention(
+                filename=pretrained_attention_model_name,
+                directory=pretrained_attention_directory,
+                freeze_attention=freeze_attention,
+            )
 
         self.save_every = save_every
         self.model_name = model_name
@@ -642,6 +686,128 @@ class TD3WithLiDAR:
             torch.load(f"{directory}/{filename}_critic_target.pth", map_location=self.device)
         )
         print(f"Loaded weights from: {directory}/{filename}")
+
+    def load_pretrained_attention(self, filename: str, directory: Path, freeze_attention: bool = False):
+        """
+        Load pretrained attention network weights from a decentralized MARL model.
+
+        This method loads only the attention module weights from a pretrained
+        decentralized marlTD3 model into the actor and critic networks.
+        The policy head, critic Q-network layers, and LiDAR encoder are left with
+        their current (randomly initialized) weights.
+
+        Args:
+            filename (str): Base filename for the pretrained model files
+                (e.g., "TDR-MARL-train").
+            directory (Path or str): Path to the directory containing the
+                pretrained model files.
+            freeze_attention (bool, optional): If True, freezes the attention
+                network parameters so they are not updated during training.
+                Defaults to False.
+
+        Example:
+            >>> model.load_pretrained_attention(
+            ...     filename="TDR-MARL-train",
+            ...     directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
+            ...     freeze_attention=True
+            ... )
+        """
+        # Load pretrained actor state dict (from decentralized model)
+        pretrained_actor_path = "%s/%s_actor.pth" % (directory, filename)
+        pretrained_actor_state = torch.load(
+            pretrained_actor_path, map_location=self.device
+        )
+
+        # Load pretrained critic state dict (from decentralized model)
+        pretrained_critic_path = "%s/%s_critic.pth" % (directory, filename)
+        pretrained_critic_state = torch.load(
+            pretrained_critic_path, map_location=self.device
+        )
+
+        # Extract only attention-related keys from actor
+        attention_keys_actor = {
+            k: v for k, v in pretrained_actor_state.items() if k.startswith("attention.")
+        }
+
+        # Extract only attention-related keys from critic
+        attention_keys_critic = {
+            k: v for k, v in pretrained_critic_state.items() if k.startswith("attention.")
+        }
+
+        # Load attention weights into actor
+        actor_state = self.actor.state_dict()
+        actor_state.update(attention_keys_actor)
+        self.actor.load_state_dict(actor_state)
+
+        # Load attention weights into actor_target
+        actor_target_state = self.actor_target.state_dict()
+        actor_target_state.update(attention_keys_actor)
+        self.actor_target.load_state_dict(actor_target_state)
+
+        # Load attention weights into critic
+        critic_state = self.critic.state_dict()
+        critic_state.update(attention_keys_critic)
+        self.critic.load_state_dict(critic_state)
+
+        # Load attention weights into critic_target
+        critic_target_state = self.critic_target.state_dict()
+        critic_target_state.update(attention_keys_critic)
+        self.critic_target.load_state_dict(critic_target_state)
+
+        print(f"Loaded pretrained attention weights from: {directory}/{filename}")
+        print(f"  Actor attention keys loaded: {len(attention_keys_actor)}")
+        print(f"  Critic attention keys loaded: {len(attention_keys_critic)}")
+
+        # Optionally freeze attention parameters
+        if freeze_attention:
+            self._freeze_attention_parameters()
+            print("  Attention parameters frozen (will not be updated during training)")
+
+    def _freeze_attention_parameters(self):
+        """
+        Freeze attention network parameters to prevent updates during training.
+
+        This is useful when you want to use pretrained attention weights and
+        only train the policy head, critic Q-networks, and LiDAR encoder.
+        """
+        for param in self.actor.attention.parameters():
+            param.requires_grad = False
+        for param in self.actor_target.attention.parameters():
+            param.requires_grad = False
+        for param in self.critic.attention.parameters():
+            param.requires_grad = False
+        for param in self.critic_target.attention.parameters():
+            param.requires_grad = False
+
+        # Update optimizer to only include trainable parameters (policy + lidar)
+        self.attn_params = []  # Clear attention params from optimizer
+        self.actor_optimizer = torch.optim.Adam(
+            self.policy_params + self.lidar_params, lr=self.lr_actor
+        )
+
+    def unfreeze_attention_parameters(self):
+        """
+        Unfreeze attention network parameters to allow updates during training.
+
+        Call this after initially training with frozen attention if you want to
+        fine-tune the full model.
+        """
+        for param in self.actor.attention.parameters():
+            param.requires_grad = True
+        for param in self.actor_target.attention.parameters():
+            param.requires_grad = True
+        for param in self.critic.attention.parameters():
+            param.requires_grad = True
+        for param in self.critic_target.attention.parameters():
+            param.requires_grad = True
+
+        # Update optimizer to include attention parameters again
+        self.attn_params = list(self.actor.attention.parameters())
+        self.actor_optimizer = torch.optim.Adam(
+            self.policy_params + self.attn_params + self.lidar_params,
+            lr=self.lr_actor
+        )
+        print("Attention parameters unfrozen (will be updated during training)")
 
     def prepare_state(
         self,

@@ -50,7 +50,8 @@ def main(args=None):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # using cuda if it is available, cpu otherwise
-    max_epochs = 50  # max number of epochs
+    print(f"Using device: {device}")
+    max_epochs = 500  # max number of epochs
     epoch = 1  # starting epoch number
     episode = 0  # starting episode number
     train_every_n = 10  # train and update network parameters every n episodes
@@ -62,6 +63,10 @@ def main(args=None):
     pretrain = False  # whether to use the loaded experiences to pre-train the model
     pretraining_iterations = 10  # number of training iterations to run during pre-training
     save_every = 5  # save the model every n training cycles
+
+    # ---- Environment Hyperparameters ----
+    per_robot_goal_reset = True  # whether to reset individual robot goals when they are reached
+
 
     # ---- LiDAR Hyperparameters ----
     use_lidar = True  # whether to use LiDAR observations
@@ -84,6 +89,7 @@ def main(args=None):
         lidar_range_max=lidar_range_max,
         random_obstacles=random_obstacles,
         num_obstacles=num_obstacles,
+        per_robot_goal_reset=per_robot_goal_reset,
     )  # instantiate environment
 
     model = TD3WithLiDAR(
@@ -96,6 +102,11 @@ def main(args=None):
         load_model=False,
         model_name="MARL-LiDAR-train",
         attention="igs",
+        # Load pretrained attention weights from decentralized model
+        load_pretrained_attention=True,
+        pretrained_attention_model_name="TDR-MARL-train",
+        pretrained_attention_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
+        freeze_attention=True,  # Set to True to freeze attention during training
         use_lidar=use_lidar,
         lidar_encoder_type="sector",  # use sector encoder (min-range, no NN)
         lidar_num_beams=lidar_num_beams,
