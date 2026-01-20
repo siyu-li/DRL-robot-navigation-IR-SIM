@@ -185,27 +185,28 @@ class MARL_SIM(SIM_ENV):
                     self.env.draw_trajectory(
                         np.array([rx, ry]), refresh=True, linewidth=weight * 2
                     )
-
-            # if goal:
-            #     self.env.robot_list[i].set_random_goal(
-            #         obstacle_list=self.env.obstacle_list,
-            #         init=True,
-            #         range_limits=[
-            #             [self.x_range[0] + 1, self.y_range[0] + 1, -3.141592653589793],
-            #             [self.x_range[1] - 1, self.y_range[1] - 1, 3.141592653589793],
-            #         ],
-            #     )
-
-        if all(goals):
-            for i in range(self.num_robots):
-                self.env.robot_list[i].set_random_goal(
-                    obstacle_list=self.env.obstacle_list,
-                    init=True,
-                    range_limits=[
-                        [self.x_range[0] + 1, self.y_range[0] + 1, -3.141592653589793],
-                        [self.x_range[1] - 1, self.y_range[1] - 1, 3.141592653589793],
-                    ],
-                )
+                # Reset goals individually if reached
+                if self.per_robot_goal_reset and goal:
+                    self.env.robot_list[i].set_random_goal(
+                        obstacle_list=self.env.obstacle_list,
+                        init=True,
+                        range_limits=[
+                            [self.x_range[0] + 1, self.y_range[0] + 1, -3.141592653589793],
+                            [self.x_range[1] - 1, self.y_range[1] - 1, 3.141592653589793],
+                        ],
+                    )
+            
+            # Handle all goals reached
+            if not self.per_robot_goal_reset and all(goals):
+                for i in range(self.num_robots):
+                    self.env.robot_list[i].set_random_goal(
+                        obstacle_list=self.env.obstacle_list,
+                        init=True,
+                        range_limits=[
+                            [self.x_range[0] + 1, self.y_range[0] + 1, -3.141592653589793],
+                            [self.x_range[1] - 1, self.y_range[1] - 1, 3.141592653589793],
+                        ],
+                    )
 
         return (
             poses,

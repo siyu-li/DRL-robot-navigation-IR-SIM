@@ -40,7 +40,7 @@ def main(args=None):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # using cuda if it is available, cpu otherwise
-    max_epochs = 50  # max number of epochs
+    max_epochs = 2000  # max number of epochs
     epoch = 1  # starting epoch number
     episode = 0  # starting episode number
     train_every_n = 10  # train and update network parameters every n episodes
@@ -54,14 +54,19 @@ def main(args=None):
         10  # number of training iterations to run during pre-training
     )
     save_every = 5  # save the model every n training cycles
-    save_data = True  # whether to save experience data to YAML for centralized pretraining
+    save_data = False  # whether to save experience data to YAML for centralized pretraining
     data_save_path = "robot_nav/assets/marl_data.yml"  # path to save experience data
+
+    # ---- Environment Hyperparameters ----
+    per_robot_goal_reset = True  # whether to reset individual robot goals when they are reached
+
 
     # ---- Instantiate simulation environment and model ----
     sim = MARL_SIM(
         world_file="robot_nav/worlds/multi_robot_world.yaml",
         disable_plotting=True,
         reward_phase=1,
+        per_robot_goal_reset=per_robot_goal_reset,
     )  # instantiate environment
 
     model = TD3(
