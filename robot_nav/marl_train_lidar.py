@@ -51,7 +51,7 @@ def main(args=None):
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # using cuda if it is available, cpu otherwise
     print(f"Using device: {device}")
-    max_epochs = 500  # max number of epochs
+    max_epochs = 1000  # max number of epochs
     epoch = 1  # starting epoch number
     episode = 0  # starting episode number
     train_every_n = 10  # train and update network parameters every n episodes
@@ -100,10 +100,10 @@ def main(args=None):
         device=device,
         save_every=save_every,
         load_model=False,
-        model_name="MARL-LiDAR-train",
+        model_name="MARL-LiDAR-train-noload",
         attention="igs",
         # Load pretrained attention weights from decentralized model
-        load_pretrained_attention=True,
+        load_pretrained_attention=False,
         pretrained_attention_model_name="TDR-MARL-train",
         pretrained_attention_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
         freeze_attention=True,  # Set to True to freeze attention during training
