@@ -515,6 +515,25 @@ class MARL_LIDAR_SIM(SIM_ENV):
                     if laser_scan is not None:
                         obs_pen = obstacle_penalty(laser_scan * self.lidar_range_max, threshold=1.35)
                     return -0.5 * abs(action[1]) - cl_pen - obs_pen
+            case 3: # cap the goal proximity reward
+                if goal:
+                    return 100.0
+                elif collision:
+                    return -100.0 * 3 * action[0]
+                else:
+                    r_dist = 10 * np.exp(-distance)
+                    # time penalty
+                    t_pen = -0.1
+                    # Robot proximity penalty
+                    cl_pen = 0
+                    for rob in closest_robots:
+                        add = (5 - rob) ** 2 if rob < 5 else 0
+                        cl_pen += add
+                    # obstacle proximity penalty
+                    obs_pen = 0
+                    if laser_scan is not None:
+                        obs_pen = obstacle_penalty(laser_scan * self.lidar_range_max, threshold=1.35)
+                    return action[0] - 0.5 * abs(action[1]) - cl_pen - obs_pen + r_dist + t_pen
 
             case _:
                 raise ValueError("Unknown reward phase")

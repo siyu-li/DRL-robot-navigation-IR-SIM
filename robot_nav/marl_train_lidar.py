@@ -19,8 +19,9 @@ from robot_nav.SIM_ENV.marl_lidar_sim import MARL_LIDAR_SIM
 from robot_nav.utils import get_buffer
 
 # Suppress IRSim warnings
-logging.getLogger("irsim").setLevel(logging.ERROR)
-
+# logging.getLogger("irsim").setLevel(logging.ERROR)
+from loguru import logger
+logger.disable("irsim")
 
 def outside_of_bounds(poses, sim):
     """
@@ -51,7 +52,7 @@ def main(args=None):
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # using cuda if it is available, cpu otherwise
     print(f"Using device: {device}")
-    max_epochs = 1000  # max number of epochs
+    max_epochs = 500  # max number of epochs
     epoch = 1  # starting epoch number
     episode = 0  # starting episode number
     train_every_n = 10  # train and update network parameters every n episodes
@@ -83,7 +84,7 @@ def main(args=None):
     sim = MARL_LIDAR_SIM(
         world_file="robot_nav/worlds/multi_robot_world_lidar.yaml",
         disable_plotting=True,
-        reward_phase=1,
+        reward_phase=3,
         use_lidar=use_lidar,
         lidar_num_beams=lidar_num_beams,
         lidar_range_max=lidar_range_max,
@@ -99,8 +100,11 @@ def main(args=None):
         num_robots=sim.num_robots,
         device=device,
         save_every=save_every,
-        load_model=False,
-        model_name="MARL-LiDAR-train-noload",
+        load_model=True,
+        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
+        model_name="MARL-LiDAR-train-finetune",
+        load_model_name="MARL-LiDAR-train",
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Jan.20_ver2"),
         attention="igs",
         # Load pretrained attention weights from decentralized model
         load_pretrained_attention=False,

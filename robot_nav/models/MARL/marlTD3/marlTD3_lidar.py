@@ -299,7 +299,7 @@ class TD3WithLiDAR:
         load_model_name: Optional[str] = None,
         load_directory: Path = Path("robot_nav/models/MARL/marlTD3/checkpoint"),
         attention: str = "igs",
-        # LiDAR configuration
+        # LiDAR configurationd
         use_lidar: bool = True,
         lidar_encoder_type: str = "sector",  # "sector", "mlp", or "cnn"
         lidar_num_beams: int = 180,

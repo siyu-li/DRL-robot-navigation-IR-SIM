@@ -26,6 +26,7 @@ class MARL_SIM(SIM_ENV):
         world_file="multi_robot_world.yaml",
         disable_plotting=False,
         reward_phase=1,
+        per_robot_goal_reset=True,
     ):
         """
         Initialize the MARL_SIM environment.
@@ -51,6 +52,7 @@ class MARL_SIM(SIM_ENV):
         self.x_range = self.env._world.x_range
         self.y_range = self.env._world.y_range
         self.reward_phase = reward_phase
+        self.per_robot_goal_reset = per_robot_goal_reset
 
     def step(self, action, connection, combined_weights=None):
         """
