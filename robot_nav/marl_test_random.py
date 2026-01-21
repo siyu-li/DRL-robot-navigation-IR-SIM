@@ -42,7 +42,7 @@ def main(args=None):
     )  # using cuda if it is available, cpu otherwise
     epoch = 1  # starting epoch number
     episode = 0
-    max_steps = 600  # maximum number of steps in single episode
+    max_steps = 100  # maximum number of steps in single episode
     steps = 0  # starting step number
     save_every = 5  # save the model every n training cycles
     test_scenarios = 200
@@ -54,6 +54,7 @@ def main(args=None):
         world_file="robot_nav/worlds/multi_robot_world.yaml",
         disable_plotting=False,
         reward_phase=2,
+        per_robot_goal_reset=True,
     )  # instantiate environment
 
     model = TD3(
@@ -66,7 +67,7 @@ def main(args=None):
         load_model=True,
         model_name="TDR-MARL-test",
         load_model_name="TDR-MARL-train",
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/correct"),
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Jan.19_noobstacle"),
         # attention="g2anet",
         attention="igs"
     )  # instantiate a model

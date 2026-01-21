@@ -294,7 +294,7 @@ class TD3WithLiDAR:
         lr_critic: float = 3e-4,
         save_every: int = 0,
         load_model: bool = False,
-        save_directory: Path = Path("robot_nav/models/MARL/marlTD3/checkpoint/Jan.20_noloadattention"),
+        save_directory: Path = Path("robot_nav/models/MARL/marlTD3/checkpoint"),
         model_name: str = "marlTD3_lidar",
         load_model_name: Optional[str] = None,
         load_directory: Path = Path("robot_nav/models/MARL/marlTD3/checkpoint"),
