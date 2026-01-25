@@ -476,7 +476,7 @@ class MARL_LIDAR_SIM(SIM_ENV):
         Returns:
             float: Computed scalar reward.
         """
-        def obstacle_penalty(scan, threshold=1.35):
+        def obstacle_penalty(scan, threshold=2):
             min_reading = min(scan)
             return (threshold - min_reading) ** 2 if min_reading < threshold else 0.0
         

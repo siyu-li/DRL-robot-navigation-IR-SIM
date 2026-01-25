@@ -11,6 +11,7 @@ Key features:
 - Provides obstacle state observations for the GAT
 """
 
+import warnings
 import irsim
 import numpy as np
 import random
@@ -20,6 +21,9 @@ from shapely.geometry import Point
 from typing import List, Tuple, Optional
 
 from robot_nav.SIM_ENV.sim_env import SIM_ENV
+
+# Suppress matplotlib color redundancy warning from irsim
+warnings.filterwarnings("ignore", message="color is redundantly defined")
 
 
 class MARL_SIM_OBSTACLE(SIM_ENV):
@@ -240,20 +244,60 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
 
             # Visualization (if weights provided)
             if combined_weights is not None:
-                i_weights = combined_weights[i, :self.num_robots].tolist()
-                weight_idx = 0
+                # combined_weights has shape (batch, n_robots, n_total) where n_total = n_robots + n_obstacles
+                # Squeeze batch dimension if present
+                if combined_weights.dim() == 3:
+                    weights = combined_weights[0]  # Remove batch dim -> (n_robots, n_total)
+                else:
+                    weights = combined_weights  # Already (n_robots, n_total)
+                
+                i_weights_all = weights[i].tolist()
+                n_weights = len(i_weights_all)
+                
+                # Visualize robot-robot attention weights (blue lines)
                 for j in range(self.num_robots):
                     if i == j:
                         continue
-                    weight = i_weights[weight_idx]
-                    weight_idx += 1
-                    other_robot_state = self.env.robot_list[j].state
-                    other_pos = [other_robot_state[0].item(), other_robot_state[1].item()]
-                    rx = [position[0], other_pos[0]]
-                    ry = [position[1], other_pos[1]]
-                    self.env.draw_trajectory(
-                        np.array([rx, ry]), refresh=True, linewidth=weight * 2
-                    )
+                    if j >= n_weights:
+                        break
+                    weight = i_weights_all[j]  # Direct indexing by j
+                    
+                    # Ensure weight is a scalar float
+                    if isinstance(weight, (list, np.ndarray)):
+                        weight = float(weight[0] if len(weight) > 0 else 0.0)
+                    else:
+                        weight = float(weight)
+                    
+                    if weight > 0.01:  # Only draw if weight is significant
+                        other_robot_state = self.env.robot_list[j].state
+                        other_pos = [other_robot_state[0].item(), other_robot_state[1].item()]
+                        rx = [position[0], other_pos[0]]
+                        ry = [position[1], other_pos[1]]
+                        self.env.draw_trajectory(
+                            np.array([rx, ry]), refresh=True, linewidth=weight * 2, color='blue', alpha=0.6
+                        )
+                
+                # Visualize robot-obstacle attention weights (red lines)
+                # Number of obstacle weights available in combined_weights
+                n_obs_weights = n_weights - self.num_robots
+                for k in range(min(self.num_obstacles, n_obs_weights)):
+                    obs_idx = self.num_robots + k
+                    weight = i_weights_all[obs_idx]
+                    
+                    # Ensure weight is a scalar float
+                    if isinstance(weight, (list, np.ndarray)):
+                        weight = float(weight[0] if len(weight) > 0 else 0.0)
+                    else:
+                        weight = float(weight)
+                    
+                    if weight > 0.01:  # Only draw if weight is significant
+                        obs_pos = self.env.obstacle_list[k].position.flatten()
+                        obs_x, obs_y = obs_pos[0], obs_pos[1]
+                        rx = [position[0], obs_x]
+                        ry = [position[1], obs_y]
+                        self.env.draw_trajectory(
+                            np.array([rx, ry]), refresh=True, linewidth=weight * 2, color='red', alpha=0.6
+                        )
 
             # Reset goal if reached
             if self.per_robot_goal_reset and goal:
@@ -389,7 +433,7 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
     @staticmethod
     def get_reward(
         goal, collision, action, closest_robots, distance,
-        min_obstacle_clearance, obstacle_threshold, phase=1
+        min_obstacle_clearance, obstacle_threshold, phase=3
     ):
         """
         Compute the reward for a single robot with obstacle penalty.
@@ -453,9 +497,9 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                 if goal:
                     return 100.0
                 elif collision:
-                    return -150.0 * action[0]
+                    return -100.0 * 3 * action[0]
                 else:
-                    r_dist = 1.5 / distance
+                    r_dist = 10 * np.exp(-distance)
 
                     # Robot proximity penalty
                     cl_pen = 0

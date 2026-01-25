@@ -73,13 +73,13 @@ def main(args=None):
 
     # Environment hyperparameters
     per_robot_goal_reset = True
-    obstacle_proximity_threshold = 1.5  # For reward penalty
+    obstacle_proximity_threshold = 2.0  # For reward penalty
 
     # ---- Instantiate environment ----
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_lidar.yaml",
         disable_plotting=True,
-        reward_phase=1,
+        reward_phase=3,
         per_robot_goal_reset=per_robot_goal_reset,
         obstacle_proximity_threshold=obstacle_proximity_threshold,
     )
