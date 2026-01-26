@@ -52,7 +52,7 @@ def main(args=None):
         "cuda" if torch.cuda.is_available() else "cpu"
     )  # using cuda if it is available, cpu otherwise
     print(f"Using device: {device}")
-    max_epochs = 500  # max number of epochs
+    max_epochs = 3000  # max number of epochs
     epoch = 1  # starting epoch number
     episode = 0  # starting episode number
     train_every_n = 10  # train and update network parameters every n episodes
@@ -71,7 +71,7 @@ def main(args=None):
 
     # ---- LiDAR Hyperparameters ----
     use_lidar = True  # whether to use LiDAR observations
-    lidar_num_beams = 180  # number of LiDAR beams
+    lidar_num_beams = 13  # number of LiDAR beams
     lidar_range_max = 7.0  # maximum LiDAR range
     lidar_num_sectors = 12  # number of sectors for min-range aggregation
     lidar_embed_dim = 12  # LiDAR embedding dim = num_sectors (no NN projection)
@@ -156,6 +156,9 @@ def main(args=None):
     running_goals = 0
     running_collisions = 0
     running_timesteps = 0
+    
+    # Checkpoint saving parameters
+    checkpoint_every = 150  # Save checkpoint with epoch number every N epochs
 
     # ---- Main training loop ----
     while epoch < max_epochs:  # train until max_epochs is reached
@@ -215,11 +218,17 @@ def main(args=None):
             ) = sim.reset(random_obstacles=random_obstacles)
             episode += 1
             if episode % train_every_n == 0:
+                # Log run metrics with iter_count for consistency
+                avg_goal_rate = running_goals / max(running_timesteps, 1)
+                avg_collision_rate = running_collisions / max(running_timesteps, 1)
                 model.writer.add_scalar(
-                    "run/avg_goal", running_goals / running_timesteps, epoch
+                    "run/avg_goal", avg_goal_rate, model.iter_count
                 )
                 model.writer.add_scalar(
-                    "run/avg_collision", running_collisions / running_timesteps, epoch
+                    "run/avg_collision", avg_collision_rate, model.iter_count
+                )
+                model.writer.add_scalar(
+                    "run/buffer_size", replay_buffer.size(), model.iter_count
                 )
                 running_goals = 0
                 running_collisions = 0
@@ -230,6 +239,12 @@ def main(args=None):
                     iterations=training_iterations,
                     batch_size=batch_size,
                 )  # train the model and update its parameters
+                
+                # Save checkpoint with epoch number every checkpoint_every epochs
+                if epoch % checkpoint_every == 0:
+                    checkpoint_name = f"{model.model_name}_epoch{epoch}"
+                    model.save(filename=checkpoint_name, directory=model.save_directory)
+                    print(f"Checkpoint saved: {checkpoint_name}")
 
             steps = 0
         else:

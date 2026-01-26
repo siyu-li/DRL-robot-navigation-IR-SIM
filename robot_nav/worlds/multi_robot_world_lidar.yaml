@@ -23,7 +23,7 @@ robot:
         range_min: 0
         range_max: 7
         angle_range: 3.14159  # 180 degrees (PI radians)
-        number: 180  # Number of beams
+        number: 13  # Number of beams
         noise: True
         std: 0.08
         angle_std: 0.1

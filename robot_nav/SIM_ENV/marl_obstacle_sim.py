@@ -475,22 +475,11 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
 
             case 2:
                 if goal:
-                    return 70.0
+                    return 100.0
                 elif collision:
-                    return -100.0 * 3 * action[0]
+                    return -100.0 
                 else:
-                    # Robot proximity penalty
-                    cl_pen = 0
-                    for rob in closest_robots:
-                        add = (3 - rob) ** 2 if rob < 3 else 0
-                        cl_pen += add
-
-                    # Obstacle proximity penalty
-                    obs_pen = 0
-                    if min_obstacle_clearance < obstacle_threshold:
-                        obs_pen = (obstacle_threshold - min_obstacle_clearance) ** 2
-
-                    return -0.5 * abs(action[1]) - cl_pen - obs_pen
+                    return -0.1
 
             case 3:
                 # Phase 3: Stronger obstacle avoidance emphasis

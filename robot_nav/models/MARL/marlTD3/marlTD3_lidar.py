@@ -528,6 +528,9 @@ class TD3WithLiDAR:
         max_Q = -inf
         av_loss = 0
         av_critic_loss = 0
+        av_actor_loss = 0
+        av_critic_entropy = []
+        av_actor_entropy = []
 
         # Calculate augmented state dimension
         augmented_state_dim = self.state_dim + (self.lidar_num_beams if self.use_lidar else 0)
@@ -602,6 +605,7 @@ class TD3WithLiDAR:
 
             # Add entropy bonus
             critic_loss -= entropy_weight * entropy
+            av_critic_entropy.append(entropy.item())
 
             av_critic_loss += critic_loss.item()
 
@@ -621,8 +625,10 @@ class TD3WithLiDAR:
 
                 # Add entropy bonus to actor
                 actor_loss -= entropy_weight * actor_entropy
+                av_actor_entropy.append(actor_entropy.item())
 
                 av_loss += actor_loss.item()
+                av_actor_loss += actor_loss.item()
 
                 # Update actor
                 self.actor_optimizer.zero_grad()
@@ -653,6 +659,21 @@ class TD3WithLiDAR:
         self.writer.add_scalar("train/max_Q", max_Q, self.iter_count)
         self.writer.add_scalar(
             "train/critic_loss", av_critic_loss / iterations, self.iter_count
+        )
+        self.writer.add_scalar(
+            "train/actor_loss",
+            av_actor_loss / (iterations // policy_freq) if iterations >= policy_freq else 0,
+            self.iter_count,
+        )
+        self.writer.add_scalar(
+            "train/av_critic_entropy",
+            sum(av_critic_entropy) / len(av_critic_entropy) if av_critic_entropy else 0,
+            self.iter_count,
+        )
+        self.writer.add_scalar(
+            "train/av_actor_entropy",
+            sum(av_actor_entropy) / len(av_actor_entropy) if av_actor_entropy else 0,
+            self.iter_count,
         )
 
         if self.save_every > 0 and self.iter_count % self.save_every == 0:

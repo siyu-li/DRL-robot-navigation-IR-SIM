@@ -60,7 +60,7 @@ def main(args=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    max_epochs = 2000
+    max_epochs = 3000
     epoch = 1
     episode = 0
     train_every_n = 10
@@ -79,7 +79,7 @@ def main(args=None):
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_lidar.yaml",
         disable_plotting=True,
-        reward_phase=3,
+        reward_phase=2,
         per_robot_goal_reset=per_robot_goal_reset,
         obstacle_proximity_threshold=obstacle_proximity_threshold,
     )
@@ -99,9 +99,11 @@ def main(args=None):
         obstacle_state_dim=obstacle_state_dim,
         device=device,
         save_every=save_every,
-        load_model=False,
-        model_name="TD3-MARL-obstacle",
-        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle"),
+        load_model=True,
+        load_model_name="TD3-MARL-obstacle_epoch750",
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle"),
+        model_name="TD3-MARL-obstacle_v2",
+        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_v2"),
     )
 
     # ---- Setup replay buffer ----
@@ -116,6 +118,9 @@ def main(args=None):
     running_goals = 0
     running_collisions = 0
     running_timesteps = 0
+    
+    # Checkpoint saving parameters
+    checkpoint_every = 150  # Save checkpoint with epoch number every N epochs
 
     print(f"\nStarting training...")
     print(f"Initial obstacle states shape: {obstacle_states.shape}")
@@ -184,6 +189,22 @@ def main(args=None):
 
             # Training
             if episode >= train_every_n and replay_buffer.size() >= batch_size:
+                # Log run metrics with iter_count for consistency (before train increments iter_count)
+                avg_goal_rate = running_goals / max(running_timesteps, 1)
+                avg_collision_rate = running_collisions / max(running_timesteps, 1)
+                model.writer.add_scalar(
+                    "run/avg_goal", avg_goal_rate, model.iter_count
+                )
+                model.writer.add_scalar(
+                    "run/avg_collision", avg_collision_rate, model.iter_count
+                )
+                model.writer.add_scalar(
+                    "run/buffer_size", replay_buffer.size(), model.iter_count
+                )
+                running_goals = 0
+                running_collisions = 0
+                running_timesteps = 0
+                
                 model.train(
                     replay_buffer,
                     training_iterations,
@@ -192,20 +213,21 @@ def main(args=None):
                     connection_proximity_threshold_ro=2.0,
                 )
                 episode = 0
+                
+                # Save checkpoint with epoch number every checkpoint_every epochs
+                if epoch % checkpoint_every == 0:
+                    checkpoint_name = f"{model.model_name}_epoch{epoch}"
+                    model.save(filename=checkpoint_name, directory=model.save_directory)
+                    print(f"Checkpoint saved: {checkpoint_name}")
 
-                # Logging
+                # Console logging
                 if epoch % 10 == 0:
-                    avg_goals = running_goals / max(running_timesteps, 1) * 100
-                    avg_collisions = running_collisions / max(running_timesteps, 1) * 100
                     print(
                         f"Epoch {epoch}/{max_epochs} | "
                         f"Buffer: {replay_buffer.size()} | "
-                        f"Goals: {avg_goals:.1f}% | "
-                        f"Collisions: {avg_collisions:.1f}%"
+                        f"Goals: {avg_goal_rate*100:.1f}% | "
+                        f"Collisions: {avg_collision_rate*100:.1f}%"
                     )
-                    running_goals = 0
-                    running_collisions = 0
-                    running_timesteps = 0
 
     print("\nTraining complete!")
     model.save(filename=model.model_name, directory=model.save_directory)
