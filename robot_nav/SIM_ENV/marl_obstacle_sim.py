@@ -73,6 +73,9 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         self.reward_phase = reward_phase
         self.per_robot_goal_reset = per_robot_goal_reset
         self.obstacle_proximity_threshold = obstacle_proximity_threshold
+        
+        # Track previous distances for progress-based reward
+        self.prev_distances = [None] * self.num_robots
 
     def get_obstacle_states(self) -> np.ndarray:
         """
@@ -219,11 +222,18 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
             # Min clearance to obstacles
             min_clearance = min(clearances[i]) if clearances[i] else float('inf')
 
+            # Get previous distance for progress-based reward
+            prev_distance = self.prev_distances[i]
+
             # Compute reward with obstacle penalty
             reward = self.get_reward(
                 goal, collision, action_i, closest_robots, distance,
-                min_clearance, self.obstacle_proximity_threshold, self.reward_phase
+                min_clearance, self.obstacle_proximity_threshold, self.reward_phase,
+                prev_distance=prev_distance
             )
+            
+            # Update previous distance for next step
+            self.prev_distances[i] = distance
 
             position = [robot_state[0].item(), robot_state[1].item()]
             goal_position = [robot_goal[0].item(), robot_goal[1].item()]
@@ -309,6 +319,9 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                         [self.x_range[1] - 1, self.y_range[1] - 1, np.pi],
                     ],
                 )
+                # Reset prev_distance for this robot to avoid spurious progress reward
+                # when goal changes (new goal has different distance)
+                self.prev_distances[i] = None
 
         # Get obstacle states
         obstacle_states = self.get_obstacle_states()
@@ -409,6 +422,9 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
 
         self.env.reset()
         self.robot_goal = self.env.robot.goal
+        
+        # Reset previous distances for progress-based reward
+        self.prev_distances = [None] * self.num_robots
 
         action = [[0.0, 0.0] for _ in range(self.num_robots)]
         (
@@ -433,7 +449,8 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
     @staticmethod
     def get_reward(
         goal, collision, action, closest_robots, distance,
-        min_obstacle_clearance, obstacle_threshold, phase=3
+        min_obstacle_clearance, obstacle_threshold, phase=3,
+        prev_distance=None
     ):
         """
         Compute the reward for a single robot with obstacle penalty.
@@ -446,7 +463,8 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
             distance (float): Current distance to the goal.
             min_obstacle_clearance (float): Minimum clearance to any obstacle.
             obstacle_threshold (float): Distance threshold for obstacle penalty.
-            phase (int): Reward configuration (1, 2, or 3).
+            phase (int): Reward configuration (1, 2, 3, or 5).
+            prev_distance (float or None): Previous distance to goal (for progress reward).
 
         Returns:
             float: Computed scalar reward.
@@ -502,6 +520,35 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                         obs_pen = 2.0 * (obstacle_threshold - min_obstacle_clearance) ** 2
 
                     return action[0] - 0.5 * abs(action[1]) - cl_pen - obs_pen + r_dist
+            
+            case 5:
+                # Phase 5: Progress-based reward (change in distance to goal)
+                if goal:
+                    return 100.0
+                elif collision:
+                    return -100.0 * 3 * action[0]
+                else:
+                    # Progress reward: positive if moving closer, negative if moving away
+                    k_p = 5.0  # Progress reward scaling factor
+                    if prev_distance is not None:
+                        progress = prev_distance - distance
+                        r_progress = k_p * progress
+                    else:
+                        # First step: no previous distance, use small baseline
+                        r_progress = 0.0
 
+                    # Robot proximity penalty
+                    cl_pen = 0
+                    for rob in closest_robots:
+                        add = (1.25 - rob) ** 2 if rob < 1.25 else 0
+                        cl_pen += add
+
+                    # Obstacle proximity penalty
+                    obs_pen = 0
+                    if min_obstacle_clearance < obstacle_threshold:
+                        obs_pen = 2.0 * (obstacle_threshold - min_obstacle_clearance) ** 2
+
+                    return action[0] - 0.5 * abs(action[1]) - cl_pen - obs_pen + r_progress
+                
             case _:
                 raise ValueError(f"Unknown reward phase: {phase}")
