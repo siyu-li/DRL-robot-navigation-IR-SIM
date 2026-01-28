@@ -104,7 +104,7 @@ def main(args=None):
         load_model_name="TD3-MARL-obstacle-6robots",
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots"),
         model_name="TD3-MARL-obstacle-6robots",
-        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots"),
+        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2"),
     )
 
     # ---- Setup replay buffer ----
@@ -183,7 +183,7 @@ def main(args=None):
             (
                 poses, distance, cos, sin, collision, goal, a, reward,
                 positions, goal_positions, obstacle_states
-            ) = sim.reset()
+            ) = sim.reset(random_obstacles=True)
 
             steps = 0
             epoch += 1
