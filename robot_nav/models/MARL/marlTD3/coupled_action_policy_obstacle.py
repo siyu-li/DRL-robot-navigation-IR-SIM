@@ -1,20 +1,19 @@
 """
-Coupled Action Policy for Multi-Robot Navigation.
+Coupled Action Policy with Obstacle Awareness for Group-based Multi-Robot Navigation.
 
-This module implements a policy where:
-- All robots share ONE linear velocity v_shared.
-- Each robot has its own angular velocity w_i.
+This module extends coupled_action_policy.py to:
+1. Support obstacle graph nodes (like marlTD3_obstacle.py)
+2. Use group-based embedding pooling for v_shared
+3. Work with the obstacle-aware attention mechanism (iga_obstacle.py)
 
-The shared velocity is predicted from a global embedding G computed via
-permutation-invariant pooling (mean) over per-robot embeddings H = {h_i}.
-
-Extended to support active group selection:
-- If active_group is provided, pool only over active robots for G
-- Only robots in the active group receive non-zero actions
+Key Architecture:
+- Uses AttentionObstacle instead of Attention for obstacle-aware embeddings
+- Pools embeddings only from robots in the active group for G
+- Outputs v_shared for the group and per-robot omega
 """
 
 from pathlib import Path
-from typing import Optional, Literal, List, Tuple
+from typing import Optional, Literal, List, Tuple, Union
 
 import numpy as np
 import torch
@@ -22,8 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from robot_nav.models.MARL.Attention.g2anet import G2ANet
-from robot_nav.models.MARL.Attention.iga import Attention
+from robot_nav.models.MARL.Attention.iga_obstacle import AttentionObstacle
 
 
 class SharedVelocityHead(nn.Module):
@@ -31,12 +29,6 @@ class SharedVelocityHead(nn.Module):
     MLP head that predicts a shared linear velocity from a global embedding.
     
     The output is constrained to [v_min, v_max] using sigmoid scaling.
-    
-    Args:
-        input_dim (int): Dimension of the global embedding G.
-        hidden_dim (int): Hidden layer dimension.
-        v_min (float): Minimum linear velocity.
-        v_max (float): Maximum linear velocity.
     """
     
     def __init__(
@@ -56,7 +48,7 @@ class SharedVelocityHead(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LeakyReLU(),
             nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid(),  # Output in [0, 1], then scale to [v_min, v_max]
+            nn.Sigmoid(),
         )
     
     def forward(self, global_embedding: torch.Tensor) -> torch.Tensor:
@@ -69,28 +61,23 @@ class SharedVelocityHead(nn.Module):
         Returns:
             Tensor: Shared velocity v_shared of shape (B, 1) in [v_min, v_max].
         """
-        raw_output = self.mlp(global_embedding)  # (B, 1) in [0, 1]
+        raw_output = self.mlp(global_embedding)
         v_shared = self.v_min + raw_output * (self.v_max - self.v_min)
         return v_shared
 
 
-class CoupledActionActor(nn.Module):
+class CoupledActionActorObstacle(nn.Module):
     """
-    Actor network for coupled action policy.
+    Actor network for coupled action policy with obstacle awareness.
     
     Computes:
-    - Per-robot embeddings H = {h_i} via GAT encoder
-    - Global embedding G = mean(H) via permutation-invariant pooling
+    - Per-robot embeddings H via obstacle-aware GAT encoder
+    - Group embedding G = mean(H_group) via pooling over group robots only
     - Shared linear velocity v_shared = v_head(G)
     - Per-robot angular velocities w_i = omega_head(h_i)
     
-    Extended to support active group selection:
-    - If active_group is provided, pool only over active robots for G
-    - Only robots in active_group receive non-zero actions
-    
     Args:
         embedding_dim (int): Dimension of per-robot embeddings from GAT.
-        attention (str): Attention mechanism type, one of {"igs", "g2anet"}.
         v_min (float): Minimum linear velocity for v_shared.
         v_max (float): Maximum linear velocity for v_shared.
         pooling (str): Pooling method for computing G, one of {"mean", "max"}.
@@ -101,7 +88,6 @@ class CoupledActionActor(nn.Module):
     def __init__(
         self,
         embedding_dim: int = 256,
-        attention: str = "igs",
         v_min: float = 0.0,
         v_max: float = 0.5,
         pooling: str = "mean",
@@ -112,13 +98,8 @@ class CoupledActionActor(nn.Module):
         self.pooling = pooling
         self.use_original_omega_head = use_original_omega_head
         
-        # GAT encoder (outputs embedding of dim = embedding_dim * 2)
-        if attention == "igs":
-            self.attention = Attention(embedding_dim)
-        elif attention == "g2anet":
-            self.attention = G2ANet(embedding_dim)
-        else:
-            raise ValueError(f"Unknown attention mechanism: {attention}")
+        # Obstacle-aware GAT encoder
+        self.attention = AttentionObstacle(embedding_dim)
         
         # Per-robot embedding dimension after attention
         self.per_robot_dim = embedding_dim * 2  # 512 for embedding_dim=256
@@ -133,9 +114,7 @@ class CoupledActionActor(nn.Module):
         
         # Per-robot angular velocity head: h_i -> w_i
         if use_original_omega_head:
-            # Use the SAME architecture as original policy_head for weight loading
-            # Original: Linear(512, 400) -> LeakyReLU -> Linear(400, 300) -> LeakyReLU -> Linear(300, 2) -> Tanh
-            # We keep the same structure, output 2D but only use the second dimension (omega)
+            # Match original policy_head architecture for weight loading
             self.omega_head = nn.Sequential(
                 nn.Linear(self.per_robot_dim, 400),
                 nn.LeakyReLU(),
@@ -152,72 +131,78 @@ class CoupledActionActor(nn.Module):
                 nn.Linear(256, 128),
                 nn.LeakyReLU(),
                 nn.Linear(128, 1),
-                nn.Tanh(),  # Output in [-1, 1]
+                nn.Tanh(),
             )
     
     def forward(
         self, 
-        obs: torch.Tensor, 
+        robot_obs: torch.Tensor,
+        obstacle_obs: torch.Tensor,
         detach_attn: bool = False,
         return_embeddings: bool = False,
         active_group: Optional[List[int]] = None,
     ):
         """
-        Forward pass of the coupled action actor.
+        Forward pass of the coupled action actor with obstacle awareness.
         
         Args:
-            obs (Tensor): Observations of shape (B, N, obs_dim) or (N, obs_dim).
+            robot_obs (Tensor): Robot observations of shape (B, N_robots, robot_state_dim) or (N_robots, robot_state_dim).
+            obstacle_obs (Tensor): Obstacle observations of shape (B, N_obs, obstacle_state_dim) or (N_obs, obstacle_state_dim).
             detach_attn (bool): If True, detaches attention features before heads.
             return_embeddings (bool): If True, also returns per-robot and global embeddings.
             active_group (List[int], optional): List of robot indices in active group.
-                If None, all robots are considered active (backward compatible).
+                If None, all robots are considered active.
             
         Returns:
             tuple containing:
                 - v_shared (Tensor): Shared linear velocity, shape (B, 1).
-                - omega (Tensor): Per-robot angular velocities, shape (B*N, 1).
-                - action (Tensor): Combined actions [v_shared broadcast, omega], shape (B*N, 2).
-                    For robots not in active_group, action is [0, 0].
-                - hard_logits, pair_d, mean_entropy, hard_weights, combined_weights: Attention outputs.
-                - (optional) H: Per-robot embeddings, shape (B, N, per_robot_dim).
+                - omega (Tensor): Per-robot angular velocities, shape (B*N_robots, 1).
+                - action (Tensor): Combined actions [v_shared broadcast, omega], shape (B*N_robots, 2).
+                - Attention outputs for logging.
+                - (optional) H: Per-robot embeddings, shape (B, N_robots, per_robot_dim).
                 - (optional) G: Global embedding, shape (B, per_robot_dim).
         """
-        # Handle 2D input (N, obs_dim) -> (1, N, obs_dim)
-        if obs.dim() == 2:
-            obs = obs.unsqueeze(0)
+        # Handle 2D input
+        if robot_obs.dim() == 2:
+            robot_obs = robot_obs.unsqueeze(0)
+            obstacle_obs = obstacle_obs.unsqueeze(0)
         
-        batch_size, n_agents, _ = obs.shape
+        batch_size, n_robots, _ = robot_obs.shape
         
-        # Get per-robot embeddings H from attention encoder
-        H, hard_logits, pair_d, mean_entropy, hard_weights, combined_weights = (
-            self.attention(obs)
-        )  # H shape: (B*N, per_robot_dim)
+        # Get per-robot embeddings H from obstacle-aware attention encoder
+        (
+            H,
+            hard_logits_rr, hard_logits_ro,
+            dist_rr, dist_ro,
+            mean_entropy,
+            hard_weights_rr, hard_weights_ro,
+            combined_weights,
+        ) = self.attention(robot_obs, obstacle_obs)
+        # H shape: (B*N_robots, per_robot_dim)
         
         if detach_attn:
             H = H.detach()
         
-        # Reshape H to (B, N, per_robot_dim) for pooling
-        H_reshaped = H.view(batch_size, n_agents, self.per_robot_dim)
+        # Reshape H to (B, N_robots, per_robot_dim) for pooling
+        H_reshaped = H.view(batch_size, n_robots, self.per_robot_dim)
         
-        # Compute global embedding G via permutation-invariant pooling
-        # If active_group is provided, pool only over active robots
+        # Compute group embedding G via pooling over active group only
         if active_group is not None and len(active_group) > 0:
-            # Pool only over active group embeddings
             active_indices = torch.tensor(active_group, device=H.device, dtype=torch.long)
-            H_active = H_reshaped[:, active_indices, :]  # (B, len(active_group), per_robot_dim)
+            H_active = H_reshaped[:, active_indices, :]  # (B, group_size, per_robot_dim)
             
             if self.pooling == "mean":
                 G = H_active.mean(dim=1)  # (B, per_robot_dim)
             elif self.pooling == "max":
-                G = H_active.max(dim=1)[0]  # (B, per_robot_dim)
+                G = H_active.max(dim=1)[0]
             else:
                 raise ValueError(f"Unknown pooling method: {self.pooling}")
         else:
-            # Pool over all robots (backward compatible)
+            # Pool over all robots
             if self.pooling == "mean":
-                G = H_reshaped.mean(dim=1)  # (B, per_robot_dim)
+                G = H_reshaped.mean(dim=1)
             elif self.pooling == "max":
-                G = H_reshaped.max(dim=1)[0]  # (B, per_robot_dim)
+                G = H_reshaped.max(dim=1)[0]
             else:
                 raise ValueError(f"Unknown pooling method: {self.pooling}")
         
@@ -225,69 +210,65 @@ class CoupledActionActor(nn.Module):
         v_shared = self.v_head(G)  # (B, 1) in [v_min, v_max]
         
         # Predict per-robot angular velocities
-        omega_output = self.omega_head(H)  # (B*N, 1) or (B*N, 2) depending on architecture
+        omega_output = self.omega_head(H)  # (B*N_robots, 1) or (B*N_robots, 2)
         
-        # If using original architecture, extract only the angular velocity (second dim)
         if self.use_original_omega_head:
-            omega = omega_output[:, 1:2]  # (B*N, 1) - second dimension is angular velocity
+            omega = omega_output[:, 1:2]  # Extract angular velocity
         else:
-            omega = omega_output  # (B*N, 1)
+            omega = omega_output
         
-        # Broadcast v_shared to all robots and combine with omega
-        # v_shared: (B, 1) -> (B, N, 1) -> (B*N, 1)
-        v_broadcast = v_shared.unsqueeze(1).expand(-1, n_agents, -1).reshape(-1, 1)
-        action = torch.cat([v_broadcast, omega], dim=-1)  # (B*N, 2)
+        # Broadcast v_shared to all robots
+        v_broadcast = v_shared.unsqueeze(1).expand(-1, n_robots, -1).reshape(-1, 1)
+        action = torch.cat([v_broadcast, omega], dim=-1)  # (B*N_robots, 2)
         
         # Apply active group mask: zero out actions for inactive robots
         if active_group is not None:
-            # Create mask: 1 for active robots, 0 for inactive
-            active_mask = torch.zeros(n_agents, device=H.device)
+            active_mask = torch.zeros(n_robots, device=H.device)
             active_mask[active_group] = 1.0
-            
-            # Broadcast mask to batch: (N,) -> (B, N) -> (B*N, 1)
             active_mask = active_mask.unsqueeze(0).expand(batch_size, -1).reshape(-1, 1)
-            
-            # Apply mask: inactive robots get zero action
             action = action * active_mask
         
-        if return_embeddings:
-            return (
-                v_shared, omega, action, 
-                hard_logits, pair_d, mean_entropy, hard_weights, combined_weights,
-                H_reshaped, G
-            )
-        
-        return (
-            v_shared, omega, action,
-            hard_logits, pair_d, mean_entropy, hard_weights, combined_weights
+        attention_outputs = (
+            hard_logits_rr, hard_logits_ro,
+            dist_rr, dist_ro,
+            mean_entropy,
+            hard_weights_rr, hard_weights_ro,
+            combined_weights,
         )
+        
+        if return_embeddings:
+            return v_shared, omega, action, attention_outputs, H_reshaped, G
+        
+        return v_shared, omega, action, attention_outputs
     
     def get_v_shared_only(
         self, 
-        obs: torch.Tensor,
+        robot_obs: torch.Tensor,
+        obstacle_obs: torch.Tensor,
         active_group: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """
         Compute only the shared linear velocity (for supervised training).
         
         Args:
-            obs (Tensor): Observations of shape (B, N, obs_dim) or (N, obs_dim).
-            active_group (List[int], optional): List of robot indices in active group.
-                If None, pools over all robots.
+            robot_obs (Tensor): Robot observations.
+            obstacle_obs (Tensor): Obstacle observations.
+            active_group (List[int], optional): Indices of robots in the group.
             
         Returns:
             Tensor: Shared velocity v_shared of shape (B, 1).
         """
-        if obs.dim() == 2:
-            obs = obs.unsqueeze(0)
+        if robot_obs.dim() == 2:
+            robot_obs = robot_obs.unsqueeze(0)
+            obstacle_obs = obstacle_obs.unsqueeze(0)
         
-        batch_size, n_agents, _ = obs.shape
+        batch_size, n_robots, _ = robot_obs.shape
         
         # Get per-robot embeddings
-        H, *_ = self.attention(obs)
+        H, *_ = self.attention(robot_obs, obstacle_obs)
         
         # Reshape and pool
-        H_reshaped = H.view(batch_size, n_agents, self.per_robot_dim)
+        H_reshaped = H.view(batch_size, n_robots, self.per_robot_dim)
         
         if active_group is not None and len(active_group) > 0:
             active_indices = torch.tensor(active_group, device=H.device, dtype=torch.long)
@@ -307,51 +288,106 @@ class CoupledActionActor(nn.Module):
             else:
                 raise ValueError(f"Unknown pooling method: {self.pooling}")
         
-        # Predict v_shared
         v_shared = self.v_head(G)
+        return v_shared
+    
+    def get_v_shared_batch(
+        self, 
+        robot_obs: torch.Tensor,
+        obstacle_obs: torch.Tensor,
+        group_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute v_shared for a batch with per-sample group indices.
+        
+        This is the main method for supervised training where each sample
+        in the batch may have a different group.
+        
+        Args:
+            robot_obs (Tensor): Robot observations of shape (B, N_robots, state_dim).
+            obstacle_obs (Tensor): Obstacle observations of shape (B, N_obs, obs_dim).
+            group_indices (Tensor): Per-sample group indices of shape (B, max_group_size).
+                Padded with -1 for variable group sizes.
+            
+        Returns:
+            Tensor: Shared velocity v_shared of shape (B, 1).
+        """
+        batch_size, n_robots, _ = robot_obs.shape
+        
+        # Get per-robot embeddings for all samples
+        H, *_ = self.attention(robot_obs, obstacle_obs)
+        H_reshaped = H.view(batch_size, n_robots, self.per_robot_dim)
+        
+        # Compute G for each sample using its specific group
+        G_list = []
+        for b in range(batch_size):
+            # Get valid group indices (exclude -1 padding)
+            group = group_indices[b]
+            valid_mask = group >= 0
+            valid_indices = group[valid_mask]
+            
+            if len(valid_indices) == 0:
+                # Fallback: use all robots if group is empty
+                H_group = H_reshaped[b]
+            else:
+                H_group = H_reshaped[b, valid_indices, :]  # (group_size, per_robot_dim)
+            
+            if self.pooling == "mean":
+                G_b = H_group.mean(dim=0)  # (per_robot_dim,)
+            elif self.pooling == "max":
+                G_b = H_group.max(dim=0)[0]
+            else:
+                raise ValueError(f"Unknown pooling: {self.pooling}")
+            
+            G_list.append(G_b)
+        
+        G = torch.stack(G_list, dim=0)  # (B, per_robot_dim)
+        v_shared = self.v_head(G)  # (B, 1)
         
         return v_shared
 
 
-class CoupledActionPolicy:
+class CoupledActionPolicyObstacle:
     """
-    Coupled Action Policy wrapper for multi-robot navigation.
+    Coupled Action Policy wrapper with obstacle awareness for group-based navigation.
     
     This policy produces:
-    - A shared linear velocity for all robots (or active group)
+    - A shared linear velocity for robots in the active group
     - Per-robot angular velocities
     
     Supports:
-    - Loading pretrained encoder and omega head weights from decentralized policy
-    - Active group selection for rule-based switching
+    - Loading pretrained encoder from TD3Obstacle model
+    - Group-based embedding pooling
+    - Obstacle-aware attention mechanism
     
     Args:
         state_dim (int): Per-robot state dimension.
+        obstacle_state_dim (int): Per-obstacle state dimension.
         num_robots (int): Number of robots.
+        num_obstacles (int): Number of obstacles.
         device (torch.device): Device for computation.
         embedding_dim (int): Dimension of per-robot embeddings.
-        attention (str): Attention mechanism type.
         v_min (float): Minimum linear velocity.
         v_max (float): Maximum linear velocity.
-        pooling (str): Pooling method for global embedding.
+        pooling (str): Pooling method for group embedding.
         load_pretrained_encoder (bool): Whether to load pretrained encoder weights.
         pretrained_model_name (str): Name of pretrained model file.
         pretrained_directory (Path): Directory containing pretrained weights.
         freeze_encoder (bool): Whether to freeze encoder during training.
         freeze_omega (bool): Whether to freeze omega head during training.
-        model_name (str): Name for this model (for logging/saving).
+        model_name (str): Name for this model.
         save_directory (Path): Directory for saving checkpoints.
-        use_original_omega_head (bool): If True, use the same omega head architecture
-            as the original policy_head (for weight loading compatibility).
+        use_original_omega_head (bool): If True, use original omega head architecture.
     """
     
     def __init__(
         self,
         state_dim: int = 11,
-        num_robots: int = 5,
+        obstacle_state_dim: int = 4,
+        num_robots: int = 6,
+        num_obstacles: int = 4,
         device: torch.device = None,
         embedding_dim: int = 256,
-        attention: str = "igs",
         v_min: float = 0.0,
         v_max: float = 0.5,
         pooling: str = "mean",
@@ -360,22 +396,23 @@ class CoupledActionPolicy:
         pretrained_directory: Optional[Path] = None,
         freeze_encoder: bool = True,
         freeze_omega: bool = True,
-        model_name: str = "coupled_action_policy",
+        model_name: str = "coupled_action_obstacle",
         save_directory: Path = Path("robot_nav/models/MARL/marlTD3/checkpoint"),
         use_original_omega_head: bool = True,
     ):
         self.state_dim = state_dim
+        self.obstacle_state_dim = obstacle_state_dim
         self.num_robots = num_robots
+        self.num_obstacles = num_obstacles
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
-        self.save_directory = save_directory
+        self.save_directory = Path(save_directory)
         self.v_min = v_min
         self.v_max = v_max
         
         # Create actor
-        self.actor = CoupledActionActor(
+        self.actor = CoupledActionActorObstacle(
             embedding_dim=embedding_dim,
-            attention=attention,
             v_min=v_min,
             v_max=v_max,
             pooling=pooling,
@@ -383,16 +420,11 @@ class CoupledActionPolicy:
         ).to(self.device)
         
         # Load pretrained weights if specified
-        if load_pretrained_encoder:
-            if pretrained_model_name is None or pretrained_directory is None:
-                raise ValueError(
-                    "pretrained_model_name and pretrained_directory must be provided "
-                    "when load_pretrained_encoder=True"
-                )
+        if load_pretrained_encoder and pretrained_model_name and pretrained_directory:
             self.load_pretrained_weights(
                 filename=pretrained_model_name,
                 directory=pretrained_directory,
-                load_omega=True  # Also load omega head weights
+                load_omega=use_original_omega_head
             )
         
         # Freeze parameters as specified
@@ -401,7 +433,7 @@ class CoupledActionPolicy:
         if freeze_omega:
             self._freeze_omega()
         
-        # Setup optimizer (only for v_head by default)
+        # Setup optimizer (only for trainable params)
         self._setup_optimizer()
         
         # Tensorboard writer
@@ -409,7 +441,7 @@ class CoupledActionPolicy:
         self.iter_count = 0
     
     def _freeze_encoder(self):
-        """Freeze GAT encoder parameters."""
+        """Freeze attention encoder parameters."""
         for param in self.actor.attention.parameters():
             param.requires_grad = False
         print("Encoder (attention) parameters frozen")
@@ -421,7 +453,7 @@ class CoupledActionPolicy:
         print("Omega head parameters frozen")
     
     def _unfreeze_encoder(self):
-        """Unfreeze GAT encoder parameters."""
+        """Unfreeze attention encoder parameters."""
         for param in self.actor.attention.parameters():
             param.requires_grad = True
         print("Encoder (attention) parameters unfrozen")
@@ -435,7 +467,11 @@ class CoupledActionPolicy:
     def _setup_optimizer(self, lr: float = 1e-4):
         """Setup optimizer for trainable parameters only."""
         trainable_params = [p for p in self.actor.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.Adam(trainable_params, lr=lr)
+        if len(trainable_params) > 0:
+            self.optimizer = torch.optim.Adam(trainable_params, lr=lr)
+        else:
+            self.optimizer = None
+            print("Warning: No trainable parameters!")
     
     def load_pretrained_weights(
         self,
@@ -444,7 +480,7 @@ class CoupledActionPolicy:
         load_omega: bool = True
     ):
         """
-        Load pretrained encoder (and optionally omega head) weights from decentralized policy.
+        Load pretrained encoder (and optionally omega head) from TD3Obstacle model.
         
         Args:
             filename (str): Base filename of pretrained model.
@@ -464,19 +500,14 @@ class CoupledActionPolicy:
         current_state.update(attention_keys)
         
         if load_omega and self.actor.use_original_omega_head:
-            # Map policy_head weights to omega_head
-            # When using original architecture, the omega_head has the SAME structure
-            # as policy_head, so we can directly load the weights
-            omega_keys = {
-                k.replace("policy_head.", "omega_head."): v 
-                for k, v in pretrained_state.items() 
-                if k.startswith("policy_head.")
-            }
+            # Load omega head from policy_head
+            omega_keys = {}
+            for k, v in pretrained_state.items():
+                if k.startswith("policy_head."):
+                    new_key = k.replace("policy_head.", "omega_head.")
+                    omega_keys[new_key] = v
             current_state.update(omega_keys)
-            print(f"Loaded omega_head weights from policy_head ({len(omega_keys)} keys)")
-        elif load_omega:
-            # Due to architecture differences, we skip loading omega_head weights
-            print("Note: omega_head architecture differs from policy_head; using fresh initialization")
+            print(f"  Omega head keys loaded: {len(omega_keys)}")
         
         self.actor.load_state_dict(current_state, strict=False)
         print(f"Loaded pretrained encoder from: {pretrained_path}")
@@ -484,152 +515,104 @@ class CoupledActionPolicy:
     
     def get_action(
         self, 
-        obs: np.ndarray, 
-        add_noise: bool = False,
+        robot_obs: np.ndarray,
+        obstacle_obs: np.ndarray,
         active_group: Optional[List[int]] = None,
-    ) -> tuple:
+        add_noise: bool = False,
+    ) -> Tuple[np.ndarray, float, torch.Tensor]:
         """
-        Compute actions for given observations.
+        Get action for the current observation.
         
         Args:
-            obs (np.ndarray): Observations of shape (N, state_dim) or (B, N, state_dim).
-            add_noise (bool): If True, adds exploration noise.
-            active_group (List[int], optional): List of robot indices in active group.
-                If None, all robots are considered active.
+            robot_obs (np.ndarray): Robot observations of shape (N_robots, state_dim).
+            obstacle_obs (np.ndarray): Obstacle observations of shape (N_obs, obs_dim).
+            active_group (List[int], optional): Robot indices in the active group.
+            add_noise (bool): Whether to add exploration noise.
             
         Returns:
-            tuple: (actions, v_shared, omega)
-                - actions: shape (N, 2) with [v_shared, omega_i] per robot
-                    Robots not in active_group have [0, 0]
-                - v_shared: scalar shared velocity
-                - omega: per-robot angular velocities
+            Tuple of (action, v_shared, combined_weights):
+                - action: Array of shape (N_robots, 2)
+                - v_shared: Scalar shared linear velocity
+                - combined_weights: Attention weights for visualization
         """
-        state = torch.Tensor(obs).to(self.device)
+        self.actor.eval()
+        
+        robot_state = torch.FloatTensor(robot_obs).to(self.device)
+        obstacle_state = torch.FloatTensor(obstacle_obs).to(self.device)
         
         with torch.no_grad():
-            v_shared, omega, action, *_ = self.actor(state, active_group=active_group)
+            v_shared, omega, action, attention_outputs = self.actor(
+                robot_state, obstacle_state, active_group=active_group
+            )
         
-        action = action.cpu().numpy()
+        action_np = action.cpu().numpy().reshape(-1, 2)
+        v_shared_np = v_shared.cpu().numpy().item()
+        combined_weights = attention_outputs[-1]  # Last element is combined_weights
         
         if add_noise:
-            # Add noise only to angular velocity (omega), not to v_shared
-            # Only add noise to active robots
-            noise = np.random.normal(0, 0.2, size=(action.shape[0], 1))
-            if active_group is not None:
-                # Zero out noise for inactive robots
-                noise_mask = np.zeros((action.shape[0], 1))
-                noise_mask[active_group, 0] = 1.0
-                noise = noise * noise_mask
-            action[:, 1:2] = np.clip(action[:, 1:2] + noise, -1, 1)
+            noise = np.random.normal(0, 0.1, size=action_np.shape)
+            action_np = np.clip(action_np + noise, -1, 1)
         
-        return action.reshape(-1, 2), v_shared.cpu().numpy().item(), omega.cpu().numpy()
+        return action_np, v_shared_np, combined_weights
     
     def train_step_supervised(
         self,
-        batch_states: torch.Tensor,
+        batch_robot_states: torch.Tensor,
+        batch_obstacle_states: torch.Tensor,
+        batch_group_indices: torch.Tensor,
         batch_v_labels: torch.Tensor,
-        active_group: Optional[List[int]] = None,
     ) -> float:
         """
-        Single supervised training step for v_head.
+        Perform one supervised training step on v_head.
         
         Args:
-            batch_states (Tensor): States of shape (B, N, state_dim).
+            batch_robot_states (Tensor): Robot states of shape (B, N_robots, state_dim).
+            batch_obstacle_states (Tensor): Obstacle states of shape (B, N_obs, obs_dim).
+            batch_group_indices (Tensor): Group indices of shape (B, max_group_size).
             batch_v_labels (Tensor): Target v_shared labels of shape (B, 1).
-            active_group (List[int], optional): List of robot indices in active group.
-                If None, pools over all robots.
             
         Returns:
             float: MSE loss value.
         """
         self.actor.train()
         
-        # Predict v_shared
-        v_pred = self.actor.get_v_shared_only(batch_states, active_group=active_group)
+        # Predict v_shared using per-sample group indices
+        v_pred = self.actor.get_v_shared_batch(
+            batch_robot_states, 
+            batch_obstacle_states,
+            batch_group_indices
+        )
         
-        # MSE loss
+        # Compute MSE loss
         loss = F.mse_loss(v_pred, batch_v_labels)
         
-        # Backward and optimize
+        # Backprop
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
         
+        # Logging
+        self.writer.add_scalar("train/v_loss", loss.item(), self.iter_count)
+        self.iter_count += 1
+        
         return loss.item()
     
     def save(self, filename: Optional[str] = None, directory: Optional[Path] = None):
-        """Save model checkpoint."""
-        filename = filename or self.model_name
-        directory = directory or self.save_directory
-        Path(directory).mkdir(parents=True, exist_ok=True)
+        """Save model weights."""
+        if filename is None:
+            filename = self.model_name
+        if directory is None:
+            directory = self.save_directory
         
-        torch.save(
-            self.actor.state_dict(),
-            f"{directory}/{filename}_actor.pth"
-        )
-        print(f"Saved model to: {directory}/{filename}_actor.pth")
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        
+        torch.save(self.actor.state_dict(), f"{directory}/{filename}_actor.pth")
+        print(f"Model saved to: {directory}/{filename}_actor.pth")
     
     def load(self, filename: str, directory: Path):
-        """Load model checkpoint."""
+        """Load model weights."""
         self.actor.load_state_dict(
             torch.load(f"{directory}/{filename}_actor.pth", map_location=self.device)
         )
-        print(f"Loaded model from: {directory}/{filename}_actor.pth")
-    
-    def prepare_state(
-        self, 
-        poses, 
-        distance, 
-        cos, 
-        sin, 
-        collision, 
-        action, 
-        goal_positions
-    ):
-        """
-        Convert raw environment outputs into per-agent state vectors.
-        
-        Matches the format used in decentralized/centralized policies.
-        
-        Args:
-            poses (list): Per-agent poses [[x, y, theta], ...].
-            distance (list): Per-agent distances to goal.
-            cos (list): Per-agent cos(heading error to goal).
-            sin (list): Per-agent sin(heading error to goal).
-            collision (list): Per-agent collision flags.
-            action (list): Per-agent last actions [[lin_vel, ang_vel], ...].
-            goal_positions (list): Per-agent goals [[gx, gy], ...].
-            
-        Returns:
-            list: Per-agent state vectors.
-        """
-        states = []
-        
-        for i in range(self.num_robots):
-            pose = poses[i]
-            goal_pos = goal_positions[i]
-            act = action[i]
-            
-            px, py, theta = pose
-            gx, gy = goal_pos
-            
-            heading_cos = np.cos(theta)
-            heading_sin = np.sin(theta)
-            
-            lin_vel = act[0] * 2
-            ang_vel = (act[1] + 1) / 2
-            
-            state = [
-                px, py,
-                heading_cos, heading_sin,
-                distance[i] / 17,
-                cos[i], sin[i],
-                lin_vel, ang_vel,
-                gx, gy,
-            ]
-            
-            assert len(state) == self.state_dim, \
-                f"State length mismatch: expected {self.state_dim}, got {len(state)}"
-            states.append(state)
-        
-        return states
+        print(f"Model loaded from: {directory}/{filename}_actor.pth")
