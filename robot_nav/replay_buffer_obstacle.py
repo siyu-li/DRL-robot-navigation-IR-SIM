@@ -127,8 +127,8 @@ class ReplayBufferObstacle:
         robot_states = np.array([exp[0] for exp in self.buffer])
         obstacle_states = np.array([exp[1] for exp in self.buffer])
         actions = np.array([exp[2] for exp in self.buffer])
-        rewards = np.array([exp[3] for exp in self.buffer]).reshape(-1, 1)
-        dones = np.array([exp[4] for exp in self.buffer]).reshape(-1, 1)
+        rewards = np.array([exp[3] for exp in self.buffer])  # Shape: (N, N_robots)
+        dones = np.array([exp[4] for exp in self.buffer])    # Shape: (N, N_robots)
         next_robot_states = np.array([exp[5] for exp in self.buffer])
         next_obstacle_states = np.array([exp[6] for exp in self.buffer])
 
