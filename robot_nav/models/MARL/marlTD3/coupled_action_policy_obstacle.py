@@ -616,3 +616,65 @@ class CoupledActionPolicyObstacle:
             torch.load(f"{directory}/{filename}_actor.pth", map_location=self.device)
         )
         print(f"Model loaded from: {directory}/{filename}_actor.pth")
+    
+    def prepare_state(
+        self, 
+        poses, 
+        distance, 
+        cos, 
+        sin, 
+        collision, 
+        action, 
+        goal_positions
+    ):
+        """
+        Convert raw environment outputs into per-robot state vectors.
+        
+        Use this for live inference when getting raw outputs from simulator.
+        NOT needed when loading from replay buffer (states already prepared).
+        
+        Args:
+            poses (list): Per-robot poses [[x, y, theta], ...].
+            distance (list): Per-robot distances to goal.
+            cos (list): Per-robot cos(heading error to goal).
+            sin (list): Per-robot sin(heading error to goal).
+            collision (list): Per-robot collision flags.
+            action (list): Per-robot last actions [[lin_vel, ang_vel], ...].
+            goal_positions (list): Per-robot goals [[gx, gy], ...].
+            
+        Returns:
+            tuple: (states, terminal)
+                - states: Per-robot state vectors, list of shape (N_robots, state_dim)
+                - terminal: Per-robot terminal flags
+        """
+        states = []
+        terminal = []
+        
+        for i in range(self.num_robots):
+            pose = poses[i]
+            goal_pos = goal_positions[i]
+            act = action[i]
+            
+            px, py, theta = pose
+            gx, gy = goal_pos
+            
+            heading_cos = np.cos(theta)
+            heading_sin = np.sin(theta)
+            lin_vel = act[0] * 2
+            ang_vel = (act[1] + 1) / 2
+            
+            state = [
+                px, py,
+                heading_cos, heading_sin,
+                distance[i] / 17,
+                cos[i], sin[i],
+                lin_vel, ang_vel,
+                gx, gy,
+            ]
+            
+            assert len(state) == self.state_dim, \
+                f"State length mismatch: expected {self.state_dim}, got {len(state)}"
+            states.append(state)
+            terminal.append(collision[i])
+        
+        return states, terminal

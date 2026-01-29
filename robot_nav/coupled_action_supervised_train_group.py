@@ -61,16 +61,16 @@ CONFIG = {
     ],
     
     # Training hyperparameters
-    "epochs": 100,
-    "batch_size": 64,
+    "epochs": 50,
+    "batch_size": 256,
     "lr": 1e-4,
     "train_split": 0.9,
     
     # Data generation options
-    "sample_fraction": 1.0,  # Fraction of buffer to use (1.0 = all)
-    "max_samples_per_group": None,  # None = no limit
+    "sample_fraction": 0.2,  # Fraction of buffer to use (1.0 = all)
+    "max_samples_per_group": 3000,  # None = no limit
     "skip_terminal": True,  # Skip terminal states (collisions)
-    "uniform_sampling": False,  # If True, sample same count per group
+    "uniform_sampling": True,  # If True, sample same count per group
     "samples_per_group": 5000,  # Used if uniform_sampling=True
     
     # V-label configuration
