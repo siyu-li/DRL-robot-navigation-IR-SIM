@@ -41,7 +41,7 @@ CONFIG = {
     "model_name": "coupled_action_group_obstacle_best",
     "model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/group_policy",
     "pretrained_model_name": "TD3-MARL-obstacle-6robots",
-    "pretrained_directory": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots",
+    "pretrained_directory": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2",
     
     # Evaluation configuration
     "test_scenarios": 20,  # Number of test episodes
@@ -49,7 +49,7 @@ CONFIG = {
     "disable_plotting": False,  # Set to True to disable visualization
     
     # Group selection configuration
-    "group_switch_interval": 10,  # Switch group every N steps
+    "group_switch_interval": 30,  # Switch group every N steps
     "group_sizes": [2, 3],  # Possible group sizes to randomly select
     "use_all_combinations": True,  # If True, select from all combinations; if False, random sampling
     
