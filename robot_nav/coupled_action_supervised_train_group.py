@@ -42,11 +42,11 @@ from robot_nav.models.MARL.marlTD3.supervised_dataset_group import (
 CONFIG = {
     # Data source: path to saved replay buffer pickle file
     # The buffer is saved during marl_train_obstacle_6robots training
-    "buffer_path": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots/replay_buffer_epoch1000.pkl",
+    "buffer_path": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2/replay_buffer_epoch3000.pkl",
     
     # Pretrained model from marl_train_obstacle_6robots
     "pretrained_model_name": "TD3-MARL-obstacle-6robots",
-    "pretrained_directory": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots",
+    "pretrained_directory": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2",
     
     # Group configuration
     # Option 1: Use all combinations of specified sizes
