@@ -134,6 +134,75 @@ class CoupledActionActorObstacle(nn.Module):
                 nn.Tanh(),
             )
     
+    def _mask_inactive_robot_features(
+        self, 
+        robot_obs: torch.Tensor, 
+        active_group: List[int]
+    ) -> torch.Tensor:
+        """
+        Mask non-active robots' features to treat them like obstacles.
+        
+        Zeros out velocity (indices 7:9), goal (indices 9:11), and goal-related
+        features (indices 4:7) for robots not in the active group.
+        
+        State layout: [px, py, cos_h, sin_h, dist/17, cos_err, sin_err, lin_v, ang_v, gx, gy]
+                       0   1    2      3       4        5        6        7      8    9   10
+        
+        Args:
+            robot_obs (Tensor): Robot observations of shape (B, N_robots, state_dim).
+            active_group (List[int]): Indices of robots in the active group.
+            
+        Returns:
+            Tensor: Masked robot observations with same shape as input.
+        """
+        masked_obs = robot_obs.clone()
+        n_robots = masked_obs.shape[1]
+        
+        for i in range(n_robots):
+            if i not in active_group:
+                # Zero out velocity (lin_v, ang_v) at indices 7:9
+                masked_obs[:, i, 7:9] = 0.0
+                # Zero out goal (gx, gy) at indices 9:11
+                masked_obs[:, i, 9:11] = 0.0
+                # Zero out goal-related features: dist/17, cos_err, sin_err at indices 4:7
+                masked_obs[:, i, 4:7] = 0.0
+        
+        return masked_obs
+    
+    def _mask_inactive_robot_features_batch(
+        self, 
+        robot_obs: torch.Tensor, 
+        group_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Mask non-active robots' features for batched inputs with per-sample groups.
+        
+        Args:
+            robot_obs (Tensor): Robot observations of shape (B, N_robots, state_dim).
+            group_indices (Tensor): Per-sample group indices of shape (B, max_group_size).
+                Padded with -1 for variable group sizes.
+            
+        Returns:
+            Tensor: Masked robot observations with same shape as input.
+        """
+        batch_size, n_robots, state_dim = robot_obs.shape
+        masked_obs = robot_obs.clone()
+        
+        for b in range(batch_size):
+            # Get valid group indices (exclude -1 padding)
+            group = group_indices[b]
+            valid_mask = group >= 0
+            valid_indices = set(group[valid_mask].tolist())
+            
+            for i in range(n_robots):
+                if i not in valid_indices:
+                    # Zero out velocity, goal, and goal-related features
+                    masked_obs[b, i, 7:9] = 0.0
+                    masked_obs[b, i, 9:11] = 0.0
+                    masked_obs[b, i, 4:7] = 0.0
+        
+        return masked_obs
+    
     def forward(
         self, 
         robot_obs: torch.Tensor,
@@ -151,7 +220,8 @@ class CoupledActionActorObstacle(nn.Module):
             detach_attn (bool): If True, detaches attention features before heads.
             return_embeddings (bool): If True, also returns per-robot and global embeddings.
             active_group (List[int], optional): List of robot indices in active group.
-                If None, all robots are considered active.
+                If None, all robots are considered active. When specified, non-active
+                robots' velocity and goal features are zeroed out (like obstacles).
             
         Returns:
             tuple containing:
@@ -168,6 +238,10 @@ class CoupledActionActorObstacle(nn.Module):
             obstacle_obs = obstacle_obs.unsqueeze(0)
         
         batch_size, n_robots, _ = robot_obs.shape
+        
+        # Mask non-active robots' features when a group is specified
+        if active_group is not None and len(active_group) > 0:
+            robot_obs = self._mask_inactive_robot_features(robot_obs, active_group)
         
         # Get per-robot embeddings H from obstacle-aware attention encoder
         (
@@ -254,6 +328,7 @@ class CoupledActionActorObstacle(nn.Module):
             robot_obs (Tensor): Robot observations.
             obstacle_obs (Tensor): Obstacle observations.
             active_group (List[int], optional): Indices of robots in the group.
+                When specified, non-active robots' features are zeroed out.
             
         Returns:
             Tensor: Shared velocity v_shared of shape (B, 1).
@@ -263,6 +338,10 @@ class CoupledActionActorObstacle(nn.Module):
             obstacle_obs = obstacle_obs.unsqueeze(0)
         
         batch_size, n_robots, _ = robot_obs.shape
+        
+        # Mask non-active robots' features when a group is specified
+        if active_group is not None and len(active_group) > 0:
+            robot_obs = self._mask_inactive_robot_features(robot_obs, active_group)
         
         # Get per-robot embeddings
         H, *_ = self.attention(robot_obs, obstacle_obs)
@@ -301,7 +380,8 @@ class CoupledActionActorObstacle(nn.Module):
         Compute v_shared for a batch with per-sample group indices.
         
         This is the main method for supervised training where each sample
-        in the batch may have a different group.
+        in the batch may have a different group. Non-active robots' features
+        are masked (zeroed out) for each sample based on its group_indices.
         
         Args:
             robot_obs (Tensor): Robot observations of shape (B, N_robots, state_dim).
@@ -313,6 +393,9 @@ class CoupledActionActorObstacle(nn.Module):
             Tensor: Shared velocity v_shared of shape (B, 1).
         """
         batch_size, n_robots, _ = robot_obs.shape
+        
+        # Mask non-active robots' features for each sample based on its group
+        robot_obs = self._mask_inactive_robot_features_batch(robot_obs, group_indices)
         
         # Get per-robot embeddings for all samples
         H, *_ = self.attention(robot_obs, obstacle_obs)
@@ -527,6 +610,8 @@ class CoupledActionPolicyObstacle:
             robot_obs (np.ndarray): Robot observations of shape (N_robots, state_dim).
             obstacle_obs (np.ndarray): Obstacle observations of shape (N_obs, obs_dim).
             active_group (List[int], optional): Robot indices in the active group.
+                When specified, non-active robots' velocity and goal features are
+                zeroed out (similar to how obstacles are treated).
             add_noise (bool): Whether to add exploration noise.
             
         Returns:

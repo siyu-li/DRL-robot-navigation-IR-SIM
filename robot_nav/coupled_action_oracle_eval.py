@@ -235,11 +235,18 @@ class OracleStatistics:
     executed_group_counts: Dict[Tuple[int, ...], int] = field(default_factory=lambda: defaultdict(int))
     executed_size_counts: Dict[int, int] = field(default_factory=lambda: defaultdict(int))
     
+    # Per-group collision tracking across all oracle evaluations
+    # group_collision_counts: how many times a collision occurred during oracle rollout for each group
+    group_collision_counts: Dict[Tuple[int, ...], int] = field(default_factory=lambda: defaultdict(int))
+    # group_evaluation_counts: how many times each group was evaluated by the oracle
+    group_evaluation_counts: Dict[Tuple[int, ...], int] = field(default_factory=lambda: defaultdict(int))
+    
     def record_oracle_selection(
         self,
         best_group: List[int],
         group_rewards: Dict[Tuple[int, ...], float],
         per_robot_reward_breakdown: Optional[Dict[Tuple[int, ...], Dict[int, float]]] = None,
+        group_collisions: Optional[Dict[Tuple[int, ...], bool]] = None,
     ):
         """
         Record an oracle selection decision.
@@ -249,6 +256,8 @@ class OracleStatistics:
             group_rewards: Dict mapping group tuple to cumulative reward.
             per_robot_reward_breakdown: Optional dict mapping group tuple to 
                 {robot_idx: robot's individual reward contribution}.
+            group_collisions: Optional dict mapping group tuple to whether collision occurred
+                during the oracle rollout for that group.
         """
         group_tuple = tuple(best_group)
         group_size = len(best_group)
@@ -263,6 +272,14 @@ class OracleStatistics:
             # Normalized by group size for fair comparison
             normalized = float(reward) / len(group) if len(group) > 0 else 0.0
             self.group_normalized_rewards[group].append(normalized)
+            # Track evaluation count for collision rate calculation
+            self.group_evaluation_counts[group] += 1
+        
+        # Record per-group collision occurrences
+        if group_collisions:
+            for group, had_collision in group_collisions.items():
+                if had_collision:
+                    self.group_collision_counts[group] += 1
         
         # Record per-robot rewards if provided
         if per_robot_reward_breakdown:
@@ -364,6 +381,38 @@ class OracleStatistics:
                 per_robot_by_size[robot_idx] = {}
             per_robot_by_size[robot_idx][group_size] = statistics.mean(rewards) if rewards else 0
         
+        # Per-group collision rates across all oracle evaluations
+        # collision_rate = collision_count / evaluation_count for each group
+        per_group_collision_rate = {}
+        for group, eval_count in self.group_evaluation_counts.items():
+            collision_count = self.group_collision_counts.get(group, 0)
+            per_group_collision_rate[group] = collision_count / eval_count if eval_count > 0 else 0
+        
+        # Collision rate aggregated by group size
+        collision_rate_by_size = defaultdict(lambda: {"collisions": 0, "evaluations": 0})
+        for group, eval_count in self.group_evaluation_counts.items():
+            size = len(group)
+            collision_count = self.group_collision_counts.get(group, 0)
+            collision_rate_by_size[size]["collisions"] += collision_count
+            collision_rate_by_size[size]["evaluations"] += eval_count
+        collision_rate_by_size = {
+            size: counts["collisions"] / counts["evaluations"] if counts["evaluations"] > 0 else 0
+            for size, counts in collision_rate_by_size.items()
+        }
+        
+        # Top 10 groups with highest collision rates (for diagnosis)
+        top_collision_groups = sorted(
+            per_group_collision_rate.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:10]
+        
+        # Top 10 groups with lowest collision rates (safest groups)
+        safest_groups = sorted(
+            per_group_collision_rate.items(),
+            key=lambda x: x[1],
+        )[:10]
+        
         return {
             "total_oracle_decisions": total_selections,
             "total_executions": total_executions,
@@ -375,6 +424,10 @@ class OracleStatistics:
             "avg_normalized_reward_by_size": avg_normalized_reward_by_size,
             "per_robot_avg_reward": per_robot_avg,
             "per_robot_reward_by_group_size": per_robot_by_size,
+            "per_group_collision_rate": per_group_collision_rate,
+            "collision_rate_by_size": collision_rate_by_size,
+            "top_10_collision_groups": top_collision_groups,
+            "top_10_safest_groups": safest_groups,
             "avg_margin": statistics.mean(self.reward_margins) if self.reward_margins else 0,
             "num_episodes": len(self.episode_rewards),
             "avg_episode_reward": statistics.mean(self.episode_rewards) if self.episode_rewards else 0,
@@ -589,7 +642,7 @@ class ShortHorizonOracle:
         obstacle_states: np.ndarray,
         execution_mode: str = "best",
         top_k: int = 3,
-    ) -> Tuple[List[int], List[int], Dict[Tuple[int, ...], float], Dict[Tuple[int, ...], Dict[int, float]]]:
+    ) -> Tuple[List[int], List[int], Dict[Tuple[int, ...], float], Dict[Tuple[int, ...], Dict[int, float]], Dict[Tuple[int, ...], bool]]:
         """
         Evaluate all candidate groups and select one for execution.
         
@@ -605,17 +658,19 @@ class ShortHorizonOracle:
             top_k: Number of top groups to consider when using "random_from_top_k"
                 
         Returns:
-            Tuple of (best_group, executed_group, all_group_rewards, per_robot_breakdown).
+            Tuple of (best_group, executed_group, all_group_rewards, per_robot_breakdown, group_collisions).
             - best_group: The group with highest oracle reward
             - executed_group: The group selected for actual execution (based on mode)
             - all_group_rewards: Dict mapping group tuple to cumulative reward
             - per_robot_breakdown: Dict mapping group tuple to {robot_idx: robot_reward}
+            - group_collisions: Dict mapping group tuple to whether collision occurred during rollout
         """
         # Take snapshot before rollouts
         snapshot = SimulationSnapshot.from_sim(sim)
         
         group_rewards = {}
         per_robot_breakdown = {}
+        group_collisions = {}
         best_group = None
         best_reward = float('-inf')
         
@@ -632,6 +687,7 @@ class ShortHorizonOracle:
             
             group_rewards[tuple(group)] = cumulative_reward
             per_robot_breakdown[tuple(group)] = per_robot_rewards
+            group_collisions[tuple(group)] = had_collision
             
             if cumulative_reward > best_reward:
                 best_reward = cumulative_reward
@@ -654,7 +710,7 @@ class ShortHorizonOracle:
         else:
             raise ValueError(f"Unknown execution_mode: {execution_mode}")
         
-        return best_group, executed_group, group_rewards, per_robot_breakdown
+        return best_group, executed_group, group_rewards, per_robot_breakdown, group_collisions
 
 
 # ============================================================================
@@ -718,7 +774,7 @@ def run_oracle_evaluation(
         while steps < max_steps:
             # Re-evaluate oracle at intervals or first step
             if steps % oracle_interval == 0:
-                best_group, executed_group, group_rewards, per_robot_breakdown = oracle.select_best_group(
+                best_group, executed_group, group_rewards, per_robot_breakdown, group_collisions = oracle.select_best_group(
                     sim, coupled_policy,
                     poses, distance, cos, sin, collision, action,
                     goal_positions, obstacle_states,
@@ -726,7 +782,7 @@ def run_oracle_evaluation(
                     top_k=top_k,
                 )
                 # Record oracle selection (what oracle thinks is best)
-                stats.record_oracle_selection(best_group, group_rewards, per_robot_breakdown)
+                stats.record_oracle_selection(best_group, group_rewards, per_robot_breakdown, group_collisions)
                 # Record what we actually execute
                 stats.record_executed_group(executed_group)
                 current_group = executed_group
@@ -973,6 +1029,24 @@ def main():
         size = len(group)
         pct = count / summary["total_executions"] * 100 if summary["total_executions"] > 0 else 0
         logger.info(f"  {list(group)} (size-{size}): {count} times ({pct:.1f}%)")
+    
+    logger.info("\n--- Collision Rate by Group Size (Oracle Rollouts) ---")
+    logger.info("(Percentage of oracle rollouts where collision occurred)")
+    collision_by_size = summary["collision_rate_by_size"]
+    for size in sorted(collision_by_size.keys()):
+        logger.info(f"  Size-{size}: {collision_by_size[size]:.2%}")
+    
+    logger.info("\n--- Top 10 Groups with Highest Collision Rate (Oracle Rollouts) ---")
+    for group, rate in summary["top_10_collision_groups"]:
+        eval_count = stats.group_evaluation_counts.get(group, 0)
+        collision_count = stats.group_collision_counts.get(group, 0)
+        logger.info(f"  {list(group)} (size-{len(group)}): {rate:.2%} ({collision_count}/{eval_count} rollouts)")
+    
+    logger.info("\n--- Top 10 Safest Groups (Lowest Collision Rate) ---")
+    for group, rate in summary["top_10_safest_groups"]:
+        eval_count = stats.group_evaluation_counts.get(group, 0)
+        collision_count = stats.group_collision_counts.get(group, 0)
+        logger.info(f"  {list(group)} (size-{len(group)}): {rate:.2%} ({collision_count}/{eval_count} rollouts)")
     
     logger.info("=" * 70)
     
