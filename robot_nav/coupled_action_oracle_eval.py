@@ -241,12 +241,28 @@ class OracleStatistics:
     # group_evaluation_counts: how many times each group was evaluated by the oracle
     group_evaluation_counts: Dict[Tuple[int, ...], int] = field(default_factory=lambda: defaultdict(int))
     
+    # Detailed collision tracking: intra-group vs extra-group collisions
+    # For each group, track counts of:
+    # - intra_group_collisions: collisions between robots WITHIN the group (e.g., robot 2 with robot 3 in group (2,3,4))
+    # - extra_group_robot_collisions: collisions with robots OUTSIDE the group
+    # - obstacle_collisions: collisions with static obstacles
+    group_intra_collisions: Dict[Tuple[int, ...], int] = field(default_factory=lambda: defaultdict(int))
+    group_extra_robot_collisions: Dict[Tuple[int, ...], int] = field(default_factory=lambda: defaultdict(int))
+    group_obstacle_collisions: Dict[Tuple[int, ...], int] = field(default_factory=lambda: defaultdict(int))
+    
+    # Per-robot collision details within group context
+    # (group_tuple, robot_idx) -> {"intra": count, "extra_robot": count, "obstacle": count}
+    per_robot_collision_details: Dict[Tuple[Tuple[int, ...], int], Dict[str, int]] = field(
+        default_factory=lambda: defaultdict(lambda: {"intra": 0, "extra_robot": 0, "obstacle": 0})
+    )
+    
     def record_oracle_selection(
         self,
         best_group: List[int],
         group_rewards: Dict[Tuple[int, ...], float],
         per_robot_reward_breakdown: Optional[Dict[Tuple[int, ...], Dict[int, float]]] = None,
         group_collisions: Optional[Dict[Tuple[int, ...], bool]] = None,
+        group_collision_details: Optional[Dict[Tuple[int, ...], Dict[str, any]]] = None,
     ):
         """
         Record an oracle selection decision.
@@ -258,6 +274,9 @@ class OracleStatistics:
                 {robot_idx: robot's individual reward contribution}.
             group_collisions: Optional dict mapping group tuple to whether collision occurred
                 during the oracle rollout for that group.
+            group_collision_details: Optional dict mapping group tuple to detailed collision info:
+                {"intra": count, "extra_robot": count, "obstacle": count, 
+                 "per_robot": {robot_idx: {"intra": count, "extra_robot": count, "obstacle": count}}}
         """
         group_tuple = tuple(best_group)
         group_size = len(best_group)
@@ -280,6 +299,21 @@ class OracleStatistics:
             for group, had_collision in group_collisions.items():
                 if had_collision:
                     self.group_collision_counts[group] += 1
+        
+        # Record detailed collision breakdown (intra-group vs extra-group vs obstacle)
+        if group_collision_details:
+            for group, details in group_collision_details.items():
+                self.group_intra_collisions[group] += details.get("intra", 0)
+                self.group_extra_robot_collisions[group] += details.get("extra_robot", 0)
+                self.group_obstacle_collisions[group] += details.get("obstacle", 0)
+                
+                # Per-robot collision details
+                per_robot = details.get("per_robot", {})
+                for robot_idx, robot_details in per_robot.items():
+                    key = (group, robot_idx)
+                    self.per_robot_collision_details[key]["intra"] += robot_details.get("intra", 0)
+                    self.per_robot_collision_details[key]["extra_robot"] += robot_details.get("extra_robot", 0)
+                    self.per_robot_collision_details[key]["obstacle"] += robot_details.get("obstacle", 0)
         
         # Record per-robot rewards if provided
         if per_robot_reward_breakdown:
@@ -413,6 +447,52 @@ class OracleStatistics:
             key=lambda x: x[1],
         )[:10]
         
+        # Detailed collision breakdown by group (intra vs extra vs obstacle)
+        # For size-2 and size-3 groups only
+        detailed_collision_by_group = {}
+        for group in self.group_evaluation_counts.keys():
+            if len(group) >= 2:  # Only for groups with 2+ robots
+                eval_count = self.group_evaluation_counts[group]
+                intra = self.group_intra_collisions.get(group, 0)
+                extra = self.group_extra_robot_collisions.get(group, 0)
+                obstacle = self.group_obstacle_collisions.get(group, 0)
+                total = intra + extra + obstacle
+                detailed_collision_by_group[group] = {
+                    "evaluations": eval_count,
+                    "total_collisions": total,
+                    "intra_group": intra,
+                    "extra_group_robot": extra,
+                    "obstacle": obstacle,
+                    "intra_rate": intra / eval_count if eval_count > 0 else 0,
+                    "extra_robot_rate": extra / eval_count if eval_count > 0 else 0,
+                    "obstacle_rate": obstacle / eval_count if eval_count > 0 else 0,
+                }
+        
+        # Aggregate collision breakdown by group size
+        collision_breakdown_by_size = defaultdict(lambda: {
+            "evaluations": 0, "intra": 0, "extra_robot": 0, "obstacle": 0
+        })
+        for group, eval_count in self.group_evaluation_counts.items():
+            size = len(group)
+            if size >= 2:
+                collision_breakdown_by_size[size]["evaluations"] += eval_count
+                collision_breakdown_by_size[size]["intra"] += self.group_intra_collisions.get(group, 0)
+                collision_breakdown_by_size[size]["extra_robot"] += self.group_extra_robot_collisions.get(group, 0)
+                collision_breakdown_by_size[size]["obstacle"] += self.group_obstacle_collisions.get(group, 0)
+        
+        collision_breakdown_by_size = {
+            size: {
+                "evaluations": data["evaluations"],
+                "intra_rate": data["intra"] / data["evaluations"] if data["evaluations"] > 0 else 0,
+                "extra_robot_rate": data["extra_robot"] / data["evaluations"] if data["evaluations"] > 0 else 0,
+                "obstacle_rate": data["obstacle"] / data["evaluations"] if data["evaluations"] > 0 else 0,
+                "intra_count": data["intra"],
+                "extra_robot_count": data["extra_robot"],
+                "obstacle_count": data["obstacle"],
+            }
+            for size, data in collision_breakdown_by_size.items()
+        }
+        
         return {
             "total_oracle_decisions": total_selections,
             "total_executions": total_executions,
@@ -428,6 +508,8 @@ class OracleStatistics:
             "collision_rate_by_size": collision_rate_by_size,
             "top_10_collision_groups": top_collision_groups,
             "top_10_safest_groups": safest_groups,
+            "detailed_collision_by_group": detailed_collision_by_group,
+            "collision_breakdown_by_size": collision_breakdown_by_size,
             "avg_margin": statistics.mean(self.reward_margins) if self.reward_margins else 0,
             "num_episodes": len(self.episode_rewards),
             "avg_episode_reward": statistics.mean(self.episode_rewards) if self.episode_rewards else 0,
@@ -549,7 +631,7 @@ class ShortHorizonOracle:
         goal_positions: List[List[float]],
         obstacle_states: np.ndarray,
         snapshot: SimulationSnapshot,
-    ) -> Tuple[float, bool, Dict[int, float]]:
+    ) -> Tuple[float, bool, Dict[int, float], Dict[str, any]]:
         """
         Evaluate a group by simulating forward H steps.
         
@@ -562,16 +644,28 @@ class ShortHorizonOracle:
             snapshot: Simulation snapshot to restore after rollout.
             
         Returns:
-            Tuple of (cumulative_reward, had_collision, per_robot_rewards).
+            Tuple of (cumulative_reward, had_collision, per_robot_rewards, collision_details).
             - cumulative_reward: Sum of rewards for all robots in group over H steps
             - had_collision: Whether any robot in group collided
             - per_robot_rewards: Dict mapping robot_idx to that robot's cumulative reward
+            - collision_details: Dict with breakdown of collision types:
+                {"intra": count, "extra_robot": count, "obstacle": count,
+                 "per_robot": {robot_idx: {"intra": count, "extra_robot": count, "obstacle": count}}}
         """
         cumulative_reward = 0.0
         had_collision = False
         
         # Track per-robot rewards
         per_robot_rewards = {robot_idx: 0.0 for robot_idx in group}
+        
+        # Track detailed collision information
+        group_set = set(group)
+        collision_details = {
+            "intra": 0,  # Collisions between robots in the group
+            "extra_robot": 0,  # Collisions with robots outside the group
+            "obstacle": 0,  # Collisions with static obstacles
+            "per_robot": {robot_idx: {"intra": 0, "extra_robot": 0, "obstacle": 0} for robot_idx in group}
+        }
         
         # Current state for rollout
         curr_poses = [p.copy() for p in poses]
@@ -613,9 +707,36 @@ class ShortHorizonOracle:
             group_reward = sum(reward[i] for i in group)
             cumulative_reward += group_reward
             
-            # Check for collision
+            # Check for collision and classify it
             if any(curr_collision[i] for i in group):
                 had_collision = True
+                
+                # Analyze collision details using collision_obj from irsim
+                for robot_idx in group:
+                    if curr_collision[robot_idx]:
+                        robot = sim.env.robot_list[robot_idx]
+                        for collided_obj in robot.collision_obj:
+                            obj_name = getattr(collided_obj, 'name', '')
+                            
+                            if obj_name.startswith('robot_'):
+                                # Extract robot index from name (e.g., "robot_3" -> 3)
+                                try:
+                                    other_robot_idx = int(obj_name.split('_')[1])
+                                    if other_robot_idx in group_set:
+                                        # Intra-group collision
+                                        collision_details["intra"] += 1
+                                        collision_details["per_robot"][robot_idx]["intra"] += 1
+                                    else:
+                                        # Extra-group robot collision
+                                        collision_details["extra_robot"] += 1
+                                        collision_details["per_robot"][robot_idx]["extra_robot"] += 1
+                                except (ValueError, IndexError):
+                                    pass
+                            elif obj_name.startswith('obstacle_'):
+                                # Obstacle collision
+                                collision_details["obstacle"] += 1
+                                collision_details["per_robot"][robot_idx]["obstacle"] += 1
+                
                 break
             
             # Check for out of bounds
@@ -626,7 +747,7 @@ class ShortHorizonOracle:
         # Restore simulation to original state
         snapshot.restore_to_sim(sim)
         
-        return cumulative_reward, had_collision, per_robot_rewards
+        return cumulative_reward, had_collision, per_robot_rewards, collision_details
     
     def select_best_group(
         self,
@@ -658,12 +779,13 @@ class ShortHorizonOracle:
             top_k: Number of top groups to consider when using "random_from_top_k"
                 
         Returns:
-            Tuple of (best_group, executed_group, all_group_rewards, per_robot_breakdown, group_collisions).
+            Tuple of (best_group, executed_group, all_group_rewards, per_robot_breakdown, group_collisions, group_collision_details).
             - best_group: The group with highest oracle reward
             - executed_group: The group selected for actual execution (based on mode)
             - all_group_rewards: Dict mapping group tuple to cumulative reward
             - per_robot_breakdown: Dict mapping group tuple to {robot_idx: robot_reward}
             - group_collisions: Dict mapping group tuple to whether collision occurred during rollout
+            - group_collision_details: Dict mapping group tuple to detailed collision breakdown
         """
         # Take snapshot before rollouts
         snapshot = SimulationSnapshot.from_sim(sim)
@@ -671,11 +793,12 @@ class ShortHorizonOracle:
         group_rewards = {}
         per_robot_breakdown = {}
         group_collisions = {}
+        group_collision_details = {}
         best_group = None
         best_reward = float('-inf')
         
         for group in self.candidate_groups:
-            cumulative_reward, had_collision, per_robot_rewards = self.evaluate_group(
+            cumulative_reward, had_collision, per_robot_rewards, collision_details = self.evaluate_group(
                 sim, policy, group,
                 poses, distance, cos, sin, collision, action,
                 goal_positions, obstacle_states, snapshot
@@ -688,6 +811,7 @@ class ShortHorizonOracle:
             group_rewards[tuple(group)] = cumulative_reward
             per_robot_breakdown[tuple(group)] = per_robot_rewards
             group_collisions[tuple(group)] = had_collision
+            group_collision_details[tuple(group)] = collision_details
             
             if cumulative_reward > best_reward:
                 best_reward = cumulative_reward
@@ -710,7 +834,7 @@ class ShortHorizonOracle:
         else:
             raise ValueError(f"Unknown execution_mode: {execution_mode}")
         
-        return best_group, executed_group, group_rewards, per_robot_breakdown, group_collisions
+        return best_group, executed_group, group_rewards, per_robot_breakdown, group_collisions, group_collision_details
 
 
 # ============================================================================
@@ -774,7 +898,7 @@ def run_oracle_evaluation(
         while steps < max_steps:
             # Re-evaluate oracle at intervals or first step
             if steps % oracle_interval == 0:
-                best_group, executed_group, group_rewards, per_robot_breakdown, group_collisions = oracle.select_best_group(
+                best_group, executed_group, group_rewards, per_robot_breakdown, group_collisions, group_collision_details = oracle.select_best_group(
                     sim, coupled_policy,
                     poses, distance, cos, sin, collision, action,
                     goal_positions, obstacle_states,
@@ -782,7 +906,7 @@ def run_oracle_evaluation(
                     top_k=top_k,
                 )
                 # Record oracle selection (what oracle thinks is best)
-                stats.record_oracle_selection(best_group, group_rewards, per_robot_breakdown, group_collisions)
+                stats.record_oracle_selection(best_group, group_rewards, per_robot_breakdown, group_collisions, group_collision_details)
                 # Record what we actually execute
                 stats.record_executed_group(executed_group)
                 current_group = executed_group
@@ -1047,6 +1171,47 @@ def main():
         eval_count = stats.group_evaluation_counts.get(group, 0)
         collision_count = stats.group_collision_counts.get(group, 0)
         logger.info(f"  {list(group)} (size-{len(group)}): {rate:.2%} ({collision_count}/{eval_count} rollouts)")
+    
+    # Detailed collision breakdown by group size
+    logger.info("\n" + "=" * 70)
+    logger.info("DETAILED COLLISION BREAKDOWN (Intra-Group vs Extra-Group vs Obstacle)")
+    logger.info("=" * 70)
+    
+    collision_breakdown = summary.get("collision_breakdown_by_size", {})
+    if collision_breakdown:
+        logger.info("\n--- Collision Type Breakdown by Group Size ---")
+        logger.info("(Rates = collision events / total evaluations for that size)")
+        for size in sorted(collision_breakdown.keys()):
+            data = collision_breakdown[size]
+            logger.info(f"\n  Size-{size} Groups ({data['evaluations']} total evaluations):")
+            logger.info(f"    Intra-group (within group):  {data['intra_rate']:.2%} ({data['intra_count']} events)")
+            logger.info(f"    Extra-group (other robots):  {data['extra_robot_rate']:.2%} ({data['extra_robot_count']} events)")
+            logger.info(f"    Obstacle (static obstacles): {data['obstacle_rate']:.2%} ({data['obstacle_count']} events)")
+    
+    # Detailed breakdown for each size-2 group
+    detailed_by_group = summary.get("detailed_collision_by_group", {})
+    size_2_groups = {g: d for g, d in detailed_by_group.items() if len(g) == 2}
+    size_3_groups = {g: d for g, d in detailed_by_group.items() if len(g) == 3}
+    
+    if size_2_groups:
+        logger.info("\n--- Detailed Collision Breakdown for Size-2 Groups ---")
+        # Sort by total collision count
+        sorted_size_2 = sorted(size_2_groups.items(), key=lambda x: x[1]["total_collisions"], reverse=True)
+        for group, data in sorted_size_2[:15]:  # Top 15 size-2 groups
+            if data["total_collisions"] > 0:
+                logger.info(f"  Group {list(group)}: {data['evaluations']} evals, {data['total_collisions']} collisions")
+                logger.info(f"    Intra-group: {data['intra_rate']:.2%} | Extra-robot: {data['extra_robot_rate']:.2%} | Obstacle: {data['obstacle_rate']:.2%}")
+    
+    if size_3_groups:
+        logger.info("\n--- Detailed Collision Breakdown for Size-3 Groups ---")
+        # Sort by total collision count
+        sorted_size_3 = sorted(size_3_groups.items(), key=lambda x: x[1]["total_collisions"], reverse=True)
+        for group, data in sorted_size_3[:20]:  # Top 20 size-3 groups
+            if data["total_collisions"] > 0:
+                logger.info(f"  Group {list(group)}: {data['evaluations']} evals, {data['total_collisions']} collisions")
+                logger.info(f"    Intra-group: {data['intra_rate']:.2%} ({data['intra_group']} events)")
+                logger.info(f"    Extra-robot: {data['extra_robot_rate']:.2%} ({data['extra_group_robot']} events)")
+                logger.info(f"    Obstacle:    {data['obstacle_rate']:.2%} ({data['obstacle']} events)")
     
     logger.info("=" * 70)
     
