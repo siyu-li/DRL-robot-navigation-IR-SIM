@@ -148,10 +148,13 @@ def test_feature_builder():
     print("   ✓ Batched input handled")
     
     print("\n✓ All GroupFeatureBuilder tests passed!")
-    return builder_extra.output_dim
+    # Return embed_dim and scalar_dim for the switcher test
+    # scalar_dim = size_feat (1) + attn_stats (3) + extra_features (2) = 6
+    scalar_dim = 1 + 3 + len(builder_extra.extra_feature_names)
+    return embed_dim, scalar_dim
 
 
-def test_switcher_network(input_dim: int):
+def test_switcher_network(embed_dim: int, scalar_dim: int):
     """Test GroupSwitcher network."""
     print("\n" + "="*60)
     print("Testing GroupSwitcher Network")
@@ -160,11 +163,13 @@ def test_switcher_network(input_dim: int):
     n_groups = 6
     
     # Create fake group features
+    # Input format: [h_g (embed_dim), h_glob (embed_dim), scalars (scalar_dim)]
+    input_dim = 2 * embed_dim + scalar_dim
     X = torch.randn(n_groups, input_dim)
     
     # Test 1: Basic forward pass
     print("\n1. Basic forward pass:")
-    switcher = GroupSwitcher(input_dim=input_dim, hidden_dim=64, dropout=0.1)
+    switcher = GroupSwitcher(embed_dim=embed_dim, scalar_dim=scalar_dim, dropout=0.1)
     logits = switcher(X)
     print(f"   Input shape: {X.shape}")
     print(f"   Output shape: {logits.shape}")
@@ -202,7 +207,7 @@ def test_switcher_network(input_dim: int):
     
     # Test 6: Switcher with baseline
     print("\n6. Switcher with baseline:")
-    switcher_baseline = GroupSwitcherWithBaseline(input_dim=input_dim, hidden_dim=64)
+    switcher_baseline = GroupSwitcherWithBaseline(embed_dim=embed_dim, scalar_dim=scalar_dim)
     logits_b, value = switcher_baseline(X)
     print(f"   Logits shape: {logits_b.shape}")
     print(f"   Value: {value.item():.4f}")
@@ -334,12 +339,13 @@ def test_end_to_end():
     print(f"   Feature matrix shape: {X.shape}")
     
     # Create switcher
+    # scalar_dim = size_feat (1) + attn_stats (3) + extra_features (2) = 6
+    scalar_dim = 1 + 3 + len(builder.extra_feature_names)
     print("\n2. Creating switcher network:")
     switcher = GroupSwitcher(
-        input_dim=builder.output_dim,
-        hidden_dim=64,
+        embed_dim=embed_dim,
+        scalar_dim=scalar_dim,
         dropout=0.1,
-        num_layers=2,
     )
     print(f"   Network parameters: {sum(p.numel() for p in switcher.parameters())}")
     
@@ -386,8 +392,8 @@ def main():
     print("#"*60)
     
     # Run tests
-    input_dim = test_feature_builder()
-    test_switcher_network(input_dim)
+    embed_dim, scalar_dim = test_feature_builder()
+    test_switcher_network(embed_dim, scalar_dim)
     test_ranking_losses()
     test_end_to_end()
     
