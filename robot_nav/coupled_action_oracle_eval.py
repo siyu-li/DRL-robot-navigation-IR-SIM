@@ -49,16 +49,16 @@ CONFIG = {
     # Model configuration
     "coupled_model_name": "coupled_action_group_obstacle_best",
     "coupled_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/group_policy",
-    "decentralized_model_name": "TD3-MARL-obstacle-6robots",
+    "decentralized_model_name": "TD3-MARL-obstacle-6robots_epoch2400",
     "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2",
     
     # Evaluation configuration
     "test_episodes": 20,
     "max_steps_per_episode": 500,
-    "disable_plotting": False,
+    "disable_plotting": True,
     
     # Oracle configuration
-    "oracle_horizon": 5,  # Number of steps to simulate forward
+    "oracle_horizon": 10,  # Number of steps to simulate forward
     "oracle_interval": 10,  # Re-evaluate oracle every N steps
     "include_size_1": True,  # Include individual robots as candidates
     "include_size_2": True,  # Include size-2 groups
@@ -173,9 +173,6 @@ class SimulationSnapshot:
         for i, robot in enumerate(sim.env.robot_list):
             robot.set_state(state=self.robot_states[i], init=True)
             robot.set_goal(self.robot_goals[i], init=True)
-            # Reset collision and arrive flags
-            robot.collision = False
-            robot.arrive = False
         
         sim.prev_distances = self.prev_distances.copy()
 
@@ -260,10 +257,11 @@ class OracleStatistics:
         self.group_selection_counts[group_tuple] += 1
         
         # Record all group rewards (both raw and normalized)
+        # Convert to float to avoid numpy type coercion issues in statistics.mean()
         for group, reward in group_rewards.items():
-            self.group_cumulative_rewards[group].append(reward)
+            self.group_cumulative_rewards[group].append(float(reward))
             # Normalized by group size for fair comparison
-            normalized = reward / len(group) if len(group) > 0 else 0
+            normalized = float(reward) / len(group) if len(group) > 0 else 0.0
             self.group_normalized_rewards[group].append(normalized)
         
         # Record per-robot rewards if provided
@@ -271,13 +269,13 @@ class OracleStatistics:
             for group, robot_rewards in per_robot_reward_breakdown.items():
                 group_size = len(group)
                 for robot_idx, robot_reward in robot_rewards.items():
-                    self.per_robot_rewards[robot_idx].append(robot_reward)
-                    self.per_robot_rewards_by_group_size[(robot_idx, group_size)].append(robot_reward)
+                    self.per_robot_rewards[robot_idx].append(float(robot_reward))
+                    self.per_robot_rewards_by_group_size[(robot_idx, group_size)].append(float(robot_reward))
         
         # Calculate margin
         sorted_rewards = sorted(group_rewards.values(), reverse=True)
         if len(sorted_rewards) >= 2:
-            margin = sorted_rewards[0] - sorted_rewards[1]
+            margin = float(sorted_rewards[0] - sorted_rewards[1])
             self.reward_margins.append(margin)
     
     def record_executed_group(self, group: List[int]):
@@ -299,10 +297,10 @@ class OracleStatistics:
         Note: These are accumulated over the ENTIRE episode (all steps),
         not just a single oracle horizon.
         """
-        self.episode_rewards.append(total_reward)
-        self.episode_goals.append(goals_reached)
-        self.episode_collisions.append(collisions)
-        self.episode_steps.append(steps)
+        self.episode_rewards.append(float(total_reward))
+        self.episode_goals.append(int(goals_reached))
+        self.episode_collisions.append(int(collisions))
+        self.episode_steps.append(int(steps))
     
     def get_summary(self) -> Dict:
         """Get summary statistics."""
@@ -459,11 +457,14 @@ class ShortHorizonOracle:
             action, _ = self.decentralized_policy.get_action(
                 robot_obs, obstacle_obs, add_noise=False
             )
-            # action is already (num_robots, 2), just zero out inactive robots
+            # action is (num_robots, 2) with values in [-1, 1]
+            # Scale linear velocity: [-1, 1] -> [0, 0.5] using (v + 1) / 4
+            # Angular velocity stays in [-1, 1]
             a_out = []
             for i in range(num_robots):
                 if i == robot_idx:
-                    a_out.append([action[i][0], action[i][1]])
+                    scaled_lin_vel = (action[i][0] + 1) / 4  # [-1,1] -> [0,0.5]
+                    a_out.append([scaled_lin_vel, action[i][1]])
                 else:
                     a_out.append([0.0, 0.0])
             return a_out

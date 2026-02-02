@@ -3,6 +3,6 @@
 from robot_nav.SIM_ENV.sim_env import SIM_ENV
 from robot_nav.SIM_ENV.sim import SIM
 from robot_nav.SIM_ENV.marl_sim import MARL_SIM
-from robot_nav.SIM_ENV.marl_lidar_sim import MARL_LIDAR_SIM
+from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 
-__all__ = ["SIM_ENV", "SIM", "MARL_SIM", "MARL_LIDAR_SIM"]
+__all__ = ["SIM_ENV", "SIM", "MARL_SIM", "MARL_SIM_OBSTACLE"]

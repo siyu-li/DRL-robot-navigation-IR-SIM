@@ -144,9 +144,9 @@ def main(args=None):
         obstacle_state_dim=obstacle_state_dim,
         device=device,
         load_model=True,
-        model_name="TD3-MARL-obstacle-6robots_epoch1200",
-        load_model_name="TD3-MARL-obstacle-6robots_epoch1200",
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots"),
+        model_name="TD3-MARL-obstacle-6robots_epoch2400",
+        load_model_name="TD3-MARL-obstacle-6robots_epoch2400",
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2"),
     )
 
     # ---- Statistics tracking ----
