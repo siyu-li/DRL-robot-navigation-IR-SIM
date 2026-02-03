@@ -46,7 +46,7 @@ CONFIG = {
     "output_path": "robot_nav/models/MARL/switcher/data/oracle_data.pt",
     
     # Data collection settings
-    "n_samples": 100,              # Number of samples to collect
+    "n_samples": 1000,              # Number of samples to collect
     "n_robots": 6,                  # Number of robots
     "n_obstacles": 4,               # Number of obstacles
     "embed_dim": 256,               # Embedding dimension from GAT backbone
@@ -252,15 +252,16 @@ class OracleDataCollector:
                     a_out.append([0.0, 0.0])
             return a_out
         else:
-            # Size-2/3: Compute coupled linear velocity by averaging
+            # Size-2/3: Compute coupled linear velocity using minimum
             # Get scaled linear velocities for robots in the group
             scaled_lin_vels = []
             for idx in group:
                 scaled_lin_vel = (action[idx][0] + 1) / 4  # [-1,1] -> [0,0.5]
                 scaled_lin_vels.append(scaled_lin_vel)
             
-            # Average linear velocity as the coupled velocity
-            v_coupled = sum(scaled_lin_vels) / group_size
+            # Use minimum linear velocity as the coupled velocity
+            # This ensures safety - coupled robots move at the slowest robot's speed
+            v_coupled = min(scaled_lin_vels)
             
             # Build output actions
             a_out = []
