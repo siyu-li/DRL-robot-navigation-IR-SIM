@@ -18,8 +18,8 @@ class GroupSwitcher(nn.Module):
     Takes group feature vectors and outputs logits for ranking.
     
     Architecture (Two-Tower Fusion):
-        Tower 1 (embeddings): e = [h_g || h_glob] ∈ R^512
-            Linear(512 → 256) → GELU → LayerNorm
+        Tower 1 (embeddings): e = [h_g || h_glob] ∈ R^1024
+            Linear(1024 → 256) → GELU → LayerNorm
         
         Tower 2 (scalars): s ∈ R^4 (size_feat + attn_stats)
             Linear(4 → 32) → GELU → LayerNorm
@@ -29,7 +29,7 @@ class GroupSwitcher(nn.Module):
             Linear(256 → 1)
     
     Args:
-        embed_dim: Dimension of per-robot embeddings (d). Default 256.
+        embed_dim: Dimension of per-robot embeddings (d). Default 512.
         scalar_dim: Dimension of scalar features (size + attn_stats). Default 4.
         embed_hidden: Hidden dimension for embedding tower. Default 256.
         scalar_hidden: Hidden dimension for scalar tower. Default 32.
@@ -39,7 +39,7 @@ class GroupSwitcher(nn.Module):
     
     def __init__(
         self,
-        embed_dim: int = 256,
+        embed_dim: int = 512,
         scalar_dim: int = 4,
         embed_hidden: int = 256,
         scalar_hidden: int = 32,
@@ -209,8 +209,8 @@ class GroupSwitcherWithBaseline(nn.Module):
     
     def __init__(
         self,
-        embed_dim: int = 256,
-        scalar_dim: int = 4,
+        embed_dim: int = 512,
+        scalar_dim: int = 6,
         embed_hidden: int = 256,
         scalar_hidden: int = 32,
         fusion_hidden: int = 256,

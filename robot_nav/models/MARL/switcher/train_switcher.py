@@ -43,8 +43,8 @@ from robot_nav.models.MARL.switcher import (
 CONFIG = {
     # Data configuration
     "data_path": "robot_nav/models/MARL/switcher/data/oracle_data.pt",
-    "embed_dim": 256,
-    "extra_features": ["dist_to_goal", "clearance"],
+    "embed_dim": 512,              # Dimension of per-robot embeddings: Will be adjust based on data if None
+    "extra_features": ["dist_to_goal", "clearance"], # If empty list, no extra features
     "extra_aggregations": ["mean", "min"],
     
     # Model architecture
@@ -116,7 +116,7 @@ class OracleDataFormat:
     data = {
         "samples": [
             {
-                "h": torch.randn(6, 256),           # 6 robots, 256-dim embeddings
+                "h": torch.randn(6, 512),           # 6 robots, 512-dim embeddings
                 "groups": [[0], [1], [0,1], [2,3]], # 4 candidate groups
                 "group_scores": torch.tensor([0.3, 0.4, 0.9, 0.7]),  # Oracle scores
                 "attn_rr": torch.rand(6, 6),        # Optional
@@ -129,7 +129,7 @@ class OracleDataFormat:
             # ... more samples
         ],
         "config": {
-            "embed_dim": 256,
+            "embed_dim": 512,
             "n_robots": 6,
             "collection_method": "simulation_rollout",  # or "expert_demo"
             "timestamp": "2026-02-02",

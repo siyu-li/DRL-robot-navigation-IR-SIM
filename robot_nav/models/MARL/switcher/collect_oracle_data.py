@@ -285,6 +285,7 @@ class OracleDataCollector:
         goal_positions: List[List[float]],
         obstacle_states: np.ndarray,
         snapshot: SimulationSnapshot,
+        verbose: bool = False,
     ) -> Tuple[float, bool]:
         """
         Evaluate a group by simulating forward H steps (single rollout).
@@ -294,12 +295,16 @@ class OracleDataCollector:
             poses, distance, cos, sin, collision, action, goal_positions, obstacle_states:
                 Current environment state.
             snapshot: Simulation snapshot to restore after rollout.
+            verbose: If True, print debug information about actions.
             
         Returns:
             Tuple of (cumulative_reward, had_collision).
         """
         cumulative_reward = 0.0
         had_collision = False
+        
+        if verbose:
+            print(f"\n  [Oracle] Evaluating group: {group} (size={len(group)})")
         
         # Current state for rollout
         curr_poses = [p.copy() for p in poses]
@@ -324,6 +329,12 @@ class OracleDataCollector:
                 curr_obstacle_states,
                 group,
             )
+            
+            if verbose and step == 0:
+                print(f"    Step {step}: Actions for all robots (a_in):")
+                for i, act in enumerate(a_in):
+                    in_group = "* " if i in group else "  "
+                    print(f"      {in_group}Robot {i}: lin_vel={act[0]:.4f}, ang_vel={act[1]:.4f}")
             
             # Step simulation
             (
@@ -363,6 +374,7 @@ class OracleDataCollector:
         goal_positions: List[List[float]],
         obstacle_states: np.ndarray,
         snapshot: SimulationSnapshot,
+        verbose: bool = False,
     ) -> float:
         """
         Evaluate a group by averaging over n_rollouts.
@@ -372,20 +384,27 @@ class OracleDataCollector:
             poses, distance, cos, sin, collision, action, goal_positions, obstacle_states:
                 Current environment state.
             snapshot: Simulation snapshot to restore after each rollout.
+            verbose: If True, print debug information (only for first rollout).
             
         Returns:
             score: Average cumulative reward across rollouts (higher = better)
         """
         total_reward = 0.0
         
-        for _ in range(self.n_rollouts_per_group):
+        for rollout_idx in range(self.n_rollouts_per_group):
+            # Only print verbose info for the first rollout
             reward, _ = self._evaluate_group_once(
                 group, poses, distance, cos, sin, collision, action,
-                goal_positions, obstacle_states, snapshot
+                goal_positions, obstacle_states, snapshot,
+                verbose=(verbose and rollout_idx == 0),
             )
             total_reward += reward
         
         avg_reward = total_reward / self.n_rollouts_per_group
+        
+        if verbose:
+            print(f"    -> Group {group} avg reward: {avg_reward:.4f}")
+        
         return avg_reward
     
     def _get_embeddings_and_attention(
@@ -483,6 +502,7 @@ class OracleDataCollector:
         goal_positions: List[List[float]],
         obstacle_states: np.ndarray,
         scenario_id: Optional[int] = None,
+        verbose: bool = False,
     ) -> Dict:
         """
         Collect one sample of oracle data at the current simulation state.
@@ -495,6 +515,7 @@ class OracleDataCollector:
             poses, distance, cos, sin, collision, action, goal_positions, obstacle_states:
                 Current environment state from sim.step() or sim.reset()
             scenario_id: Optional identifier for this sample
+            verbose: If True, print debug information about group evaluations
             
         Returns:
             Sample dictionary compatible with train_switcher.py
@@ -514,17 +535,30 @@ class OracleDataCollector:
         # Get extra features
         extra = self._get_extra_features(poses, distance, goal_positions)
         
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"[Sample {scenario_id}] Evaluating {len(self.groups)} candidate groups")
+            print(f"  Robot positions: {[f'R{i}:({p[0]:.2f},{p[1]:.2f})' for i, p in enumerate(poses)]}")
+            print(f"  Distances to goal: {[f'{d:.2f}' for d in distance]}")
+            print(f"{'='*60}")
+        
         # Evaluate each group with rollouts
         group_scores = []
         
         for group in self.groups:
             score = self._evaluate_group(
                 group, poses, distance, cos, sin, collision, action,
-                goal_positions, obstacle_states, snapshot
+                goal_positions, obstacle_states, snapshot,
+                verbose=verbose,
             )
             group_scores.append(score)
         
         group_scores = torch.tensor(group_scores, dtype=torch.float32)
+        
+        if verbose:
+            best_idx = group_scores.argmax().item()
+            print(f"\n  Best group: {self.groups[best_idx]} with score {group_scores[best_idx]:.4f}")
+            print(f"{'='*60}\n")
         
         return {
             "h": h.cpu(),
@@ -543,6 +577,7 @@ class OracleDataCollector:
         n_samples: int,
         save_path: Optional[str] = None,
         verbose: bool = True,
+        debug_first_n: int = 2,
     ) -> Dict:
         """
         Collect a full dataset of oracle samples by running episodes.
@@ -550,7 +585,8 @@ class OracleDataCollector:
         Args:
             n_samples: Number of samples to collect
             save_path: Path to save the dataset (optional)
-            verbose: Print progress
+            verbose: Print progress bar
+            debug_first_n: Print detailed debug info for first N samples (0 to disable)
             
         Returns:
             data: Dataset dictionary
@@ -570,10 +606,12 @@ class OracleDataCollector:
         
         for i in pbar:
             # Collect sample at current state
+            # Enable verbose for first few samples to debug
             sample = self.collect_sample(
                 poses, distance, cos, sin, collision, action,
                 goal_positions, obstacle_states,
-                scenario_id=i
+                scenario_id=i,
+                verbose=(i < debug_first_n),
             )
             samples.append(sample)
             
