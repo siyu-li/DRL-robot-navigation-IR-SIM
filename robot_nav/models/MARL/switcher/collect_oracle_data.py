@@ -46,15 +46,11 @@ CONFIG = {
     "output_path": "robot_nav/models/MARL/switcher/data/oracle_data.pt",
     
     # Data collection settings
-    "n_samples": 1000,              # Number of samples to collect
+    "n_samples": 100,              # Number of samples to collect
     "n_robots": 6,                  # Number of robots
     "n_obstacles": 4,               # Number of obstacles
     "embed_dim": 256,               # Embedding dimension from GAT backbone
     "seed": 42,                     # Random seed for reproducibility
-    
-    # Collection mode
-    "synthetic": False,             # True: generate synthetic data for testing
-                                    # False: use real simulation
     
     # Oracle evaluation settings
     "oracle_horizon": 10,           # Number of steps to simulate forward for each group
@@ -79,143 +75,6 @@ CONFIG = {
     "obstacle_proximity_threshold": 1.5,
     "max_steps_per_episode": 500,   # Reset episode after this many steps
 }
-
-
-def create_synthetic_oracle_data(
-    n_samples: int = 1000,
-    n_robots: int = 6,
-    embed_dim: int = 256,
-    n_obstacles: int = 4,
-    seed: int = 42,
-) -> Dict:
-    """
-    Create synthetic oracle data for testing the training pipeline.
-    
-    In practice, replace this with actual simulation rollouts or expert labels.
-    
-    Args:
-        n_samples: Number of samples to generate
-        n_robots: Number of robots
-        embed_dim: Dimension of robot embeddings
-        n_obstacles: Number of obstacles
-        seed: Random seed
-        
-    Returns:
-        Data dictionary in the format expected by train_switcher.py
-    """
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    
-    # Define candidate groups (example: all singles, all pairs, all triples)
-    # In practice, use your group generation logic
-    def generate_groups(n_robots: int) -> List[List[int]]:
-        """Generate candidate groups for n robots."""
-        groups = []
-        
-        # Singles
-        for i in range(n_robots):
-            groups.append([i])
-        
-        # Pairs (consecutive robots)
-        for i in range(n_robots - 1):
-            groups.append([i, i + 1])
-        
-        # Triples (consecutive robots)
-        for i in range(n_robots - 2):
-            groups.append([i, i + 1, i + 2])
-        
-        return groups
-    
-    groups = generate_groups(n_robots)
-    n_groups = len(groups)
-    
-    print(f"Generating {n_samples} synthetic samples...")
-    print(f"  Robots: {n_robots}")
-    print(f"  Candidate groups: {n_groups}")
-    print(f"  Groups: {groups}")
-    
-    samples = []
-    
-    for i in range(n_samples):
-        # Generate random robot embeddings (in practice, from GAT backbone)
-        h = torch.randn(n_robots, embed_dim)
-        
-        # Generate random attention weights (in practice, from AttentionObstacle)
-        attn_rr = torch.rand(n_robots, n_robots)
-        attn_rr = attn_rr / attn_rr.sum(dim=1, keepdim=True)  # Normalize rows
-        
-        attn_ro = torch.rand(n_robots, n_obstacles)
-        attn_ro = attn_ro / attn_ro.sum(dim=1, keepdim=True)
-        
-        # Generate per-robot features
-        dist_to_goal = torch.rand(n_robots) * 10  # 0-10 meters
-        clearance = torch.rand(n_robots) * 2      # 0-2 meters
-        
-        # Generate oracle scores for each group
-        # In practice: run simulation rollouts and measure success/progress
-        # Here we use a synthetic scoring function based on group properties
-        group_scores = []
-        
-        for group in groups:
-            # Synthetic score based on:
-            # - Smaller groups are more efficient (less coordination overhead)
-            # - Groups with robots closer to goal are better
-            # - Groups with higher clearance are safer
-            
-            group_dist = dist_to_goal[group].mean().item()
-            group_clearance = clearance[group].min().item()
-            group_size = len(group)
-            
-            # Score formula (higher = better)
-            # Prefer: small groups, close to goal, good clearance
-            score = (
-                -0.3 * group_dist +           # Closer to goal is better
-                0.5 * group_clearance +       # Higher clearance is better
-                -0.1 * group_size +           # Smaller groups are slightly better
-                0.2 * np.random.randn()       # Add some noise
-            )
-            
-            # Normalize to [0, 1]
-            score = 1 / (1 + np.exp(-score))
-            group_scores.append(score)
-        
-        group_scores = torch.tensor(group_scores, dtype=torch.float32)
-        
-        sample = {
-            "h": h,
-            "groups": groups,
-            "group_scores": group_scores,
-            "attn_rr": attn_rr,
-            "attn_ro": attn_ro,
-            "extra": {
-                "dist_to_goal": dist_to_goal,
-                "clearance": clearance,
-            },
-            "metadata": {
-                "sample_id": i,
-            },
-        }
-        
-        samples.append(sample)
-        
-        if (i + 1) % 200 == 0:
-            print(f"  Generated {i + 1}/{n_samples} samples")
-    
-    data = {
-        "samples": samples,
-        "config": {
-            "embed_dim": embed_dim,
-            "n_robots": n_robots,
-            "n_obstacles": n_obstacles,
-            "n_groups": n_groups,
-            "groups": groups,
-            "collection_method": "synthetic",
-            "timestamp": datetime.now().isoformat(),
-            "seed": seed,
-        },
-    }
-    
-    return data
 
 
 # =============================================================================
@@ -801,91 +660,78 @@ def main():
     print(f"Embedding dimension: {config['embed_dim']}")
     print(f"Oracle horizon: {config['oracle_horizon']} steps")
     print(f"Rollouts per group: {config['n_rollouts_per_group']}")
-    print(f"Synthetic mode: {config['synthetic']}")
     print("=" * 70 + "\n")
     
-    if config["synthetic"]:
-        # Generate synthetic data for testing the training pipeline
-        print("Generating SYNTHETIC oracle data (for testing)...")
-        print("For real training, set CONFIG['synthetic'] = False.\n")
-        
-        data = create_synthetic_oracle_data(
-            n_samples=config["n_samples"],
-            n_robots=config["n_robots"],
-            embed_dim=config["embed_dim"],
-            n_obstacles=config["n_obstacles"],
-            seed=config["seed"],
-        )
-    else:
-        # Real data collection using simulation
-        print("Collecting REAL oracle data via simulation rollouts...")
-        
-        # Device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Using device: {device}")
-        
-        # Create simulation environment
-        logger.info("Creating simulation environment...")
-        sim = MARL_SIM_OBSTACLE(
-            world_file=config["world_file"],
-            disable_plotting=config["disable_plotting"],
-            reward_phase=5,
-            per_robot_goal_reset=True,
-            obstacle_proximity_threshold=config["obstacle_proximity_threshold"],
-        )
-        logger.info(f"Environment: {sim.num_robots} robots, {sim.num_obstacles} obstacles")
-        
-        # Load decentralized policy (TD3Obstacle)
-        # This policy provides:
-        # - Robot embeddings from GAT encoder
-        # - Attention weights (hard_weights_rr, hard_weights_ro)
-        # - Per-robot actions (we average linear velocities for coupled groups)
-        logger.info("Loading decentralized policy (TD3Obstacle)...")
-        policy = TD3Obstacle(
-            state_dim=config["state_dim"],
-            action_dim=2,
-            max_action=1.0,
-            device=device,
-            num_robots=config["n_robots"],
-            num_obstacles=config["n_obstacles"],
-            obstacle_state_dim=config["obstacle_state_dim"],
-            load_model=True,
-            model_name=config["decentralized_model_name"],
-            load_model_name=config["decentralized_model_name"],
-            load_directory=Path(config["decentralized_model_directory"]),
-            save_directory=Path(config["decentralized_model_directory"]),
-        )
-        logger.info("Loaded decentralized policy successfully")
-        
-        # Generate candidate groups
-        candidate_groups = generate_candidate_groups(
-            num_robots=config["n_robots"],
-            include_size_1=config["include_size_1"],
-            include_size_2=config["include_size_2"],
-            include_size_3=config["include_size_3"],
-        )
-        
-        logger.info(f"Candidate groups: {len(candidate_groups)} total")
-        logger.info(f"  Size-1: {sum(1 for g in candidate_groups if len(g) == 1)}")
-        logger.info(f"  Size-2: {sum(1 for g in candidate_groups if len(g) == 2)}")
-        logger.info(f"  Size-3: {sum(1 for g in candidate_groups if len(g) == 3)}")
-        
-        # Create oracle data collector
-        collector = OracleDataCollector(
-            sim=sim,
-            policy=policy,
-            groups=candidate_groups,
-            horizon=config["oracle_horizon"],
-            n_rollouts_per_group=config["n_rollouts_per_group"],
-            device=device,
-        )
-        
-        # Collect data
-        data = collector.collect_dataset(
-            n_samples=config["n_samples"],
-            save_path=None,  # We'll save below
-            verbose=True,
-        )
+
+    # Real data collection using simulation
+    print("Collecting REAL oracle data via simulation rollouts...")
+    
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+    
+    # Create simulation environment
+    logger.info("Creating simulation environment...")
+    sim = MARL_SIM_OBSTACLE(
+        world_file=config["world_file"],
+        disable_plotting=config["disable_plotting"],
+        reward_phase=5,
+        per_robot_goal_reset=True,
+        obstacle_proximity_threshold=config["obstacle_proximity_threshold"],
+    )
+    logger.info(f"Environment: {sim.num_robots} robots, {sim.num_obstacles} obstacles")
+    
+    # Load decentralized policy (TD3Obstacle)
+    # This policy provides:
+    # - Robot embeddings from GAT encoder
+    # - Attention weights (hard_weights_rr, hard_weights_ro)
+    # - Per-robot actions (we average linear velocities for coupled groups)
+    logger.info("Loading decentralized policy (TD3Obstacle)...")
+    policy = TD3Obstacle(
+        state_dim=config["state_dim"],
+        action_dim=2,
+        max_action=1.0,
+        device=device,
+        num_robots=config["n_robots"],
+        num_obstacles=config["n_obstacles"],
+        obstacle_state_dim=config["obstacle_state_dim"],
+        load_model=True,
+        model_name=config["decentralized_model_name"],
+        load_model_name=config["decentralized_model_name"],
+        load_directory=Path(config["decentralized_model_directory"]),
+        save_directory=Path(config["decentralized_model_directory"]),
+    )
+    logger.info("Loaded decentralized policy successfully")
+    
+    # Generate candidate groups
+    candidate_groups = generate_candidate_groups(
+        num_robots=config["n_robots"],
+        include_size_1=config["include_size_1"],
+        include_size_2=config["include_size_2"],
+        include_size_3=config["include_size_3"],
+    )
+    
+    logger.info(f"Candidate groups: {len(candidate_groups)} total")
+    logger.info(f"  Size-1: {sum(1 for g in candidate_groups if len(g) == 1)}")
+    logger.info(f"  Size-2: {sum(1 for g in candidate_groups if len(g) == 2)}")
+    logger.info(f"  Size-3: {sum(1 for g in candidate_groups if len(g) == 3)}")
+    
+    # Create oracle data collector
+    collector = OracleDataCollector(
+        sim=sim,
+        policy=policy,
+        groups=candidate_groups,
+        horizon=config["oracle_horizon"],
+        n_rollouts_per_group=config["n_rollouts_per_group"],
+        device=device,
+    )
+    
+    # Collect data
+    data = collector.collect_dataset(
+        n_samples=config["n_samples"],
+        save_path=None,  # We'll save below
+        verbose=True,
+    )
     
     # Save
     output_path = Path(config["output_path"])
