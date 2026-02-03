@@ -27,6 +27,7 @@ Data Collection Methods:
 """
 
 import logging
+import random
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import combinations
@@ -46,7 +47,7 @@ CONFIG = {
     "output_path": "robot_nav/models/MARL/switcher/data/oracle_data.pt",
     
     # Data collection settings
-    "n_samples": 100,              # Number of samples to collect
+    "n_samples": 10000,              # Number of samples to collect
     "n_robots": 6,                  # Number of robots
     "n_obstacles": 4,               # Number of obstacles
     "embed_dim": 256,               # Embedding dimension from GAT backbone
@@ -54,7 +55,7 @@ CONFIG = {
     
     # Oracle evaluation settings
     "oracle_horizon": 10,           # Number of steps to simulate forward for each group
-    "n_rollouts_per_group": 3,      # Number of rollouts to average for each group score
+    "n_rollouts_per_group": 1,      # Number of rollouts to average for each group score
     
     # Group generation settings
     "include_size_1": False,         # Include individual robots as candidates
@@ -73,7 +74,7 @@ CONFIG = {
     "world_file": "robot_nav/worlds/multi_robot_world_obstacle.yaml",
     "disable_plotting": True,
     "obstacle_proximity_threshold": 1.5,
-    "max_steps_per_episode": 500,   # Reset episode after this many steps
+    "max_steps_per_episode": 400,   # Reset episode after this many steps
 }
 
 
@@ -219,7 +220,7 @@ class OracleDataCollector:
         Get action for a specific group using the decentralized policy.
         
         For groups with size > 1, we compute the coupled linear velocity by
-        averaging the linear velocities of all robots in the group.
+        taking the minimum of the linear velocities of all robots in the group.
         Each robot keeps its individual angular velocity.
         
         Args:
@@ -273,6 +274,73 @@ class OracleDataCollector:
                     a_out.append([0.0, 0.0])
             return a_out
     
+    def compute_trajectory_score(
+        self,
+        group: List[int],
+        initial_distances: List[float],
+        final_distances: List[float],
+        had_collision: bool,
+        had_goal: bool,
+        min_robot_proximity: float,
+        min_obstacle_clearance: float,
+        robot_proximity_threshold: float = 1.25,
+        obstacle_proximity_threshold: float = 1.5,
+    ) -> float:
+        """
+        Compute trajectory-based score for an oracle rollout.
+        
+        This evaluates the entire H-step trajectory holistically rather than
+        summing per-step rewards.
+        
+        Scoring components (adjusted scales for balanced influence):
+        1. Collision penalty: -50 if any collision occurred
+        2. Goal bonus: +50 if any robot in group reached goal
+        3. Progress reward: 10.0 * sum(initial_dist - final_dist) for robots in group
+        4. Robot proximity penalty: -10.0 * (threshold - min_prox)^2
+        5. Obstacle proximity penalty: -15.0 * (threshold - min_clearance)^2
+        
+        Args:
+            group: Robot indices in the group
+            initial_distances: Per-robot distances to goal at step 0
+            final_distances: Per-robot distances to goal at final step
+            had_collision: Whether collision occurred during trajectory
+            had_goal: Whether any robot in group reached goal
+            min_robot_proximity: Minimum distance to other robots across trajectory
+            min_obstacle_clearance: Minimum clearance to obstacles across trajectory
+            robot_proximity_threshold: Threshold for robot proximity penalty
+            obstacle_proximity_threshold: Threshold for obstacle proximity penalty
+            
+        Returns:
+            score: Trajectory score (higher = better)
+        """
+        score = 0.0
+        
+        # 1. Collision penalty
+        if had_collision:
+            return -50.0
+        
+        # 2. Goal bonus
+        if had_goal:
+            score += 50.0
+        
+        # 3. Progress reward: sum of (initial_dist - final_dist) for robots in group
+        k_progress = 10.0
+        for i in group:
+            progress = initial_distances[i] - final_distances[i]
+            score += k_progress * progress
+        
+        # 4. Robot proximity penalty
+        k_robot_prox = 10.0
+        if min_robot_proximity < robot_proximity_threshold:
+            score -= k_robot_prox * (robot_proximity_threshold - min_robot_proximity) ** 2
+        
+        # 5. Obstacle proximity penalty
+        k_obs_prox = 15.0
+        if min_obstacle_clearance < obstacle_proximity_threshold:
+            score -= k_obs_prox * (obstacle_proximity_threshold - min_obstacle_clearance) ** 2
+        
+        return score
+    
     def _evaluate_group_once(
         self,
         group: List[int],
@@ -285,26 +353,34 @@ class OracleDataCollector:
         goal_positions: List[List[float]],
         obstacle_states: np.ndarray,
         snapshot: SimulationSnapshot,
-        verbose: bool = False,
     ) -> Tuple[float, bool]:
         """
         Evaluate a group by simulating forward H steps (single rollout).
+        
+        Uses trajectory-based scoring that evaluates the entire rollout:
+        - Collision penalty if any collision occurred
+        - Goal bonus if goal reached
+        - Progress reward based on initial vs final distance
+        - Proximity penalties based on minimum distances across trajectory
         
         Args:
             group: Robot indices in the group.
             poses, distance, cos, sin, collision, action, goal_positions, obstacle_states:
                 Current environment state.
             snapshot: Simulation snapshot to restore after rollout.
-            verbose: If True, print debug information about actions.
             
         Returns:
-            Tuple of (cumulative_reward, had_collision).
+            Tuple of (trajectory_score, had_collision).
         """
-        cumulative_reward = 0.0
         had_collision = False
+        had_goal = False
         
-        if verbose:
-            print(f"\n  [Oracle] Evaluating group: {group} (size={len(group)})")
+        # Store initial distances for progress computation
+        initial_distances = distance.copy()
+        
+        # Track minimum proximities across trajectory
+        min_robot_proximity = float('inf')
+        min_obstacle_clearance = float('inf')
         
         # Current state for rollout
         curr_poses = [p.copy() for p in poses]
@@ -330,12 +406,6 @@ class OracleDataCollector:
                 group,
             )
             
-            if verbose and step == 0:
-                print(f"    Step {step}: Actions for all robots (a_in):")
-                for i, act in enumerate(a_in):
-                    in_group = "* " if i in group else "  "
-                    print(f"      {in_group}Robot {i}: lin_vel={act[0]:.4f}, ang_vel={act[1]:.4f}")
-            
             # Step simulation
             (
                 curr_poses, curr_distance, curr_cos, curr_sin,
@@ -343,9 +413,25 @@ class OracleDataCollector:
                 _, curr_goal_positions, curr_obstacle_states
             ) = self.sim.step(a_in, None, None)
             
-            # Accumulate reward for robots in the group
-            group_reward = sum(reward[i] for i in group)
-            cumulative_reward += group_reward
+            # Track minimum robot-robot proximity for robots in group
+            for i in group:
+                for j in range(self.num_robots):
+                    if i != j:
+                        dist_ij = np.sqrt(
+                            (curr_poses[i][0] - curr_poses[j][0]) ** 2 +
+                            (curr_poses[i][1] - curr_poses[j][1]) ** 2
+                        )
+                        min_robot_proximity = min(min_robot_proximity, dist_ij)
+            
+            # Track minimum obstacle clearance for robots in group
+            for i in group:
+                clearance = self.sim.get_min_obstacle_clearance(i)
+                min_obstacle_clearance = min(min_obstacle_clearance, clearance)
+            
+            # Check for goal reached by any robot in group
+            for i in group:
+                if curr_goal[i]:
+                    had_goal = True
             
             # Check for collision - end rollout early if collision
             if any(curr_collision[i] for i in group):
@@ -357,10 +443,26 @@ class OracleDataCollector:
                 had_collision = True
                 break
         
+        # Final distances after trajectory
+        final_distances = curr_distance.copy()
+        
+        # Compute trajectory score
+        trajectory_score = self.compute_trajectory_score(
+            group=group,
+            initial_distances=initial_distances,
+            final_distances=final_distances,
+            had_collision=had_collision,
+            had_goal=had_goal,
+            min_robot_proximity=min_robot_proximity,
+            min_obstacle_clearance=min_obstacle_clearance,
+            robot_proximity_threshold=1.25,
+            obstacle_proximity_threshold=self.sim.obstacle_proximity_threshold,
+        )
+        
         # Restore simulation to original state
         snapshot.restore_to_sim(self.sim)
         
-        return cumulative_reward, had_collision
+        return trajectory_score, had_collision
     
     def _evaluate_group(
         self,
@@ -374,7 +476,6 @@ class OracleDataCollector:
         goal_positions: List[List[float]],
         obstacle_states: np.ndarray,
         snapshot: SimulationSnapshot,
-        verbose: bool = False,
     ) -> float:
         """
         Evaluate a group by averaging over n_rollouts.
@@ -384,7 +485,6 @@ class OracleDataCollector:
             poses, distance, cos, sin, collision, action, goal_positions, obstacle_states:
                 Current environment state.
             snapshot: Simulation snapshot to restore after each rollout.
-            verbose: If True, print debug information (only for first rollout).
             
         Returns:
             score: Average cumulative reward across rollouts (higher = better)
@@ -392,20 +492,13 @@ class OracleDataCollector:
         total_reward = 0.0
         
         for rollout_idx in range(self.n_rollouts_per_group):
-            # Only print verbose info for the first rollout
             reward, _ = self._evaluate_group_once(
                 group, poses, distance, cos, sin, collision, action,
                 goal_positions, obstacle_states, snapshot,
-                verbose=(verbose and rollout_idx == 0),
             )
             total_reward += reward
         
-        avg_reward = total_reward / self.n_rollouts_per_group
-        
-        if verbose:
-            print(f"    -> Group {group} avg reward: {avg_reward:.4f}")
-        
-        return avg_reward
+        return total_reward / self.n_rollouts_per_group
     
     def _get_embeddings_and_attention(
         self,
@@ -502,7 +595,6 @@ class OracleDataCollector:
         goal_positions: List[List[float]],
         obstacle_states: np.ndarray,
         scenario_id: Optional[int] = None,
-        verbose: bool = False,
     ) -> Dict:
         """
         Collect one sample of oracle data at the current simulation state.
@@ -515,7 +607,6 @@ class OracleDataCollector:
             poses, distance, cos, sin, collision, action, goal_positions, obstacle_states:
                 Current environment state from sim.step() or sim.reset()
             scenario_id: Optional identifier for this sample
-            verbose: If True, print debug information about group evaluations
             
         Returns:
             Sample dictionary compatible with train_switcher.py
@@ -535,13 +626,6 @@ class OracleDataCollector:
         # Get extra features
         extra = self._get_extra_features(poses, distance, goal_positions)
         
-        if verbose:
-            print(f"\n{'='*60}")
-            print(f"[Sample {scenario_id}] Evaluating {len(self.groups)} candidate groups")
-            print(f"  Robot positions: {[f'R{i}:({p[0]:.2f},{p[1]:.2f})' for i, p in enumerate(poses)]}")
-            print(f"  Distances to goal: {[f'{d:.2f}' for d in distance]}")
-            print(f"{'='*60}")
-        
         # Evaluate each group with rollouts
         group_scores = []
         
@@ -549,16 +633,10 @@ class OracleDataCollector:
             score = self._evaluate_group(
                 group, poses, distance, cos, sin, collision, action,
                 goal_positions, obstacle_states, snapshot,
-                verbose=verbose,
             )
             group_scores.append(score)
         
         group_scores = torch.tensor(group_scores, dtype=torch.float32)
-        
-        if verbose:
-            best_idx = group_scores.argmax().item()
-            print(f"\n  Best group: {self.groups[best_idx]} with score {group_scores[best_idx]:.4f}")
-            print(f"{'='*60}\n")
         
         return {
             "h": h.cpu(),
@@ -577,7 +655,6 @@ class OracleDataCollector:
         n_samples: int,
         save_path: Optional[str] = None,
         verbose: bool = True,
-        debug_first_n: int = 2,
     ) -> Dict:
         """
         Collect a full dataset of oracle samples by running episodes.
@@ -586,7 +663,6 @@ class OracleDataCollector:
             n_samples: Number of samples to collect
             save_path: Path to save the dataset (optional)
             verbose: Print progress bar
-            debug_first_n: Print detailed debug info for first N samples (0 to disable)
             
         Returns:
             data: Dataset dictionary
@@ -606,31 +682,25 @@ class OracleDataCollector:
         
         for i in pbar:
             # Collect sample at current state
-            # Enable verbose for first few samples to debug
             sample = self.collect_sample(
                 poses, distance, cos, sin, collision, action,
                 goal_positions, obstacle_states,
                 scenario_id=i,
-                verbose=(i < debug_first_n),
             )
             samples.append(sample)
             
-            # Take a random action to advance simulation to a new state
-            # Use decentralized policy to get diverse states
+            # Take action from a randomly selected group to advance simulation
+            # This better mimics how the switcher will operate during evaluation
             robot_state, _ = self.policy.prepare_state(
                 poses, distance, cos, sin, collision, action, goal_positions
             )
             robot_obs = np.array(robot_state)
             
-            action_out, _ = self.policy.get_action(
-                robot_obs, obstacle_states, add_noise=True  # Add noise for diversity
+            # Randomly select a group and use its coupled action
+            random_group = random.choice(self.groups)
+            scaled_action = self.get_action_for_group(
+                robot_obs, obstacle_states, random_group
             )
-            
-            # Scale actions
-            scaled_action = []
-            for j in range(self.num_robots):
-                scaled_lin_vel = (action_out[j][0] + 1) / 4
-                scaled_action.append([scaled_lin_vel, action_out[j][1]])
             
             # Step simulation
             (
@@ -648,10 +718,11 @@ class OracleDataCollector:
             )
             
             if should_reset:
+                # Full reset: all robots and randomize obstacles
                 (
                     poses, distance, cos, sin, collision, goals,
                     action, reward, positions, goal_positions, obstacle_states
-                ) = self.sim.reset()
+                ) = self.sim.reset(random_obstacles=True)
                 step_in_episode = 0
         
         data = {
