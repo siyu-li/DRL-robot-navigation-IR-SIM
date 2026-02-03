@@ -46,7 +46,7 @@ CONFIG = {
     "output_path": "robot_nav/models/MARL/switcher/data/oracle_data.pt",
     
     # Data collection settings
-    "n_samples": 1000,              # Number of samples to collect
+    "n_samples": 100,              # Number of samples to collect
     "n_robots": 6,                  # Number of robots
     "n_obstacles": 4,               # Number of obstacles
     "embed_dim": 256,               # Embedding dimension from GAT backbone

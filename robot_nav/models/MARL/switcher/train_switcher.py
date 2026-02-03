@@ -156,20 +156,24 @@ class SwitcherDataset(Dataset):
     def __init__(
         self,
         data_path: str,
-        embed_dim: int = 256,
+        embed_dim: Optional[int] = None,
         extra_feature_names: Optional[List[str]] = None,
         extra_aggregations: Optional[List[str]] = None,
     ):
         """
         Args:
             data_path: Path to oracle data file (.pt)
-            embed_dim: Dimension of robot embeddings
+            embed_dim: Dimension of robot embeddings. If None, inferred from data.
             extra_feature_names: Names of extra features to include
             extra_aggregations: Aggregation methods for extra features
         """
         self.data = torch.load(data_path)
         self.samples = self.data["samples"]
         self.config = self.data.get("config", {})
+        
+        # Infer embed_dim from data if not provided
+        if embed_dim is None:
+            embed_dim = self.samples[0]["h"].shape[-1]
         
         # Feature builder
         self.feature_builder = GroupFeatureBuilder(
@@ -352,10 +356,10 @@ class SwitcherTrainer:
         """Setup datasets and dataloaders."""
         config = self.config
         
-        # Load full dataset
+        # Load full dataset (embed_dim is inferred from data)
         full_dataset = SwitcherDataset(
             data_path=config.data_path,
-            embed_dim=config.embed_dim,
+            embed_dim=None,  # Infer from data
             extra_feature_names=config.extra_features,
             extra_aggregations=config.extra_aggregations,
         )

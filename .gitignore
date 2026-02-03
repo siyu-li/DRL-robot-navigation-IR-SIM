@@ -15,3 +15,7 @@ robot_nav/.DS_Store
 *.pth
 /tests/__pycache__
 *.yml
+*.pyc
+*.pt
+*.0
+robot_nav/models/MARL/switcher/runs/switcher/config.json
