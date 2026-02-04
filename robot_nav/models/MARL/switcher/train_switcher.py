@@ -56,8 +56,8 @@ CONFIG = {
     
     # Training configuration
     "epochs": 100,
-    "batch_size": 32,
-    "lr": 1e-3,
+    "batch_size": 64,
+    "lr": 3e-4,
     "weight_decay": 1e-4,
     "loss_type": "logistic",        # "logistic" or "hinge"
     "hinge_margin": 1.0,            # Only used if loss_type="hinge"
