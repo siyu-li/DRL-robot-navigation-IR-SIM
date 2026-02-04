@@ -47,7 +47,7 @@ CONFIG = {
     "output_path": "robot_nav/models/MARL/switcher/data/oracle_data.pt",
     
     # Data collection settings
-    "n_samples": 10000,              # Number of samples to collect
+    "n_samples": 7000,              # Number of samples to collect
     "n_robots": 6,                  # Number of robots
     "n_obstacles": 4,               # Number of obstacles
     "embed_dim": 256,               # Embedding dimension from GAT backbone
@@ -58,7 +58,7 @@ CONFIG = {
     "n_rollouts_per_group": 1,      # Number of rollouts to average for each group score
     
     # Group generation settings
-    "include_size_1": False,         # Include individual robots as candidates
+    "include_size_1": True,         # Include individual robots as candidates
     "include_size_2": True,         # Include pairs
     "include_size_3": True,         # Include triplets
     
@@ -75,102 +75,8 @@ CONFIG = {
     "disable_plotting": True,
     "obstacle_proximity_threshold": 1.5,
     "max_steps_per_episode": 400,   # Reset episode after this many steps
-    
-    # Debug settings
-    "debug_scoring": True,          # Enable detailed scoring debug output
-    "debug_samples": 10,            # Number of samples to print detailed debug info
-    
-    # Interactive debug mode - pause after each oracle with rendering
-    "interactive_debug": False,      # Enable interactive debug mode (pauses after each group eval)
-    "interactive_samples": 3,       # Number of samples to run in interactive mode
 }
 
-
-# =============================================================================
-# Debug Statistics Tracker
-# =============================================================================
-class ScoringDebugStats:
-    """Track statistics of scoring components for debugging."""
-    
-    def __init__(self):
-        self.reset()
-    
-    def reset(self):
-        self.collision_count = 0
-        self.goal_count = 0
-        self.progress_rewards = []
-        self.evasion_rewards = []
-        self.stuckness_penalties = []
-        self.total_scores = []
-        self.evasion_details = []  # List of dicts with breakdown
-        
-    def add_sample(self, collision, goal, progress, evasion, stuckness, total, evasion_detail=None):
-        if collision:
-            self.collision_count += 1
-        if goal:
-            self.goal_count += 1
-        self.progress_rewards.append(progress)
-        self.evasion_rewards.append(evasion)
-        self.stuckness_penalties.append(stuckness)
-        self.total_scores.append(total)
-        if evasion_detail:
-            self.evasion_details.append(evasion_detail)
-    
-    def print_summary(self, n_samples):
-        print("\n" + "=" * 70)
-        print("SCORING DEBUG SUMMARY")
-        print("=" * 70)
-        
-        print(f"\nTotal groups evaluated: {len(self.total_scores)}")
-        print(f"Collisions: {self.collision_count} ({100*self.collision_count/max(1,len(self.total_scores)):.1f}%)")
-        print(f"Goals reached: {self.goal_count} ({100*self.goal_count/max(1,len(self.total_scores)):.1f}%)")
-        
-        def stats(arr, name):
-            if len(arr) == 0:
-                return
-            arr = np.array(arr)
-            print(f"\n{name}:")
-            print(f"  Mean: {arr.mean():.4f}")
-            print(f"  Std:  {arr.std():.4f}")
-            print(f"  Min:  {arr.min():.4f}")
-            print(f"  Max:  {arr.max():.4f}")
-            print(f"  |Mean|: {np.abs(arr).mean():.4f}  (absolute contribution)")
-        
-        stats(self.progress_rewards, "Progress Reward")
-        stats(self.evasion_rewards, "Evasion Reward")
-        stats(self.stuckness_penalties, "Stuckness Penalty")
-        stats(self.total_scores, "Total Score")
-        
-        # Compute relative contributions (using absolute values)
-        if len(self.total_scores) > 0:
-            abs_progress = np.abs(self.progress_rewards).mean()
-            abs_evasion = np.abs(self.evasion_rewards).mean()
-            abs_stuckness = np.abs(self.stuckness_penalties).mean()
-            total_contrib = abs_progress + abs_evasion + abs_stuckness + 1e-8
-            
-            print(f"\nRelative Contribution (by absolute mean):")
-            print(f"  Progress:  {100*abs_progress/total_contrib:.1f}%")
-            print(f"  Evasion:   {100*abs_evasion/total_contrib:.1f}%")
-            print(f"  Stuckness: {100*abs_stuckness/total_contrib:.1f}%")
-        
-        # Evasion breakdown
-        if len(self.evasion_details) > 0:
-            robot_align = [d.get('robot_align', 0) for d in self.evasion_details]
-            robot_dist = [d.get('robot_dist', 0) for d in self.evasion_details]
-            obs_align = [d.get('obs_align', 0) for d in self.evasion_details]
-            obs_dist = [d.get('obs_dist', 0) for d in self.evasion_details]
-            
-            print(f"\nEvasion Reward Breakdown:")
-            print(f"  Robot alignment: mean={np.mean(robot_align):.4f}, std={np.std(robot_align):.4f}")
-            print(f"  Robot distance:  mean={np.mean(robot_dist):.4f}, std={np.std(robot_dist):.4f}")
-            print(f"  Obs alignment:   mean={np.mean(obs_align):.4f}, std={np.std(obs_align):.4f}")
-            print(f"  Obs distance:    mean={np.mean(obs_dist):.4f}, std={np.std(obs_dist):.4f}")
-        
-        print("=" * 70 + "\n")
-
-
-# Global debug tracker
-DEBUG_STATS = ScoringDebugStats()
 
 # =============================================================================
 # Helper Functions
@@ -375,27 +281,33 @@ class OracleDataCollector:
         final_poses: List[List[float]],
         initial_obstacle_states: np.ndarray,
         final_obstacle_states: np.ndarray,
-        robot_proximity_threshold: float = 1.5,
-        obstacle_proximity_threshold: float = 1.5,
+        robot_proximity_threshold: float = 1.25,
+        obstacle_proximity_threshold: float = 1.25,
+        robot_align_threshold: float = 0.7,
+        obstacle_align_threshold: float = 0.7,
         return_details: bool = False,
     ) -> Tuple[float, Optional[Dict]]:
         """
         Compute evasion reward for robots that rotate/move away from nearby entities.
         
         Rewards robots for:
-        - Rotating away from nearby robots/obstacles (alignment improvement)
-        - Increasing distance from nearby robots/obstacles (distance improvement)
+        - Rotating away from nearby robots/obstacles (alignment improvement) - uses smaller threshold
+        - Increasing clearance from nearby robots/obstacles (clearance improvement) - uses larger threshold
         
-        Only applies to entities within the proximity threshold.
-        
+        NOTE: Uses proper clearance calculation:
+        - Robot-robot clearance: center distance minus 2*robot_radius (0.4)
+        - Robot-obstacle clearance: center distance minus (obstacle_radius+robot_radius) (0.9)
+
         Args:
             group: Robot indices in the group
             initial_poses: Per-robot poses at start [[x, y, theta], ...]
             final_poses: Per-robot poses at end [[x, y, theta], ...]
             initial_obstacle_states: Obstacle states at start (N_obs, 4) [x, y, vx, vy]
             final_obstacle_states: Obstacle states at end
-            robot_proximity_threshold: Only consider robots within this distance
-            obstacle_proximity_threshold: Only consider obstacles within this distance
+            robot_proximity_threshold: Consider robots within this clearance for clearance reward
+            obstacle_proximity_threshold: Consider obstacles within this clearance for clearance reward
+            robot_align_threshold: Consider robots within this clearance for alignment reward (smaller)
+            obstacle_align_threshold: Consider obstacles within this clearance for alignment reward (smaller)
             return_details: If True, return breakdown of evasion components
             
         Returns:
@@ -404,8 +316,13 @@ class OracleDataCollector:
         """
         evasion_score = 0.0
         k_align = 5.0   # Weight for alignment improvement
-        k_dist = 3.0    # Weight for distance improvement
+        k_dist = 3.0    # Weight for clearance improvement
         
+        # Geometry constants
+        robot_radius = 0.2       # Robot radius from world yaml
+        obstacle_radius = 0.7   # Obstacle radius from world yaml
+        robot_collision_dist = 2 * robot_radius  # 0.4m center-to-center for collision
+        obstacle_collision_dist = obstacle_radius + robot_radius  # 0.9m center-to-center for collision
         # Track detailed breakdown
         robot_align_total = 0.0
         robot_dist_total = 0.0
@@ -422,14 +339,16 @@ class OracleDataCollector:
                 if i == j:
                     continue
                 
-                # Initial distance and angle to robot j
+                # Initial center-to-center distance and clearance to robot j
                 xj_init, yj_init, _ = initial_poses[j]
                 dx_init = xj_init - xi_init
                 dy_init = yj_init - yi_init
-                dist_init = np.sqrt(dx_init**2 + dy_init**2)
+                center_dist_init = np.sqrt(dx_init**2 + dy_init**2)
+                # Clearance = center distance - 2*robot_radius
+                clearance_init = center_dist_init - robot_collision_dist
                 
-                # Only consider robots within threshold
-                if dist_init > robot_proximity_threshold:
+                # Skip if outside both thresholds
+                if clearance_init > robot_proximity_threshold:
                     continue
                 
                 # Angle from robot i to robot j (in world frame)
@@ -443,24 +362,27 @@ class OracleDataCollector:
                 xj_final, yj_final, _ = final_poses[j]
                 dx_final = xj_final - xi_final
                 dy_final = yj_final - yi_final
-                dist_final = np.sqrt(dx_final**2 + dy_final**2)
+                center_dist_final = np.sqrt(dx_final**2 + dy_final**2)
+                clearance_final = center_dist_final - robot_collision_dist
                 angle_to_j_final = np.arctan2(dy_final, dx_final)
                 alignment_final = np.cos(theta_i_final - angle_to_j_final)
                 
-                # Improvement scores (positive = good)
-                # Alignment improvement: went from pointing at (1) to pointing away (-1)
-                alignment_improvement = alignment_init - alignment_final
-                # Distance improvement: increased distance
-                dist_improvement = dist_final - dist_init
-                
-                # Urgency weight: closer initial distance = more important to evade
-                urgency = max(0, robot_proximity_threshold - dist_init) / robot_proximity_threshold
-                
-                robot_align_contrib = urgency * k_align * alignment_improvement
-                robot_dist_contrib = urgency * k_dist * dist_improvement
-                robot_align_total += robot_align_contrib
+                # Clearance improvement (uses robot_proximity_threshold)
+                # Clip final clearance at threshold - no extra reward for moving beyond safe distance
+                clearance_final_clipped = min(clearance_final, robot_proximity_threshold)
+                clearance_improvement = clearance_final_clipped - clearance_init
+                urgency_dist = max(0, robot_proximity_threshold - clearance_init) / robot_proximity_threshold
+                robot_dist_contrib = urgency_dist * k_dist * clearance_improvement
                 robot_dist_total += robot_dist_contrib
-                evasion_score += robot_align_contrib + robot_dist_contrib
+                evasion_score += robot_dist_contrib
+                
+                # Alignment improvement (uses smaller robot_align_threshold)
+                if clearance_init <= robot_align_threshold:
+                    alignment_improvement = alignment_init - alignment_final
+                    urgency_align = max(0, robot_align_threshold - clearance_init) / robot_align_threshold
+                    robot_align_contrib = urgency_align * k_align * alignment_improvement
+                    robot_align_total += robot_align_contrib
+                    evasion_score += robot_align_contrib
             
             # === Robot-Obstacle Evasion ===
             for obs_idx in range(self.num_obstacles):
@@ -470,10 +392,12 @@ class OracleDataCollector:
                 
                 dx_init = ox_init - xi_init
                 dy_init = oy_init - yi_init
-                dist_init = np.sqrt(dx_init**2 + dy_init**2)
+                center_dist_init = np.sqrt(dx_init**2 + dy_init**2)
+                # Clearance = center distance - obstacle_collision_dist 
+                clearance_init = center_dist_init - obstacle_collision_dist
                 
-                # Only consider obstacles within threshold
-                if dist_init > obstacle_proximity_threshold:
+                # Skip if outside both thresholds
+                if clearance_init > obstacle_proximity_threshold:
                     continue
                 
                 angle_to_obs_init = np.arctan2(dy_init, dx_init)
@@ -485,22 +409,27 @@ class OracleDataCollector:
                 
                 dx_final = ox_final - xi_final
                 dy_final = oy_final - yi_final
-                dist_final = np.sqrt(dx_final**2 + dy_final**2)
+                center_dist_final = np.sqrt(dx_final**2 + dy_final**2)
+                clearance_final = center_dist_final - obstacle_collision_dist
                 angle_to_obs_final = np.arctan2(dy_final, dx_final)
                 alignment_final = np.cos(theta_i_final - angle_to_obs_final)
                 
-                # Improvement scores
-                alignment_improvement = alignment_init - alignment_final
-                dist_improvement = dist_final - dist_init
-                
-                # Urgency weight
-                urgency = max(0, obstacle_proximity_threshold - dist_init) / obstacle_proximity_threshold
-                
-                obs_align_contrib = urgency * k_align * alignment_improvement
-                obs_dist_contrib = urgency * k_dist * dist_improvement
-                obs_align_total += obs_align_contrib
+                # Clearance improvement (uses obstacle_proximity_threshold)
+                # Clip final clearance at threshold - no extra reward for moving beyond safe distance
+                clearance_final_clipped = min(clearance_final, obstacle_proximity_threshold)
+                clearance_improvement = clearance_final_clipped - clearance_init
+                urgency_dist = max(0, obstacle_proximity_threshold - clearance_init) / obstacle_proximity_threshold
+                obs_dist_contrib = urgency_dist * k_dist * clearance_improvement
                 obs_dist_total += obs_dist_contrib
-                evasion_score += obs_align_contrib + obs_dist_contrib
+                evasion_score += obs_dist_contrib
+                
+                # Alignment improvement (uses smaller obstacle_align_threshold)
+                if clearance_init <= obstacle_align_threshold:
+                    alignment_improvement = alignment_init - alignment_final
+                    urgency_align = max(0, obstacle_align_threshold - clearance_init) / obstacle_align_threshold
+                    obs_align_contrib = urgency_align * k_align * alignment_improvement
+                    obs_align_total += obs_align_contrib
+                    evasion_score += obs_align_contrib
         
         details = {
             'robot_align': robot_align_total,
@@ -572,7 +501,6 @@ class OracleDataCollector:
         robot_proximity_threshold: float = 1.5,
         obstacle_proximity_threshold: float = 1.5,
         min_displacement_threshold: float = 0.2,
-        debug: bool = False,
     ) -> float:
         """
         Compute trajectory-based score for an oracle rollout.
@@ -582,8 +510,8 @@ class OracleDataCollector:
         
         Scoring components:
         1. Collision penalty: -50 if any collision occurred
-        2. Goal bonus: +50 if any robot in group reached goal
-        3. Progress reward: 10.0 * sum(initial_dist - final_dist) for robots in group
+        2. Goal bonus: +30 if any robot in group reached goal
+        3. Progress reward: k * sum(initial_dist - final_dist) for robots in group
         4. Evasion reward: Reward for rotating/moving away from nearby entities
         5. Stuckness penalty: Penalty for groups with very low displacement
         
@@ -600,36 +528,32 @@ class OracleDataCollector:
             robot_proximity_threshold: Threshold for evasion reward (robots)
             obstacle_proximity_threshold: Threshold for evasion reward (obstacles)
             min_displacement_threshold: Minimum displacement to avoid stuckness penalty
-            debug: If True, track debug statistics
             
         Returns:
             score: Trajectory score (higher = better)
         """
         # 1. Collision penalty
         if had_collision:
-            if debug:
-                DEBUG_STATS.add_sample(
-                    collision=True, goal=False, progress=0, evasion=0, 
-                    stuckness=0, total=-50.0, evasion_detail=None
-                )
             return -50.0
         
         score = 0.0
         
         # 2. Goal bonus
         if had_goal:
-            score += 50.0
+            score += 30.0
         
         # 3. Progress reward: sum of (initial_dist - final_dist) for robots in group
-        k_progress = 10.0
+        # Skip progress reward if goal was reached (goal position changes, making distance invalid)
+        k_progress = 3.0
         progress_reward = 0.0
-        for i in group:
-            progress = initial_distances[i] - final_distances[i]
-            progress_reward += k_progress * progress
-        score += progress_reward
+        if not had_goal:
+            for i in group:
+                progress = initial_distances[i] - final_distances[i]
+                progress_reward += k_progress * progress
+            score += progress_reward
         
         # 4. Evasion reward: reward for rotating/moving away from nearby entities
-        evasion_reward, evasion_detail = self.compute_evasion_reward(
+        evasion_reward, _ = self.compute_evasion_reward(
             group=group,
             initial_poses=initial_poses,
             final_poses=final_poses,
@@ -637,7 +561,7 @@ class OracleDataCollector:
             final_obstacle_states=final_obstacle_states,
             robot_proximity_threshold=robot_proximity_threshold,
             obstacle_proximity_threshold=obstacle_proximity_threshold,
-            return_details=debug,
+            return_details=False,
         )
         score += evasion_reward
         
@@ -650,18 +574,6 @@ class OracleDataCollector:
             had_goal=had_goal,
         )
         score += stuckness_penalty
-        
-        # Track debug statistics
-        if debug:
-            DEBUG_STATS.add_sample(
-                collision=False,
-                goal=had_goal,
-                progress=progress_reward,
-                evasion=evasion_reward,
-                stuckness=stuckness_penalty,
-                total=score,
-                evasion_detail=evasion_detail,
-            )
         
         return score
     
@@ -677,8 +589,6 @@ class OracleDataCollector:
         goal_positions: List[List[float]],
         obstacle_states: np.ndarray,
         snapshot: SimulationSnapshot,
-        debug: bool = False,
-        interactive: bool = False,
     ) -> Tuple[float, bool]:
         """
         Evaluate a group by simulating forward H steps (single rollout).
@@ -695,8 +605,6 @@ class OracleDataCollector:
             poses, distance, cos, sin, collision, action, goal_positions, obstacle_states:
                 Current environment state.
             snapshot: Simulation snapshot to restore after rollout.
-            debug: If True, track debug statistics.
-            interactive: If True, render simulation and print detailed breakdown.
             
         Returns:
             Tuple of (trajectory_score, had_collision).
@@ -719,13 +627,6 @@ class OracleDataCollector:
         curr_goal_positions = [g.copy() for g in goal_positions]
         curr_obstacle_states = obstacle_states.copy()
         
-        if interactive:
-            print(f"\n{'='*60}")
-            print(f"ORACLE ROLLOUT: Group {group}")
-            print(f"{'='*60}")
-            print(f"Initial poses: {[f'R{i}:({p[0]:.2f},{p[1]:.2f},θ={p[2]:.2f})' for i, p in enumerate(initial_poses) if i in group]}")
-            print(f"Initial distances to goal: {[f'R{i}:{d:.2f}' for i, d in enumerate(initial_distances) if i in group]}")
-        
         for step in range(self.horizon):
             # Prepare state using the policy's prepare_state method
             robot_state, _ = self.policy.prepare_state(
@@ -747,10 +648,6 @@ class OracleDataCollector:
                 _, curr_goal_positions, curr_obstacle_states
             ) = self.sim.step(a_in, None, None)
             
-            # Render if interactive
-            if interactive:
-                self.sim.render()
-            
             # Check for goal reached by any robot in group
             for i in group:
                 if curr_goal[i]:
@@ -759,35 +656,17 @@ class OracleDataCollector:
             # Check for collision - end rollout early if collision
             if any(curr_collision[i] for i in group):
                 had_collision = True
-                if interactive:
-                    print(f"  Step {step}: COLLISION detected!")
                 break
             
             # Check for out of bounds
             if outside_of_bounds(curr_poses, self.sim):
                 had_collision = True
-                if interactive:
-                    print(f"  Step {step}: OUT OF BOUNDS!")
                 break
         
         # Final state after trajectory
         final_poses = [p.copy() for p in curr_poses]
         final_distances = curr_distance.copy()
         final_obstacle_states = curr_obstacle_states.copy()
-        
-        # Compute detailed score breakdown for interactive mode
-        if interactive:
-            self._print_interactive_score_breakdown(
-                group=group,
-                initial_poses=initial_poses,
-                final_poses=final_poses,
-                initial_distances=initial_distances,
-                final_distances=final_distances,
-                initial_obstacle_states=initial_obstacle_states,
-                final_obstacle_states=final_obstacle_states,
-                had_collision=had_collision,
-                had_goal=had_goal,
-            )
         
         # Compute trajectory score using start and end states
         trajectory_score = self.compute_trajectory_score(
@@ -803,170 +682,12 @@ class OracleDataCollector:
             robot_proximity_threshold=1.5,
             obstacle_proximity_threshold=self.sim.obstacle_proximity_threshold,
             min_displacement_threshold=0.2,
-            debug=debug,
         )
-        
-        if interactive:
-            print(f"\n  >>> TOTAL SCORE: {trajectory_score:.4f}")
-            input("  Press Enter to continue to next group...")
         
         # Restore simulation to original state
         snapshot.restore_to_sim(self.sim)
         
-        # Re-render after restore if interactive
-        if interactive:
-            self.sim.render()
-        
         return trajectory_score, had_collision
-    
-    def _print_interactive_score_breakdown(
-        self,
-        group: List[int],
-        initial_poses: List[List[float]],
-        final_poses: List[List[float]],
-        initial_distances: List[float],
-        final_distances: List[float],
-        initial_obstacle_states: np.ndarray,
-        final_obstacle_states: np.ndarray,
-        had_collision: bool,
-        had_goal: bool,
-    ):
-        """Print detailed score breakdown for interactive debugging."""
-        print(f"\n--- Score Breakdown for Group {group} ---")
-        
-        # Collision
-        if had_collision:
-            print(f"  [COLLISION] Score = -50.0 (early termination)")
-            return
-        
-        # Goal bonus
-        goal_bonus = 50.0 if had_goal else 0.0
-        print(f"  [GOAL]      Reached: {had_goal}, Bonus: +{goal_bonus:.2f}")
-        
-        # Progress reward
-        k_progress = 10.0
-        progress_reward = 0.0
-        print(f"  [PROGRESS]  (k={k_progress})")
-        for i in group:
-            progress = initial_distances[i] - final_distances[i]
-            contrib = k_progress * progress
-            progress_reward += contrib
-            print(f"              R{i}: {initial_distances[i]:.3f} -> {final_distances[i]:.3f}, "
-                  f"Δ={progress:.3f}, contrib={contrib:.3f}")
-        print(f"              Total progress reward: {progress_reward:.4f}")
-        
-        # Evasion reward breakdown
-        k_align = 5.0
-        k_dist = 3.0
-        robot_prox_thresh = 1.5
-        obs_prox_thresh = self.sim.obstacle_proximity_threshold
-        
-        print(f"  [EVASION]   (k_align={k_align}, k_dist={k_dist})")
-        
-        robot_align_total = 0.0
-        robot_dist_total = 0.0
-        obs_align_total = 0.0
-        obs_dist_total = 0.0
-        
-        for i in group:
-            xi_init, yi_init, theta_i_init = initial_poses[i]
-            xi_final, yi_final, theta_i_final = final_poses[i]
-            
-            # Robot-robot evasion
-            for j in range(self.num_robots):
-                if i == j:
-                    continue
-                xj_init, yj_init, _ = initial_poses[j]
-                dist_init = np.sqrt((xj_init - xi_init)**2 + (yj_init - yi_init)**2)
-                
-                if dist_init <= robot_prox_thresh:
-                    angle_to_j_init = np.arctan2(yj_init - yi_init, xj_init - xi_init)
-                    alignment_init = np.cos(theta_i_init - angle_to_j_init)
-                    
-                    xj_final, yj_final, _ = final_poses[j]
-                    dist_final = np.sqrt((xj_final - xi_final)**2 + (yj_final - yi_final)**2)
-                    angle_to_j_final = np.arctan2(yj_final - yi_final, xj_final - xi_final)
-                    alignment_final = np.cos(theta_i_final - angle_to_j_final)
-                    
-                    alignment_improvement = alignment_init - alignment_final
-                    dist_improvement = dist_final - dist_init
-                    urgency = max(0, robot_prox_thresh - dist_init) / robot_prox_thresh
-                    
-                    align_contrib = urgency * k_align * alignment_improvement
-                    dist_contrib = urgency * k_dist * dist_improvement
-                    robot_align_total += align_contrib
-                    robot_dist_total += dist_contrib
-                    
-                    print(f"              R{i}->R{j}: dist={dist_init:.2f}, urgency={urgency:.2f}")
-                    print(f"                align: {alignment_init:.3f}->{alignment_final:.3f}, Δ={alignment_improvement:.3f}, contrib={align_contrib:.3f}")
-                    print(f"                dist:  {dist_init:.3f}->{dist_final:.3f}, Δ={dist_improvement:.3f}, contrib={dist_contrib:.3f}")
-            
-            # Robot-obstacle evasion
-            for obs_idx in range(self.num_obstacles):
-                ox_init = initial_obstacle_states[obs_idx, 0]
-                oy_init = initial_obstacle_states[obs_idx, 1]
-                dist_init = np.sqrt((ox_init - xi_init)**2 + (oy_init - yi_init)**2)
-                
-                if dist_init <= obs_prox_thresh:
-                    angle_to_obs_init = np.arctan2(oy_init - yi_init, ox_init - xi_init)
-                    alignment_init = np.cos(theta_i_init - angle_to_obs_init)
-                    
-                    ox_final = final_obstacle_states[obs_idx, 0]
-                    oy_final = final_obstacle_states[obs_idx, 1]
-                    dist_final = np.sqrt((ox_final - xi_final)**2 + (oy_final - yi_final)**2)
-                    angle_to_obs_final = np.arctan2(oy_final - yi_final, ox_final - xi_final)
-                    alignment_final = np.cos(theta_i_final - angle_to_obs_final)
-                    
-                    alignment_improvement = alignment_init - alignment_final
-                    dist_improvement = dist_final - dist_init
-                    urgency = max(0, obs_prox_thresh - dist_init) / obs_prox_thresh
-                    
-                    align_contrib = urgency * k_align * alignment_improvement
-                    dist_contrib = urgency * k_dist * dist_improvement
-                    obs_align_total += align_contrib
-                    obs_dist_total += dist_contrib
-                    
-                    print(f"              R{i}->Obs{obs_idx}: dist={dist_init:.2f}, urgency={urgency:.2f}")
-                    print(f"                align: {alignment_init:.3f}->{alignment_final:.3f}, Δ={alignment_improvement:.3f}, contrib={align_contrib:.3f}")
-                    print(f"                dist:  {dist_init:.3f}->{dist_final:.3f}, Δ={dist_improvement:.3f}, contrib={dist_contrib:.3f}")
-        
-        evasion_total = robot_align_total + robot_dist_total + obs_align_total + obs_dist_total
-        print(f"              Robot align: {robot_align_total:.4f}, Robot dist: {robot_dist_total:.4f}")
-        print(f"              Obs align: {obs_align_total:.4f}, Obs dist: {obs_dist_total:.4f}")
-        print(f"              Total evasion reward: {evasion_total:.4f}")
-        
-        # Stuckness penalty
-        k_stuck = 20.0
-        min_disp_thresh = 0.2
-        total_displacement = 0.0
-        print(f"  [STUCKNESS] (k={k_stuck}, thresh={min_disp_thresh})")
-        for i in group:
-            xi_init, yi_init, _ = initial_poses[i]
-            xi_final, yi_final, _ = final_poses[i]
-            disp = np.sqrt((xi_final - xi_init)**2 + (yi_final - yi_init)**2)
-            total_displacement += disp
-            print(f"              R{i}: displacement={disp:.4f}")
-        
-        avg_disp = total_displacement / len(group)
-        if had_goal:
-            stuckness_penalty = 0.0
-            print(f"              Avg displacement: {avg_disp:.4f} (no penalty - goal reached)")
-        elif avg_disp < min_disp_thresh:
-            stuckness_penalty = -k_stuck * (min_disp_thresh - avg_disp)
-            print(f"              Avg displacement: {avg_disp:.4f} < {min_disp_thresh}, penalty={stuckness_penalty:.4f}")
-        else:
-            stuckness_penalty = 0.0
-            print(f"              Avg displacement: {avg_disp:.4f} >= {min_disp_thresh}, no penalty")
-        
-        # Summary
-        total = goal_bonus + progress_reward + evasion_total + stuckness_penalty
-        print(f"\n  --- SUMMARY ---")
-        print(f"  Goal bonus:      {goal_bonus:+.4f}")
-        print(f"  Progress reward: {progress_reward:+.4f}")
-        print(f"  Evasion reward:  {evasion_total:+.4f}")
-        print(f"  Stuckness pen:   {stuckness_penalty:+.4f}")
-        print(f"  --------------------------")
-        print(f"  TOTAL:           {total:+.4f}")
     
     def _evaluate_group(
         self,
@@ -980,8 +701,6 @@ class OracleDataCollector:
         goal_positions: List[List[float]],
         obstacle_states: np.ndarray,
         snapshot: SimulationSnapshot,
-        debug: bool = False,
-        interactive: bool = False,
     ) -> float:
         """
         Evaluate a group by averaging over n_rollouts.
@@ -991,8 +710,6 @@ class OracleDataCollector:
             poses, distance, cos, sin, collision, action, goal_positions, obstacle_states:
                 Current environment state.
             snapshot: Simulation snapshot to restore after each rollout.
-            debug: If True, track debug statistics.
-            interactive: If True, render and pause for user inspection.
             
         Returns:
             score: Average cumulative reward across rollouts (higher = better)
@@ -1002,8 +719,7 @@ class OracleDataCollector:
         for rollout_idx in range(self.n_rollouts_per_group):
             reward, _ = self._evaluate_group_once(
                 group, poses, distance, cos, sin, collision, action,
-                goal_positions, obstacle_states, snapshot, debug=debug,
-                interactive=interactive,
+                goal_positions, obstacle_states, snapshot,
             )
             total_reward += reward
         
@@ -1104,8 +820,6 @@ class OracleDataCollector:
         goal_positions: List[List[float]],
         obstacle_states: np.ndarray,
         scenario_id: Optional[int] = None,
-        debug: bool = False,
-        interactive: bool = False,
     ) -> Dict:
         """
         Collect one sample of oracle data at the current simulation state.
@@ -1118,8 +832,6 @@ class OracleDataCollector:
             poses, distance, cos, sin, collision, action, goal_positions, obstacle_states:
                 Current environment state from sim.step() or sim.reset()
             scenario_id: Optional identifier for this sample
-            debug: If True, track debug statistics
-            interactive: If True, render and pause after each group evaluation
             
         Returns:
             Sample dictionary compatible with train_switcher.py
@@ -1139,24 +851,13 @@ class OracleDataCollector:
         # Get extra features
         extra = self._get_extra_features(poses, distance, goal_positions)
         
-        if interactive:
-            print(f"\n{'#'*70}")
-            print(f"# SAMPLE {scenario_id}: Evaluating {len(self.groups)} groups")
-            print(f"# Robot positions: {[f'R{i}:({p[0]:.1f},{p[1]:.1f})' for i, p in enumerate(poses)]}")
-            print(f"# Obstacle positions: {[f'O{i}:({obstacle_states[i,0]:.1f},{obstacle_states[i,1]:.1f})' for i in range(self.num_obstacles)]}")
-            print(f"{'#'*70}")
-            # Render initial state
-            self.sim.render()
-            input("Press Enter to start evaluating groups...")
-        
         # Evaluate each group with rollouts
         group_scores = []
         
         for group in self.groups:
             score = self._evaluate_group(
                 group, poses, distance, cos, sin, collision, action,
-                goal_positions, obstacle_states, snapshot, debug=debug,
-                interactive=interactive,
+                goal_positions, obstacle_states, snapshot,
             )
             group_scores.append(score)
         
@@ -1179,8 +880,6 @@ class OracleDataCollector:
         n_samples: int,
         save_path: Optional[str] = None,
         verbose: bool = True,
-        debug_scoring: bool = False,
-        debug_samples: int = 5,
     ) -> Dict:
         """
         Collect a full dataset of oracle samples by running episodes.
@@ -1189,21 +888,11 @@ class OracleDataCollector:
             n_samples: Number of samples to collect
             save_path: Path to save the dataset (optional)
             verbose: Print progress bar
-            debug_scoring: If True, track and print debug statistics
-            debug_samples: Number of samples to collect debug stats for
             
         Returns:
             data: Dataset dictionary
         """
         samples = []
-        
-        # Check for interactive mode
-        interactive_debug = CONFIG.get("interactive_debug", False)
-        interactive_samples = CONFIG.get("interactive_samples", 3)
-        
-        # Reset debug stats
-        if debug_scoring:
-            DEBUG_STATS.reset()
         
         pbar = tqdm(range(n_samples), desc="Collecting oracle data") if verbose else range(n_samples)
         
@@ -1217,55 +906,15 @@ class OracleDataCollector:
         max_steps = CONFIG.get("max_steps_per_episode", 500)
         
         for i in pbar:
-            # Enable debug for first N samples
-            enable_debug = debug_scoring and (i < debug_samples)
-            # Enable interactive mode for first few samples
-            enable_interactive = interactive_debug and (i < interactive_samples)
-            
             # Collect sample at current state
             sample = self.collect_sample(
                 poses, distance, cos, sin, collision, action,
                 goal_positions, obstacle_states,
                 scenario_id=i,
-                debug=enable_debug,
-                interactive=enable_interactive,
             )
             samples.append(sample)
             
-            # Print sample summary after interactive session
-            if enable_interactive:
-                scores = sample["group_scores"]
-                best_idx = scores.argmax().item()
-                worst_idx = scores.argmin().item()
-                print(f"\n{'='*70}")
-                print(f"SAMPLE {i} COMPLETE - Summary")
-                print(f"{'='*70}")
-                print(f"  Score range: [{scores.min():.2f}, {scores.max():.2f}]")
-                print(f"  Best group: {self.groups[best_idx]} (score={scores[best_idx]:.2f})")
-                print(f"  Worst group: {self.groups[worst_idx]} (score={scores[worst_idx]:.2f})")
-                print(f"  Mean score: {scores.mean():.2f}, Std: {scores.std():.2f}")
-                
-                # Print top 5 groups
-                sorted_indices = scores.argsort(descending=True)
-                print(f"\n  Top 5 groups:")
-                for rank, idx in enumerate(sorted_indices[:5]):
-                    print(f"    {rank+1}. {self.groups[idx]} -> score={scores[idx]:.2f}")
-                
-                input("\nPress Enter to continue to next sample...")
-            
-            # Print detailed debug info for first few samples (non-interactive)
-            elif enable_debug and verbose:
-                scores = sample["group_scores"]
-                best_idx = scores.argmax().item()
-                worst_idx = scores.argmin().item()
-                print(f"\n--- Sample {i} Debug ---")
-                print(f"  Score range: [{scores.min():.2f}, {scores.max():.2f}]")
-                print(f"  Best group: {self.groups[best_idx]} (score={scores[best_idx]:.2f})")
-                print(f"  Worst group: {self.groups[worst_idx]} (score={scores[worst_idx]:.2f})")
-                print(f"  Mean score: {scores.mean():.2f}, Std: {scores.std():.2f}")
-            
             # Take action from a randomly selected group to advance simulation
-            # This better mimics how the switcher will operate during evaluation
             robot_state, _ = self.policy.prepare_state(
                 poses, distance, cos, sin, collision, action, goal_positions
             )
@@ -1299,10 +948,6 @@ class OracleDataCollector:
                     action, reward, positions, goal_positions, obstacle_states
                 ) = self.sim.reset(random_obstacles=True)
                 step_in_episode = 0
-        
-        # Print debug summary
-        if debug_scoring and verbose:
-            DEBUG_STATS.print_summary(debug_samples)
         
         data = {
             "samples": samples,
@@ -1340,10 +985,6 @@ def main():
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
     
-    # Check for interactive mode
-    interactive_debug = config.get("interactive_debug", False)
-    interactive_samples = config.get("interactive_samples", 3)
-    
     print("=" * 70)
     print("Oracle Data Collection for Group Switcher")
     print("=" * 70)
@@ -1353,31 +994,17 @@ def main():
     print(f"Embedding dimension: {config['embed_dim']}")
     print(f"Oracle horizon: {config['oracle_horizon']} steps")
     print(f"Rollouts per group: {config['n_rollouts_per_group']}")
-    if interactive_debug:
-        print(f"\n*** INTERACTIVE MODE ENABLED ***")
-        print(f"    Will pause and render for first {interactive_samples} samples")
-        print(f"    Press Enter to advance through group evaluations")
     print("=" * 70 + "\n")
-    
-
-    # Real data collection using simulation
-    print("Collecting REAL oracle data via simulation rollouts...")
     
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
     # Create simulation environment
-    # In interactive mode, enable plotting for visualization
-    disable_plotting = config["disable_plotting"]
-    if interactive_debug:
-        disable_plotting = False  # Enable rendering for interactive debug
-        logger.info("Interactive mode: enabling simulation rendering")
-    
     logger.info("Creating simulation environment...")
     sim = MARL_SIM_OBSTACLE(
         world_file=config["world_file"],
-        disable_plotting=disable_plotting,
+        disable_plotting=config["disable_plotting"],
         reward_phase=5,
         per_robot_goal_reset=True,
         obstacle_proximity_threshold=config["obstacle_proximity_threshold"],
@@ -1385,10 +1012,6 @@ def main():
     logger.info(f"Environment: {sim.num_robots} robots, {sim.num_obstacles} obstacles")
     
     # Load decentralized policy (TD3Obstacle)
-    # This policy provides:
-    # - Robot embeddings from GAT encoder
-    # - Attention weights (hard_weights_rr, hard_weights_ro)
-    # - Per-robot actions (we average linear velocities for coupled groups)
     logger.info("Loading decentralized policy (TD3Obstacle)...")
     policy = TD3Obstacle(
         state_dim=config["state_dim"],
@@ -1429,19 +1052,11 @@ def main():
         device=device,
     )
     
-    # Collect data with debug mode from config
-    debug_scoring = config.get("debug_scoring", False)
-    debug_samples = config.get("debug_samples", 5)
-    
-    if debug_scoring:
-        print(f"\n[DEBUG MODE] Collecting detailed scoring stats for first {debug_samples} samples...")
-    
+    # Collect data
     data = collector.collect_dataset(
         n_samples=config["n_samples"],
         save_path=None,  # We'll save below
         verbose=True,
-        debug_scoring=debug_scoring,
-        debug_samples=debug_samples,
     )
     
     # Save
