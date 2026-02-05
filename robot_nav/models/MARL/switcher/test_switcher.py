@@ -3,11 +3,15 @@ Test script for evaluating the trained Group Switcher network.
 
 This script evaluates the GroupSwitcher network by comparing its performance
 against random group selection. It measures:
-- Success rate (percentage of episodes where all robots reach goals)
-- Collision rate (percentage of episodes with collisions)
+- Success rate (percentage of robot trajectories that reach goals)
+- Collision rate (percentage of robot trajectories that end in collision)
 - Average reward (using reward phase 5)
 - Group execution statistics
 - Detailed collision breakdown (intra-group vs extra-group vs obstacle)
+
+Note: Success rate and collision rate are calculated at the per-robot trajectory
+level (not episode level), so they should sum to 100%. Each robot trajectory
+ends in either "goal" (success) or "collision/out-of-bounds" (failure).
 
 Usage:
     python -m robot_nav.models.MARL.switcher.test_switcher
@@ -26,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from shapely.geometry import Point
 from tqdm import tqdm
 
 from robot_nav.models.MARL.marlTD3.marlTD3_obstacle import TD3Obstacle
@@ -87,14 +92,16 @@ CONFIG = {
 # =============================================================================
 def generate_candidate_groups(
     num_robots: int,
+    include_size_1: bool = True,
     include_size_2: bool = True,
     include_size_3: bool = True,
 ) -> List[List[int]]:
     """
-    Generate all candidate groups of size 2 and 3.
+    Generate all candidate groups of size 1, 2, and 3.
     
     Args:
         num_robots: Total number of robots.
+        include_size_1: Include singletons (individual robots).
         include_size_2: Include pairs.
         include_size_3: Include triplets.
         
@@ -103,6 +110,10 @@ def generate_candidate_groups(
     """
     all_groups = []
     robot_indices = list(range(num_robots))
+    
+    if include_size_1:
+        for i in robot_indices:
+            all_groups.append([i])
     
     if include_size_2:
         for combo in combinations(robot_indices, 2):
@@ -125,6 +136,84 @@ def outside_of_bounds(poses: List[List[float]], sim: MARL_SIM_OBSTACLE) -> bool:
     return False
 
 
+def robot_outside_bounds(pose: List[float], sim: MARL_SIM_OBSTACLE) -> bool:
+    """Check if a specific robot is outside world boundaries."""
+    if pose[0] < sim.x_range[0] or pose[0] > sim.x_range[1]:
+        return True
+    if pose[1] < sim.y_range[0] or pose[1] > sim.y_range[1]:
+        return True
+    return False
+
+
+def reset_single_robot(
+    sim: MARL_SIM_OBSTACLE,
+    robot_idx: int,
+    current_positions: List[List[float]],
+) -> List[List[float]]:
+    """
+    Reset a single robot to a new random position and goal.
+    
+    Args:
+        sim: The simulation environment.
+        robot_idx: Index of the robot to reset.
+        current_positions: List of current robot positions to avoid overlap.
+    
+    Returns:
+        Updated current_positions list.
+    """
+    x_min = sim.x_range[0] + 1
+    x_max = sim.x_range[1] - 1
+    y_min = sim.y_range[0] + 1
+    y_max = sim.y_range[1] - 1
+    
+    robot = sim.env.robot_list[robot_idx]
+    
+    conflict = True
+    while conflict:
+        conflict = False
+        robot_state = [
+            [random.uniform(x_min, x_max)],
+            [random.uniform(y_min, y_max)],
+            [random.uniform(-np.pi, np.pi)],
+        ]
+        pos = [robot_state[0][0], robot_state[1][0]]
+        
+        # Check robot-robot spacing
+        for j, loc in enumerate(current_positions):
+            if j == robot_idx:
+                continue
+            vector = [pos[0] - loc[0], pos[1] - loc[1]]
+            if np.linalg.norm(vector) < 0.6:
+                conflict = True
+                break
+        
+        # Check robot-obstacle clearance
+        if not conflict:
+            robot_point = Point(pos[0], pos[1])
+            for obs in sim.env.obstacle_list:
+                if obs.geometry.distance(robot_point) < 0.5:
+                    conflict = True
+                    break
+    
+    # Update current_positions
+    current_positions[robot_idx] = pos
+    
+    # Set robot state
+    robot.set_state(state=np.array(robot_state), init=True)
+    
+    # Set new random goal
+    robot.set_random_goal(
+        obstacle_list=sim.env.obstacle_list,
+        init=True,
+        range_limits=[
+            [sim.x_range[0] + 1, sim.y_range[0] + 1, -np.pi],
+            [sim.x_range[1] - 1, sim.y_range[1] - 1, np.pi],
+        ],
+    )
+    
+    return current_positions
+
+
 # =============================================================================
 # Statistics Tracking
 # =============================================================================
@@ -134,10 +223,12 @@ class TestStatistics:
     
     # Episode-level metrics
     episode_rewards: List[float] = field(default_factory=list)
-    episode_goals: List[int] = field(default_factory=list)
-    episode_collisions: List[int] = field(default_factory=list)
     episode_steps: List[int] = field(default_factory=list)
-    episode_success: List[bool] = field(default_factory=list)
+    
+    # Per-robot trajectory tracking (like marl_test_obstacle_6robots.py)
+    # Each trajectory ends in either 'goal' (success) or 'collision' (failure)
+    completed_trajectories: List[Tuple[int, str, float]] = field(default_factory=list)
+    # Format: (robot_idx, outcome ('goal' or 'collision'), cumulative_reward)
     
     # Group execution counts
     executed_group_counts: Dict[Tuple[int, ...], int] = field(
@@ -203,20 +294,25 @@ class TestStatistics:
                 elif coll_type == "obstacle":
                     self.group_obstacle_collisions[group_tuple] += 1
     
+    def record_trajectory(self, robot_idx: int, outcome: str, cumulative_reward: float):
+        """
+        Record a completed robot trajectory.
+        
+        Args:
+            robot_idx: Index of the robot.
+            outcome: 'goal' for success, 'collision' for failure.
+            cumulative_reward: Total reward accumulated during this trajectory.
+        """
+        self.completed_trajectories.append((robot_idx, outcome, cumulative_reward))
+    
     def record_episode(
         self,
         total_reward: float,
-        goals_reached: int,
-        collisions: int,
         steps: int,
-        success: bool,
     ):
         """Record episode-level metrics."""
         self.episode_rewards.append(float(total_reward))
-        self.episode_goals.append(int(goals_reached))
-        self.episode_collisions.append(int(collisions))
         self.episode_steps.append(int(steps))
-        self.episode_success.append(success)
     
     def get_summary(self) -> Dict:
         """Get summary statistics."""
@@ -225,12 +321,29 @@ class TestStatistics:
         
         # Episode statistics
         avg_reward = np.mean(self.episode_rewards) if self.episode_rewards else 0.0
-        avg_goals = np.mean(self.episode_goals) if self.episode_goals else 0.0
-        avg_collisions = np.mean(self.episode_collisions) if self.episode_collisions else 0.0
         avg_steps = np.mean(self.episode_steps) if self.episode_steps else 0.0
         
-        success_rate = np.mean(self.episode_success) if self.episode_success else 0.0
-        collision_rate = sum(1 for c in self.episode_collisions if c > 0) / max(num_episodes, 1)
+        # Per-trajectory statistics (like marl_test_obstacle_6robots.py)
+        total_trajectories = len(self.completed_trajectories)
+        successful_trajectories = [t for t in self.completed_trajectories if t[1] == 'goal']
+        collision_trajectories = [t for t in self.completed_trajectories if t[1] == 'collision']
+        
+        success_count = len(successful_trajectories)
+        collision_count = len(collision_trajectories)
+        
+        # Success rate and collision rate are mutually exclusive and sum to 100%
+        success_rate = success_count / max(total_trajectories, 1)
+        collision_rate = collision_count / max(total_trajectories, 1)
+        
+        # Average rewards by outcome
+        avg_success_reward = (
+            np.mean([t[2] for t in successful_trajectories]) 
+            if successful_trajectories else 0.0
+        )
+        avg_collision_reward = (
+            np.mean([t[2] for t in collision_trajectories]) 
+            if collision_trajectories else 0.0
+        )
         
         # Group size distribution
         size_distribution = {}
@@ -246,7 +359,7 @@ class TestStatistics:
         
         # Collision rate by group size
         collision_rate_by_size = {}
-        for size in [2, 3]:
+        for size in [1, 2, 3]:
             size_groups = [g for g in self.group_execution_counts.keys() if len(g) == size]
             total_exec = sum(self.group_execution_counts.get(g, 0) for g in size_groups)
             total_coll = sum(self.group_collision_counts.get(g, 0) for g in size_groups)
@@ -274,7 +387,7 @@ class TestStatistics:
         
         # Collision breakdown by size
         collision_breakdown = {}
-        for size in [2, 3]:
+        for size in [1, 2, 3]:
             size_groups = [g for g in self.group_execution_counts.keys() if len(g) == size]
             total_exec = sum(self.group_execution_counts.get(g, 0) for g in size_groups)
             intra = sum(self.group_intra_collisions.get(g, 0) for g in size_groups)
@@ -306,12 +419,15 @@ class TestStatistics:
         return {
             "num_episodes": num_episodes,
             "total_executions": total_executions,
+            "total_trajectories": total_trajectories,
+            "success_count": success_count,
+            "collision_count": collision_count,
             "avg_episode_reward": avg_reward,
-            "avg_goals": avg_goals,
-            "avg_collisions": avg_collisions,
             "avg_steps": avg_steps,
             "success_rate": success_rate,
             "collision_rate": collision_rate,
+            "avg_success_reward": avg_success_reward,
+            "avg_collision_reward": avg_collision_reward,
             "size_distribution": size_distribution,
             "top_10_executed_groups": top_10_executed,
             "collision_rate_by_size": collision_rate_by_size,
@@ -613,6 +729,10 @@ def run_test_evaluation(
     """
     Run test evaluation with either switcher or random group selection.
     
+    Tracks per-robot trajectories like marl_test_obstacle_6robots.py.
+    Each robot trajectory ends in either 'goal' (success) or 'collision' (failure).
+    When a robot completes a trajectory, it is reset to a new random position.
+    
     Args:
         sim: Simulation environment.
         policy: TD3Obstacle policy.
@@ -640,11 +760,16 @@ def run_test_evaluation(
         ) = sim.reset(random_obstacles=True)
         
         episode_reward = 0.0
-        episode_goals = 0
-        episode_collisions = 0
         current_group = None
         steps = 0
-        goals_reached = [False] * num_robots
+        
+        # Per-robot trajectory tracking
+        trajectory_rewards = [0.0] * num_robots  # Cumulative reward for current trajectory
+        current_positions = [[p[0], p[1]] for p in poses]  # For collision-free respawn
+        
+        # Track episode-level stats for progress bar
+        episode_goals = 0
+        episode_collisions = 0
         
         while steps < max_steps:
             # Select group at intervals
@@ -683,69 +808,73 @@ def run_test_evaluation(
             
             steps += 1
             
-            # Accumulate reward (sum of per-robot rewards for robots in group)
+            # Update current positions
+            current_positions = [[p[0], p[1]] for p in poses]
+            
+            # Accumulate rewards for all robots (for trajectory tracking)
+            for i in range(num_robots):
+                trajectory_rewards[i] += reward[i]
+            
+            # Accumulate episode reward (sum of per-robot rewards for robots in group)
             for i in current_group:
                 episode_reward += reward[i]
             
-            # Track goals reached
-            for i, g in enumerate(goals):
-                if g and not goals_reached[i]:
-                    goals_reached[i] = True
+            # Check for completed trajectories and reset individual robots
+            robots_to_reset = []
+            
+            for i in range(num_robots):
+                if collision[i]:
+                    # Trajectory ended with collision
+                    stats.record_trajectory(i, 'collision', trajectory_rewards[i])
+                    episode_collisions += 1
+                    trajectory_rewards[i] = 0.0
+                    robots_to_reset.append(i)
+                    
+                    # Record collision details if robot is in current group
+                    if i in current_group:
+                        collision_types = classify_collisions(
+                            collision, poses, current_group, sim
+                        )
+                        stats.record_collision(current_group, [i], collision_types)
+                        
+                elif goals[i]:
+                    # Trajectory ended with goal reach
+                    stats.record_trajectory(i, 'goal', trajectory_rewards[i])
                     episode_goals += 1
+                    trajectory_rewards[i] = 0.0
+                    robots_to_reset.append(i)
+                    
+                elif robot_outside_bounds(poses[i], sim):
+                    # Trajectory ended by going out of bounds (treat as collision)
+                    stats.record_trajectory(i, 'collision', trajectory_rewards[i])
+                    episode_collisions += 1
+                    trajectory_rewards[i] = 0.0
+                    robots_to_reset.append(i)
             
-            # Check for collision
-            if any(collision):
-                episode_collisions += 1
-                
-                # Classify collision types
-                collision_types = classify_collisions(
-                    collision, poses, current_group, sim
-                )
-                collision_indices = [i for i, c in enumerate(collision) if c]
-                stats.record_collision(current_group, collision_indices, collision_types)
-                
-                # Reset on collision
-                (
-                    poses, distance, cos, sin, collision, goals, action, reward,
-                    positions, goal_positions, obstacle_states
-                ) = sim.reset(random_obstacles=True)
-                goals_reached = [False] * num_robots
+            # Reset robots that completed their trajectories
+            for robot_idx in robots_to_reset:
+                current_positions = reset_single_robot(sim, robot_idx, current_positions)
+            
+            # Force re-selection if any robot in current group was reset
+            if any(r in current_group for r in robots_to_reset):
                 current_group = None
-                continue
-            
-            # Check for out of bounds
-            if outside_of_bounds(poses, sim):
-                episode_collisions += 1
-                
-                # Reset on out of bounds
-                (
-                    poses, distance, cos, sin, collision, goals, action, reward,
-                    positions, goal_positions, obstacle_states
-                ) = sim.reset(random_obstacles=True)
-                goals_reached = [False] * num_robots
-                current_group = None
-                continue
-            
-            # Check if all goals reached
-            if all(goals_reached):
-                break
         
         # Record episode statistics
-        success = all(goals_reached)
         stats.record_episode(
             total_reward=episode_reward,
-            goals_reached=episode_goals,
-            collisions=episode_collisions,
             steps=steps,
-            success=success,
         )
         
         if verbose and isinstance(pbar, tqdm):
+            # Calculate running stats
+            total_traj = len(stats.completed_trajectories)
+            success_traj = sum(1 for t in stats.completed_trajectories if t[1] == 'goal')
+            running_success_rate = success_traj / max(total_traj, 1) * 100
+            
             pbar.set_postfix({
                 "reward": f"{episode_reward:.1f}",
-                "goals": episode_goals,
-                "collisions": episode_collisions,
-                "success": success,
+                "traj": total_traj,
+                "success%": f"{running_success_rate:.1f}",
             })
     
     return stats
@@ -796,14 +925,16 @@ def main():
         save_directory=Path(config["decentralized_model_directory"]),
     )
     
-    # Generate candidate groups (size 2 and 3 only)
+    # Generate candidate groups (size 1, 2, and 3)
     groups = generate_candidate_groups(
         num_robots=config["num_robots"],
+        include_size_1=True,
         include_size_2=True,
         include_size_3=True,
     )
     
     logger.info(f"Candidate groups: {len(groups)} total")
+    logger.info(f"  Size-1: {sum(1 for g in groups if len(g) == 1)}")
     logger.info(f"  Size-2: {sum(1 for g in groups if len(g) == 2)}")
     logger.info(f"  Size-3: {sum(1 for g in groups if len(g) == 3)}")
     
@@ -887,11 +1018,26 @@ def main():
     logger.info("\n--- Episode Statistics ---")
     logger.info(f"Episodes: {summary['num_episodes']}")
     logger.info(f"Average episode reward: {summary['avg_episode_reward']:.2f}")
-    logger.info(f"Average goals reached: {summary['avg_goals']:.2f}")
-    logger.info(f"Average collisions: {summary['avg_collisions']:.2f}")
-    logger.info(f"Average steps: {summary['avg_steps']:.1f}")
-    logger.info(f"Success rate: {summary['success_rate']:.2%}")
-    logger.info(f"Collision rate: {summary['collision_rate']:.2%}")
+    logger.info(f"Average steps per episode: {summary['avg_steps']:.1f}")
+    
+    logger.info("\n--- Per-Robot Trajectory Statistics ---")
+    logger.info(f"Total completed trajectories: {summary['total_trajectories']}")
+    logger.info(f"  - Successful (goal reached): {summary['success_count']}")
+    logger.info(f"  - Failed (collision/out-of-bounds): {summary['collision_count']}")
+    logger.info(f"\nSUCCESS RATE: {summary['success_rate']:.2%}")
+    logger.info(f"COLLISION RATE: {summary['collision_rate']:.2%}")
+    logger.info(f"(Note: Success rate + Collision rate = 100%)")
+    logger.info(f"\nAverage trajectory reward (successful): {summary['avg_success_reward']:.2f}")
+    logger.info(f"Average trajectory reward (failed): {summary['avg_collision_reward']:.2f}")
+    
+    # Per-robot statistics
+    logger.info("\n--- Per-Robot Statistics ---")
+    for robot_idx in range(sim.num_robots):
+        robot_trajectories = [t for t in stats.completed_trajectories if t[0] == robot_idx]
+        robot_success = sum(1 for t in robot_trajectories if t[1] == 'goal')
+        robot_total = len(robot_trajectories)
+        robot_rate = (robot_success / robot_total * 100) if robot_total > 0 else 0
+        logger.info(f"  Robot {robot_idx}: {robot_success}/{robot_total} successful ({robot_rate:.1f}%)")
     
     logger.info("\n--- Group Execution Statistics ---")
     logger.info(f"Total group executions: {summary['total_executions']}")
@@ -933,10 +1079,19 @@ def main():
         logger.info(f"    Extra-robot:  {breakdown['extra_robot']:4d} ({breakdown['extra_rate']:.2%})")
         logger.info(f"    Obstacle:     {breakdown['obstacle']:4d} ({breakdown['obstacle_rate']:.2%})")
     
-    # Detailed breakdown for size-2 groups
+    # Detailed breakdown for size-1, size-2, size-3 groups
     detailed = summary["detailed_collision_by_group"]
+    size_1_groups = {g: d for g, d in detailed.items() if len(g) == 1}
     size_2_groups = {g: d for g, d in detailed.items() if len(g) == 2}
     size_3_groups = {g: d for g, d in detailed.items() if len(g) == 3}
+    
+    if size_1_groups:
+        logger.info("\n--- Detailed Collision Breakdown for Size-1 Groups ---")
+        sorted_size_1 = sorted(size_1_groups.items(), key=lambda x: x[1]["total_collisions"], reverse=True)
+        for group, data in sorted_size_1[:10]:
+            if data["total_collisions"] > 0:
+                logger.info(f"  {list(group)}: {data['total_collisions']} collisions "
+                           f"(extra:{data['extra_robot']}, obs:{data['obstacle']})")
     
     if size_2_groups:
         logger.info("\n--- Detailed Collision Breakdown for Size-2 Groups ---")
