@@ -2,15 +2,15 @@
 Graph Attention Network with Obstacle Nodes (IGA-Obstacle) - OPTIMIZED VERSION.
 
 This is an optimized version of iga_obstacle.py that uses:
-1. Fully vectorized operations (no Python loops over batch dimension)
-2. PyTorch Geometric batching for efficient graph processing
-3. GPU-accelerated edge construction
+1. Vectorized edge construction via torch.where() (no nested Python loops)
+2. GPU-accelerated hard attention masking
+3. All feature computations are fully batched/vectorized
 
-Key optimizations:
-- Replaces triple-nested loops with vectorized torch.where()
-- Uses PyG Batch to process all samples in one forward pass
+Key optimization:
+- Replaces triple-nested loops in edge building with vectorized torch.where()
 - Eliminates element-wise tensor access that triggers CPU synchronization
-- Expected speedup: 5-10x over original implementation
+- Per-graph message passing is kept for simplicity (bipartite graph layout
+  makes PyG Batch remapping fragile and not worth the added complexity)
 """
 
 import numpy as np
@@ -19,7 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import softmax
-from torch_geometric.data import Data, Batch
 
 
 def entropy_from_attention(attn_weights, target_nodes, num_nodes, eps=1e-10):
@@ -80,7 +79,7 @@ class GoalAttentionLayerObstacle(MessagePassing):
         )
         self._last_attn_weights = None
 
-    def forward(self, x, edge_index, edge_attr, n_robots_per_batch):
+    def forward(self, x, edge_index, edge_attr, n_robots):
         """
         Run attention-based message passing.
 
@@ -88,23 +87,15 @@ class GoalAttentionLayerObstacle(MessagePassing):
             x (Tensor): Node features of shape (num_nodes, node_dim).
                         First n_robots nodes are robots, rest are obstacles.
             edge_index (LongTensor): Edge indices of shape (2, num_edges)
-                with format [source, target]. Targets are only robot indices.
+                with format [source, target]. Targets are only robot indices (0..n_robots-1).
             edge_attr (Tensor): Edge attributes of shape (num_edges, edge_dim).
-            n_robots_per_batch (int or Tensor): Number of robot nodes per batch sample.
-                If batched, this should be the total number of robot nodes across all batches.
+            n_robots (int): Number of robot nodes. Only these are message targets.
 
         Returns:
             tuple:
-                out (Tensor): Updated robot node features.
+                out (Tensor): Updated robot node features of shape (n_robots, out_dim).
                 attn_weights (Tensor or None): Last per-edge softmax weights.
         """
-        # Compute queries for all robot nodes
-        # Assuming robot nodes come first in the batched graph
-        if isinstance(n_robots_per_batch, int):
-            n_robots = n_robots_per_batch
-        else:
-            n_robots = n_robots_per_batch
-            
         q_robots = self.q(x[:n_robots])  # (n_robots, out_dim)
 
         # Propagate with size hint: (num_all_nodes, n_robots)
@@ -226,30 +217,37 @@ class AttentionObstacleOptimized(nn.Module):
             tuple: (edge_index, edge_attr)
         """
         # Robot-robot edges (vectorized)
+        # hard_mask_rr[i, j] > 0.5 means edge j -> i (source j, target i)
+        # torch.where returns (i_indices, j_indices)
         mask_rr_binary = (hard_mask_rr > 0.5).float()
         # Remove self-loops
         eye = torch.eye(n_robots, device=device)
         mask_rr_binary = mask_rr_binary * (1 - eye)
         
         # Get all valid edges at once using torch.where
-        src_rr, dst_rr = torch.where(mask_rr_binary)
+        # i_rr = target robot index, j_rr = source robot index
+        i_rr, j_rr = torch.where(mask_rr_binary)
         
-        if src_rr.numel() > 0:
-            edge_index_rr = torch.stack([src_rr, dst_rr], dim=0)  # [2, num_edges_rr]
-            # Fancy indexing to gather edge attributes (GPU-optimized)
-            edge_attr_rr = soft_feats_rr[dst_rr, src_rr]  # [num_edges_rr, 10]
+        if i_rr.numel() > 0:
+            edge_index_rr = torch.stack([j_rr, i_rr], dim=0)  # [2, num_edges_rr] source j -> target i
+            # Edge attr indexed as soft_feats_rr[i, j] (target, source)
+            edge_attr_rr = soft_feats_rr[i_rr, j_rr]  # [num_edges_rr, 10]
         else:
             edge_index_rr = torch.zeros((2, 0), dtype=torch.long, device=device)
             edge_attr_rr = torch.zeros((0, 10), device=device)
 
         # Robot-obstacle edges (vectorized)
+        # hard_mask_ro[i, j] > 0.5 means edge (obs j + n_robots) -> robot i
+        # torch.where returns (i_indices, j_indices)
         mask_ro_binary = (hard_mask_ro > 0.5).float()
-        src_ro, dst_ro = torch.where(mask_ro_binary)
+        # i_ro = target robot index, j_ro = source obstacle index
+        i_ro, j_ro = torch.where(mask_ro_binary)
         
-        if src_ro.numel() > 0:
-            # Obstacle nodes are offset by n_robots
-            edge_index_ro = torch.stack([src_ro + n_robots, dst_ro], dim=0)  # [2, num_edges_ro]
-            edge_attr_ro = soft_feats_ro[dst_ro, src_ro]  # [num_edges_ro, 10]
+        if i_ro.numel() > 0:
+            # Obstacle nodes are offset by n_robots in the node list
+            edge_index_ro = torch.stack([j_ro + n_robots, i_ro], dim=0)  # [2, num_edges_ro] obs_j -> robot_i
+            # Edge attr indexed as soft_feats_ro[i, j] (target robot, source obs)
+            edge_attr_ro = soft_feats_ro[i_ro, j_ro]  # [num_edges_ro, 10]
         else:
             edge_index_ro = torch.zeros((2, 0), dtype=torch.long, device=device)
             edge_attr_ro = torch.zeros((0, 10), device=device)
@@ -402,8 +400,14 @@ class AttentionObstacleOptimized(nn.Module):
         obs_action_zeros = torch.zeros(batch_size, n_robots, n_obs, 2, device=device)
         soft_edge_ro = torch.cat([edge_features_ro, obs_action_zeros, goal_polar_ro], dim=-1)
 
-        # === OPTIMIZED: Build PyG batch with vectorized edge construction ===
-        data_list = []
+        # === OPTIMIZED: Vectorized edge construction + per-graph message passing ===
+        # The main speedup comes from build_edges_vectorized replacing nested Python loops.
+        # We keep per-graph message passing to avoid the complexity of remapping
+        # node indices in a PyG Batch (which also struggles with bipartite graphs).
+        attn_outputs = []
+        entropy_list = []
+        combined_w = []
+
         for b in range(batch_size):
             # Vectorized edge construction (no nested loops!)
             edge_index, edge_attr = self.build_edges_vectorized(
@@ -415,61 +419,40 @@ class AttentionObstacleOptimized(nn.Module):
             # Node features for this batch sample
             node_feats = torch.cat([robot_embed[b], obs_embed[b]], dim=0)
 
-            # Create PyG Data object
-            data = Data(x=node_feats, edge_index=edge_index, edge_attr=edge_attr)
-            data_list.append(data)
+            # Message passing (only robot nodes 0..n_robots-1 are targets)
+            attn_out, attn_weights = self.message_graph(
+                node_feats, edge_index, edge_attr, n_robots
+            )
+            attn_outputs.append(attn_out)
 
-        # === Batch all graphs into one big graph ===
-        batch_data = Batch.from_data_list(data_list)
+            # Compute entropy (only over robot nodes)
+            if attn_weights is not None and edge_index.shape[1] > 0:
+                batch_entropy = entropy_from_attention(
+                    attn_weights, edge_index[1], num_nodes=n_robots
+                )
+            else:
+                batch_entropy = torch.tensor(0.0, device=device)
+            entropy_list.append(batch_entropy)
 
-        # === Single forward pass for ALL batches ===
-        total_robot_nodes = batch_size * n_robots
-        attn_out, attn_weights = self.message_graph(
-            batch_data.x,
-            batch_data.edge_index,
-            batch_data.edge_attr,
-            total_robot_nodes
-        )
+            # Combined weights for visualization
+            combined_weights = torch.zeros((n_robots, n_total), device=device)
+            if attn_weights is not None:
+                for idx in range(edge_index.shape[1]):
+                    j = edge_index[0, idx].item()
+                    i = edge_index[1, idx].item()
+                    combined_weights[i, j] = attn_weights[idx]
+            combined_w.append(combined_weights)
 
-        # === Reshape output back to (B, N_robots, emb_dim) ===
-        attn_out = attn_out.view(batch_size, n_robots, -1)
-
-        # === Compute entropy (vectorized across all batches) ===
-        if attn_weights is not None and batch_data.edge_index.shape[1] > 0:
-            # Map global edge indices back to robot indices within each batch
-            target_nodes = batch_data.edge_index[1]
-            mean_entropy = entropy_from_attention(attn_weights, target_nodes, total_robot_nodes)
-        else:
-            mean_entropy = torch.tensor(0.0, device=device)
-
-        # === Combined weights for visualization ===
-        combined_w = torch.zeros((batch_size, n_robots, n_total), device=device)
-        if attn_weights is not None and batch_data.edge_index.shape[1] > 0:
-            # Reconstruct per-batch attention weights from batched graph
-            edge_src = batch_data.edge_index[0]
-            edge_dst = batch_data.edge_index[1]
-            batch_idx = batch_data.batch
-            
-            for idx in range(batch_data.edge_index.shape[1]):
-                # Determine which batch this edge belongs to
-                # PyG batch attribute assigns batch index to each node
-                dst_node = edge_dst[idx].item()
-                batch_id = dst_node // n_robots  # Which batch sample
-                local_dst = dst_node % n_robots  # Local robot index within batch
-                
-                src_node = edge_src[idx].item()
-                local_src = src_node - (batch_id * n_total)  # Local source index
-                
-                if 0 <= batch_id < batch_size and 0 <= local_src < n_total:
-                    combined_w[batch_id, local_dst, local_src] = attn_weights[idx]
-
-        # === Flatten and decode ===
-        attn_stack = attn_out.reshape(batch_size * n_robots, -1)
+        # Stack outputs
+        attn_stack = torch.stack(attn_outputs, dim=0).reshape(batch_size * n_robots, -1)
         self_embed = robot_embed.reshape(batch_size * n_robots, -1)
         concat_embed = torch.cat([self_embed, attn_stack], dim=-1)
 
         x = F.leaky_relu(self.decode_1(concat_embed))
         att_embedding = F.leaky_relu(self.decode_2(x))
+
+        mean_entropy = torch.stack(entropy_list).mean()
+        combined_w = torch.stack(combined_w, dim=0)  # (B, N_r, N_total)
 
         return (
             att_embedding,
