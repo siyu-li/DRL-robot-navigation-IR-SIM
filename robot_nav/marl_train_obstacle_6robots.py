@@ -75,14 +75,16 @@ def main(args=None):
     # Environment hyperparameters
     per_robot_goal_reset = True
     obstacle_proximity_threshold = 1.5  # For reward penalty
+    num_inactive_robots = 2  # Number of robots to be inactive each episode (0 = all active)
 
     # ---- Instantiate environment ----
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle.yaml",
         disable_plotting=True,
-        reward_phase=5,
+        reward_phase=6,
         per_robot_goal_reset=per_robot_goal_reset,
         obstacle_proximity_threshold=obstacle_proximity_threshold,
+        num_inactive_robots=num_inactive_robots,
     )
 
     print(f"Environment initialized:")
@@ -104,7 +106,7 @@ def main(args=None):
         load_model_name="TD3-MARL-obstacle-6robots",
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots"),
         model_name="TD3-MARL-obstacle-6robots",
-        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2"),
+        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v4"),
     )
 
     # ---- Setup replay buffer ----
@@ -165,6 +167,7 @@ def main(args=None):
             terminal,
             next_robot_state,
             next_obstacle_states,
+            active_mask=sim.active_mask,
         )
 
         # Update obstacle states for next iteration

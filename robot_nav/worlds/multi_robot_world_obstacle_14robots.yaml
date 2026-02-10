@@ -1,6 +1,6 @@
 world:
-  height: 25  # Larger world for 14 robots
-  width: 25  # Larger world for 14 robots
+  height: 15  # Larger world for 14 robots
+  width: 15  # Larger world for 14 robots
   step_time: 0.3
   sample_time: 0.3
   collision_mode: 'reactive'

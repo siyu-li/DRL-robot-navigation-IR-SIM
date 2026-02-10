@@ -49,6 +49,7 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         reward_phase: int = 1,
         per_robot_goal_reset: bool = True,
         obstacle_proximity_threshold: float = 1.5,
+        num_inactive_robots: int = 0,
     ):
         """
         Initialize the MARL_SIM_OBSTACLE environment.
@@ -59,6 +60,8 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
             reward_phase (int): Selects the reward function variant (1, 2, or 3).
             per_robot_goal_reset (bool): If True, reset individual robot goals when reached.
             obstacle_proximity_threshold (float): Distance threshold for obstacle penalty in reward.
+            num_inactive_robots (int): Number of robots to randomly select as inactive each episode.
+                If 0 (default), all robots are active (original behavior).
         """
         display = False if disable_plotting else True
         self.env = irsim.make(
@@ -76,6 +79,11 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         
         # Track previous distances for progress-based reward
         self.prev_distances = [None] * self.num_robots
+        
+        # Inactive robots support
+        self.num_inactive_robots = num_inactive_robots
+        self.inactive_ids = []  # List of inactive robot indices
+        self.active_mask = np.ones(self.num_robots, dtype=bool)  # True for active robots
 
     def get_obstacle_states(self) -> np.ndarray:
         """
@@ -171,8 +179,14 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
             )
             obstacle_states (np.ndarray): Shape (num_obstacles, 4).
         """
-        self.env.step(action_id=[i for i in range(self.num_robots)], action=action)
+        # Force inactive robots to have zero action
+        action_copy = [list(act) for act in action]  # Deep copy
+        for i in self.inactive_ids:
+            action_copy[i] = [0.0, 0.0]
+        
+        self.env.step(action_id=[i for i in range(self.num_robots)], action=action_copy)
         self.env.render()
+        
 
         poses = []
         distances = []
@@ -425,7 +439,18 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         
         # Reset previous distances for progress-based reward
         self.prev_distances = [None] * self.num_robots
-
+        
+        # Randomly select inactive robots based on configured num_inactive_robots
+        if self.num_inactive_robots > 0:
+            self.inactive_ids = random.sample(range(self.num_robots), self.num_inactive_robots)
+        else:
+            self.inactive_ids = []
+        
+        # Update active mask
+        self.active_mask = np.ones(self.num_robots, dtype=bool)
+        for i in self.inactive_ids:
+            self.active_mask[i] = False
+        
         action = [[0.0, 0.0] for _ in range(self.num_robots)]
         (
             poses, distances, coss, sins, _, _, action, rewards,
@@ -549,6 +574,35 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                         obs_pen = 2.0 * (obstacle_threshold - min_obstacle_clearance) ** 2
 
                     return action[0] - 0.5 * abs(action[1]) - cl_pen - obs_pen + r_progress
+                
+            case 6:
+                # Phase 6: No restriction on robot rotation
+                if goal:
+                    return 100.0
+                elif collision:
+                    return -100.0 * 3 * action[0]
+                else:
+                    # Progress reward: positive if moving closer, negative if moving away
+                    k_p = 5.0  # Progress reward scaling factor
+                    if prev_distance is not None:
+                        progress = prev_distance - distance
+                        r_progress = k_p * progress
+                    else:
+                        # First step: no previous distance, use small baseline
+                        r_progress = 0.0
+
+                    # Robot proximity penalty
+                    cl_pen = 0
+                    for rob in closest_robots:
+                        add = (1.25 - rob) ** 2 if rob < 1.25 else 0
+                        cl_pen += add
+
+                    # Obstacle proximity penalty
+                    obs_pen = 0
+                    if min_obstacle_clearance < obstacle_threshold:
+                        obs_pen = 2.0 * (obstacle_threshold - min_obstacle_clearance) ** 2
+
+                    return action[0] - cl_pen - obs_pen + r_progress
                 
             case _:
                 raise ValueError(f"Unknown reward phase: {phase}")

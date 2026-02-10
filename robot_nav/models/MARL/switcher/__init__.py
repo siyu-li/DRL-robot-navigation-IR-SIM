@@ -38,6 +38,13 @@ from robot_nav.models.MARL.switcher.rank_losses import (
     compute_top1_accuracy,
     RankingLossWithScheduledMargin,
 )
+from robot_nav.models.MARL.switcher.group_generator import (
+    generate_all_groups,
+    generate_original_groups,
+    generate_subgroups_recursive,
+    filter_groups_by_size,
+    print_group_statistics,
+)
 
 __all__ = [
     # Feature builder
@@ -55,4 +62,10 @@ __all__ = [
     "compute_ranking_accuracy",
     "compute_top1_accuracy",
     "RankingLossWithScheduledMargin",
+    # Group generator
+    "generate_all_groups",
+    "generate_original_groups",
+    "generate_subgroups_recursive",
+    "filter_groups_by_size",
+    "print_group_statistics",
 ]

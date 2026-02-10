@@ -38,7 +38,7 @@ class ReplayBufferObstacle:
         random.seed(random_seed)
 
     def add(self, robot_state, obstacle_state, action, reward, done, 
-            next_robot_state, next_obstacle_state):
+            next_robot_state, next_obstacle_state, active_mask=None):
         """
         Add a transition to the buffer.
 
@@ -50,7 +50,12 @@ class ReplayBufferObstacle:
             done (list or np.ndarray): Per-robot done flags.
             next_robot_state (np.ndarray): Next robot states.
             next_obstacle_state (np.ndarray): Next obstacle states.
+            active_mask (np.ndarray or None): Boolean mask for active robots (N_robots,).
+                If None, all robots are assumed active.
         """
+        if active_mask is None:
+            active_mask = np.ones(len(robot_state), dtype=bool)
+        
         experience = (
             robot_state,
             obstacle_state,
@@ -59,6 +64,7 @@ class ReplayBufferObstacle:
             done,
             next_robot_state,
             next_obstacle_state,
+            active_mask,
         )
         if self.count < self.buffer_size:
             self.buffer.append(experience)
@@ -92,6 +98,7 @@ class ReplayBufferObstacle:
                 dones (np.ndarray): Shape (batch_size, N_robots).
                 next_robot_states (np.ndarray): Shape (batch_size, N_robots, robot_state_dim).
                 next_obstacle_states (np.ndarray): Shape (batch_size, N_obs, obstacle_state_dim).
+                active_masks (np.ndarray): Shape (batch_size, N_robots), dtype bool or float.
             )
         """
         if self.count < batch_size:
@@ -106,6 +113,7 @@ class ReplayBufferObstacle:
         dones = np.array([exp[4] for exp in batch])
         next_robot_states = np.array([exp[5] for exp in batch])
         next_obstacle_states = np.array([exp[6] for exp in batch])
+        active_masks = np.array([exp[7] if len(exp) > 7 else np.ones(len(exp[0]), dtype=bool) for exp in batch])
 
         return (
             robot_states,
@@ -115,6 +123,7 @@ class ReplayBufferObstacle:
             dones,
             next_robot_states,
             next_obstacle_states,
+            active_masks,
         )
 
     def return_buffer(self):
@@ -131,6 +140,7 @@ class ReplayBufferObstacle:
         dones = np.array([exp[4] for exp in self.buffer])    # Shape: (N, N_robots)
         next_robot_states = np.array([exp[5] for exp in self.buffer])
         next_obstacle_states = np.array([exp[6] for exp in self.buffer])
+        active_masks = np.array([exp[7] if len(exp) > 7 else np.ones(len(exp[0]), dtype=bool) for exp in self.buffer])
 
         return (
             robot_states,
@@ -140,6 +150,7 @@ class ReplayBufferObstacle:
             dones,
             next_robot_states,
             next_obstacle_states,
+            active_masks,
         )
 
     def clear(self):

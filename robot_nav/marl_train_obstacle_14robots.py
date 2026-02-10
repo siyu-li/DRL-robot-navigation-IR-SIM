@@ -62,13 +62,13 @@ def main(args=None):
     max_epochs = 5000  # More epochs needed for 14 robots
     epoch = 1
     episode = 0
-    train_every_n = 15  # Collect more experience before training
-    training_iterations = 100  # More iterations per training session
-    batch_size = 24  # Larger batch size for better gradient estimates
-    max_steps = 400  # Longer episodes for more complex scenarios
+    train_every_n = 10  # 15
+    training_iterations = 80  # 100
+    batch_size = 16  # 24
+    max_steps = 300  # 400
     steps = 0
     save_every = 5
-    buffer_size = 100000  # Larger buffer for diverse experiences
+    buffer_size = 50000  # 100000
 
     # Environment hyperparameters
     per_robot_goal_reset = True
@@ -78,7 +78,7 @@ def main(args=None):
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
         disable_plotting=True,
-        reward_phase=5,
+        reward_phase=6,
         per_robot_goal_reset=per_robot_goal_reset,
         obstacle_proximity_threshold=obstacle_proximity_threshold,
     )
@@ -95,7 +95,7 @@ def main(args=None):
     print(f"  - Buffer size: {buffer_size}")
     print(f"{'='*60}\n")
 
-    # ---- Instantiate model (NO LOADING) ----
+    # ---- Instantiate model----
     model = TD3Obstacle(
         state_dim=state_dim,
         action_dim=action_dim,
@@ -105,11 +105,11 @@ def main(args=None):
         obstacle_state_dim=obstacle_state_dim,
         device=device,
         save_every=save_every,
-        load_model=False,  
+        load_model=True,  
         load_model_name="TD3-MARL-obstacle-6robots_epoch2400",
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2"),
         model_name="TD3-MARL-obstacle-14robots",
-        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_14robots"),
+        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.9_obstacle_14robot_transfer"),
     )
 
 

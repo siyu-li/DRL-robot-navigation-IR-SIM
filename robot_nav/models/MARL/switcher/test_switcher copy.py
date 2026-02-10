@@ -24,6 +24,7 @@ import logging
 import random
 from collections import defaultdict
 from dataclasses import dataclass, field
+from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -33,12 +34,7 @@ from shapely.geometry import Point
 from tqdm import tqdm
 
 from robot_nav.models.MARL.marlTD3.marlTD3_obstacle import TD3Obstacle
-from robot_nav.models.MARL.switcher import (
-    GroupFeatureBuilder,
-    GroupSwitcher,
-    generate_all_groups,
-    filter_groups_by_size,
-)
+from robot_nav.models.MARL.switcher import GroupFeatureBuilder, GroupSwitcher
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 
 
@@ -57,22 +53,20 @@ CONFIG = {
     "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/best.pt",
     
     # Decentralized model configuration (used for all action generation)
-    # "decentralized_model_name": "TD3-MARL-obstacle-6robots_epoch2400",
-    # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2",
-    "decentralized_model_name": "TD3-MARL-obstacle-14robots",
-    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.8_obstacle_14robot_transfer",
+    "decentralized_model_name": "TD3-MARL-obstacle-6robots_epoch2400",
+    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2",
     
     # Test configuration
     "test_episodes": 100,
     "max_steps_per_episode": 500,
-    "disable_plotting": True,
+    "disable_plotting": False,
 
     # Group selection interval (re-select group every N steps)
     "selection_interval": 10,
     
     # Policy configuration
-    "num_robots": 14,
-    "num_obstacles": 7,
+    "num_robots": 6,
+    "num_obstacles": 4,
     "state_dim": 11,
     "obstacle_state_dim": 4,
     "embedding_dim": 256,
@@ -85,7 +79,7 @@ CONFIG = {
     "extra_aggregations": ["mean", "min"],
     
     # World configuration
-    "world_file": "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
+    "world_file": "robot_nav/worlds/multi_robot_world_obstacle.yaml",
     "obstacle_proximity_threshold": 1.5,
     
     # Device configuration
@@ -103,10 +97,7 @@ def generate_candidate_groups(
     include_size_3: bool = True,
 ) -> List[List[int]]:
     """
-    Generate all candidate groups using binary allocation method.
-    
-    This function uses the sophisticated binary allocation approach that ensures
-    balanced group coverage based on the number of robots.
+    Generate all candidate groups of size 1, 2, and 3.
     
     Args:
         num_robots: Total number of robots.
@@ -115,38 +106,24 @@ def generate_candidate_groups(
         include_size_3: Include triplets.
         
     Returns:
-        List of robot index groups with size <= 3.
+        List of robot index groups.
     """
-    # Determine m (number of original groups) based on num_robots
-    if num_robots <= 6:
-        m = 3
-    elif num_robots <= 14:
-        m = 4
-    else:
-        raise ValueError(
-            f"Unsupported number of robots: {num_robots}. "
-            f"Binary allocation supports up to 14 robots (m=4)."
-        )
+    all_groups = []
+    robot_indices = list(range(num_robots))
     
-    # Generate all groups using binary allocation
-    all_groups = generate_all_groups(m=m, n=num_robots, use_complement=True)
+    if include_size_1:
+        for i in robot_indices:
+            all_groups.append([i])
     
-    # Determine size range based on flags
-    min_size = 1 if include_size_1 else 2
-    max_size = 3 if include_size_3 else (2 if include_size_2 else 1)
+    if include_size_2:
+        for combo in combinations(robot_indices, 2):
+            all_groups.append(list(combo))
     
-    # Filter groups by size
-    filtered_groups = filter_groups_by_size(all_groups, min_size=min_size, max_size=max_size)
+    if include_size_3:
+        for combo in combinations(robot_indices, 3):
+            all_groups.append(list(combo))
     
-    # Additional filtering based on include flags
-    if not include_size_1:
-        filtered_groups = [g for g in filtered_groups if len(g) > 1]
-    if not include_size_2:
-        filtered_groups = [g for g in filtered_groups if len(g) != 2]
-    if not include_size_3:
-        filtered_groups = [g for g in filtered_groups if len(g) < 3]
-    
-    return filtered_groups
+    return all_groups
 
 
 def outside_of_bounds(poses: List[List[float]], sim: MARL_SIM_OBSTACLE) -> bool:

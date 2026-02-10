@@ -21,8 +21,8 @@ import torch.nn.functional as F
 from numpy import inf
 from torch.utils.tensorboard import SummaryWriter
 
-from robot_nav.models.MARL.Attention.iga_obstacle import AttentionObstacle
-
+# from robot_nav.models.MARL.Attention.iga_obstacle import AttentionObstacle
+from robot_nav.models.MARL.Attention.iga_obstacle_optimized import AttentionObstacleOptimized as AttentionObstacle
 
 class ActorObstacle(nn.Module):
     """
@@ -378,6 +378,7 @@ class TD3Obstacle:
                 batch_dones,
                 batch_next_robot_states,
                 batch_next_obstacle_states,
+                batch_active_masks,
             ) = replay_buffer.sample_batch(batch_size)
 
             robot_state = (
@@ -412,6 +413,11 @@ class TD3Obstacle:
             )
             done = (
                 torch.Tensor(batch_dones)
+                .to(self.device)
+                .view(batch_size * self.num_robots, 1)
+            )
+            active_mask = (
+                torch.Tensor(batch_active_masks.astype(float))
                 .to(self.device)
                 .view(batch_size * self.num_robots, 1)
             )
@@ -453,8 +459,12 @@ class TD3Obstacle:
                 _,
             ) = self.critic(robot_state, obstacle_state, action)
 
-            critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(
-                current_Q2, target_Q
+            # Apply active_mask to critic loss (only train on active robots)
+            critic_loss_per_robot_1 = F.mse_loss(current_Q1, target_Q, reduction='none')
+            critic_loss_per_robot_2 = F.mse_loss(current_Q2, target_Q, reduction='none')
+            critic_loss = (
+                (critic_loss_per_robot_1 * active_mask).sum() / active_mask.sum() +
+                (critic_loss_per_robot_2 * active_mask).sum() / active_mask.sum()
             )
 
             # BCE losses for hard attention
@@ -524,7 +534,9 @@ class TD3Obstacle:
                 actor_Q, _, _, _, _, _, _, _, _ = self.critic(
                     robot_state, obstacle_state, action_pred
                 )
-                actor_loss = -actor_Q.mean()
+                # Apply active_mask to actor loss (only train on active robots)
+                actor_loss_per_robot = -actor_Q
+                actor_loss = (actor_loss_per_robot * active_mask).sum() / active_mask.sum()
                 total_loss = (
                     actor_loss
                     - entropy_weight * mean_entropy
