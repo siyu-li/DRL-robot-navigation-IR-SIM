@@ -59,7 +59,7 @@ def main(args=None):
     print(f"Using device: {device}")
 
     # Training hyperparameters (adjusted for 14 robots)
-    max_epochs = 2000  # More epochs needed for 14 robots
+    max_epochs = 600  # More epochs needed for 14 robots
     epoch = 1
     episode = 0
     train_every_n = 10  # 15
@@ -108,8 +108,8 @@ def main(args=None):
         load_model=True,  
         load_model_name="TD3-MARL-obstacle-6robots_epoch2400",
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2"),
-        model_name="TD3-MARL-obstacle-14robots-ori",
-        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_ori"),
+        model_name="TD3-MARL-obstacle-14robots-vectorenv",
+        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.11_obstacle_14robot_transfer_vectorenv"),
     )
 
 
@@ -127,7 +127,7 @@ def main(args=None):
     running_timesteps = 0
     
     # Checkpoint saving parameters
-    checkpoint_every = 200  # Save checkpoint every N epochs
+    checkpoint_every = 100  # Save checkpoint every N epochs
 
     print(f"Starting training...")
     print(f"Initial obstacle states shape: {obstacle_states.shape}\n")

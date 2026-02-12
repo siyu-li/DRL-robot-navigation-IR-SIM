@@ -21,8 +21,8 @@ import torch.nn.functional as F
 from numpy import inf
 from torch.utils.tensorboard import SummaryWriter
 
-from robot_nav.models.MARL.Attention.iga_obstacle import AttentionObstacle
-# from robot_nav.models.MARL.Attention.iga_obstacle_optimized import AttentionObstacleOptimized as AttentionObstacle
+# from robot_nav.models.MARL.Attention.iga_obstacle import AttentionObstacle
+from robot_nav.models.MARL.Attention.iga_obstacle_optimized import AttentionObstacleOptimized as AttentionObstacle
 
 class ActorObstacle(nn.Module):
     """

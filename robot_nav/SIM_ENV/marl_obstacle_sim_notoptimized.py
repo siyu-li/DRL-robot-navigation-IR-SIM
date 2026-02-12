@@ -17,7 +17,6 @@ import numpy as np
 import random
 import torch
 import logging
-from scipy.spatial.distance import cdist
 from shapely.geometry import Point
 from typing import List, Tuple, Optional
 
@@ -95,40 +94,48 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                 Each row: [x, y, cos(heading), sin(heading)]
                 For static obstacles, heading is derived from their orientation.
         """
-        if self.num_obstacles == 0:
-            return np.zeros((0, 4))
+        obstacle_states = []
+        for obs in self.env.obstacle_list:
+            # Position (centroid)
+            pos = obs.position.flatten()
+            ox, oy = pos[0], pos[1]
 
-        obs_states = np.array([obs.state.flatten() for obs in self.env.obstacle_list])
-        # obs_states shape: (num_obstacles, 3) -> [x, y, theta]
-        thetas = obs_states[:, 2] if obs_states.shape[1] > 2 else np.zeros(self.num_obstacles)
-        return np.column_stack([
-            obs_states[:, 0],       # x
-            obs_states[:, 1],       # y
-            np.cos(thetas),         # cos(heading)
-            np.sin(thetas),         # sin(heading)
-        ])
+            # Heading (from state if available, else default to 0)
+            if hasattr(obs, 'state') and len(obs.state) > 2:
+                theta = obs.state[2, 0]
+            else:
+                theta = 0.0
 
-    def get_robot_obstacle_clearances(self) -> np.ndarray:
+            cos_h = np.cos(theta)
+            sin_h = np.sin(theta)
+
+            obstacle_states.append([ox, oy, cos_h, sin_h])
+
+        return np.array(obstacle_states) if obstacle_states else np.zeros((0, 4))
+
+    def get_robot_obstacle_clearances(self) -> List[List[float]]:
         """
         Compute clearance (distance to boundary) from each robot to each obstacle.
 
-        Uses vectorized cdist for circle obstacles (center-to-center minus radius).
-        Falls back to Shapely for non-circle obstacles.
+        Uses Shapely's geometry.distance() for efficient computation.
+        This gives the distance from robot center to the obstacle boundary.
 
         Returns:
-            np.ndarray: Clearances of shape (num_robots, num_obstacles).
+            List[List[float]]: Clearances of shape (num_robots, num_obstacles).
                 clearances[i][j] = distance from robot i center to obstacle j boundary.
         """
-        if self.num_obstacles == 0:
-            return np.empty((self.num_robots, 0))
+        clearances = []
+        for robot in self.env.robot_list:
+            robot_pos = robot.position.flatten()
+            robot_point = Point(robot_pos[0], robot_pos[1])
 
-        robot_positions = np.array([r.position.flatten() for r in self.env.robot_list])
-        obs_positions = np.array([o.position.flatten() for o in self.env.obstacle_list])
-        obs_radii = np.array([o.radius for o in self.env.obstacle_list])
+            robot_clearances = []
+            for obs in self.env.obstacle_list:
+                # Shapely distance() returns distance from point to polygon boundary
+                clearance = obs.geometry.distance(robot_point)
+                robot_clearances.append(clearance)
 
-        # Vectorized: center-to-center distance minus radius, clamped to 0
-        center_dists = cdist(robot_positions, obs_positions)  # (N_robots, N_obs)
-        clearances = np.maximum(center_dists - obs_radii[np.newaxis, :], 0.0)
+            clearances.append(robot_clearances)
 
         return clearances
 
@@ -145,12 +152,16 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         if self.num_obstacles == 0:
             return float('inf')
 
-        robot_pos = self.env.robot_list[robot_idx].position.flatten()
-        obs_positions = np.array([o.position.flatten() for o in self.env.obstacle_list])
-        obs_radii = np.array([o.radius for o in self.env.obstacle_list])
-        center_dists = np.linalg.norm(obs_positions - robot_pos[np.newaxis, :], axis=1)
-        clearances = np.maximum(center_dists - obs_radii, 0.0)
-        return float(clearances.min())
+        robot = self.env.robot_list[robot_idx]
+        robot_pos = robot.position.flatten()
+        robot_point = Point(robot_pos[0], robot_pos[1])
+
+        min_clearance = float('inf')
+        for obs in self.env.obstacle_list:
+            clearance = obs.geometry.distance(robot_point)
+            min_clearance = min(min_clearance, clearance)
+
+        return min_clearance
 
     def step(self, action, connection=None, combined_weights=None):
         """
@@ -175,123 +186,156 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         
         self.env.step(action_id=[i for i in range(self.num_robots)], action=action_copy)
         self.env.render()
+        
 
-        # === Vectorized state extraction ===
-        all_states = np.array([r.state.flatten() for r in self.env.robot_list])   # (N, 3)
-        all_goals = np.array([r.goal.flatten() for r in self.env.robot_list])     # (N, 3)
-        all_collisions = [r.collision for r in self.env.robot_list]               # list of bool
-        all_arrives = [r.arrive for r in self.env.robot_list]                     # list of bool
+        poses = []
+        distances = []
+        coss = []
+        sins = []
+        collisions = []
+        goals = []
+        rewards = []
+        positions = []
+        goal_positions = []
 
-        robot_positions = all_states[:, :2]                                       # (N, 2)
-        robot_thetas = all_states[:, 2]                                           # (N,)
+        robot_states = [
+            [self.env.robot_list[i].state[0], self.env.robot_list[i].state[1]]
+            for i in range(self.num_robots)
+        ]
 
-        # === Vectorized pairwise robot-robot distances (cdist) ===
-        pairwise_dists = cdist(robot_positions, robot_positions)                  # (N, N)
-        np.fill_diagonal(pairwise_dists, np.inf)  # exclude self
+        # Pre-compute clearances for reward computation
+        clearances = self.get_robot_obstacle_clearances()
 
-        # === Vectorized robot-obstacle clearances ===
-        clearances = self.get_robot_obstacle_clearances()                         # (N, M) ndarray
-        if clearances.size > 0:
-            min_clearances = clearances.min(axis=1)                               # (N,)
-        else:
-            min_clearances = np.full(self.num_robots, np.inf)
+        for i in range(self.num_robots):
+            robot_state = self.env.robot_list[i].state
+            robot_goal = self.env.robot_list[i].goal
 
-        # === Vectorized goal distances and cos/sin ===
-        goal_vecs = all_goals[:, :2] - robot_positions                            # (N, 2)
-        goal_dists = np.linalg.norm(goal_vecs, axis=1)                           # (N,)
-        goal_dists_safe = np.where(goal_dists > 1e-10, goal_dists, 1e-10)
+            # Distances to other robots
+            closest_robots = [
+                np.linalg.norm([
+                    robot_states[j][0] - robot_state[0],
+                    robot_states[j][1] - robot_state[1],
+                ])
+                for j in range(self.num_robots)
+                if j != i
+            ]
 
-        heading_vecs = np.column_stack([np.cos(robot_thetas),
-                                        np.sin(robot_thetas)])                    # (N, 2)
-        # heading_vecs are already unit vectors, but normalize for safety
-        h_norm = heading_vecs / np.linalg.norm(heading_vecs, axis=1, keepdims=True)
-        g_norm = goal_vecs / goal_dists_safe[:, np.newaxis]
+            # Distance to goal
+            goal_vector = [
+                robot_goal[0].item() - robot_state[0].item(),
+                robot_goal[1].item() - robot_state[1].item(),
+            ]
+            distance = np.linalg.norm(goal_vector)
 
-        all_coss = np.sum(h_norm * g_norm, axis=1)                               # (N,)
-        all_sins = h_norm[:, 0] * g_norm[:, 1] - h_norm[:, 1] * g_norm[:, 0]    # (N,)
+            goal = self.env.robot_list[i].arrive
+            pose_vector = [np.cos(robot_state[2]).item(), np.sin(robot_state[2]).item()]
+            cos, sin = self.cossin(pose_vector, goal_vector)
+            collision = self.env.robot_list[i].collision
+            action_i = action[i]
 
-        # === Vectorized proximity penalty (robot-robot) ===
-        close_mask = pairwise_dists < 1.25
-        cl_penalties = np.sum(np.where(close_mask, (1.25 - pairwise_dists) ** 2, 0.0), axis=1)  # (N,)
+            # Min clearance to obstacles
+            min_clearance = min(clearances[i]) if clearances[i] else float('inf')
 
-        # === Vectorized obstacle penalty ===
-        obs_threshold = self.obstacle_proximity_threshold
-        obs_close_mask = min_clearances < obs_threshold
-        obs_penalties = np.where(obs_close_mask,
-                                 2.0 * (obs_threshold - min_clearances) ** 2, 0.0)  # (N,)
+            # Get previous distance for progress-based reward
+            prev_distance = self.prev_distances[i]
 
-        # === Vectorized reward computation ===
-        actions_arr = np.array(action)  # (N, 2)
-        prev_dists_arr = np.array([d if d is not None else np.nan for d in self.prev_distances])
-
-        rewards = self._compute_rewards_vectorized(
-            all_arrives, all_collisions, actions_arr,
-            cl_penalties, goal_dists, min_clearances,
-            obs_threshold, self.reward_phase, prev_dists_arr,
-        )
-
-        # === Update prev_distances ===
-        self.prev_distances = goal_dists.tolist()
-
-        # === Build output lists (cheap, just slicing pre-computed arrays) ===
-        poses = all_states.tolist()                                               # [[x, y, theta], ...]
-        positions = robot_positions.tolist()                                       # [[x, y], ...]
-        goal_positions_out = all_goals[:, :2].tolist()                            # [[gx, gy], ...]
-        distances = goal_dists.tolist()
-        coss = all_coss.tolist()
-        sins = all_sins.tolist()
-        collisions = all_collisions
-        goals = all_arrives
-        rewards_list = rewards.tolist()
-
-        # === Visualization (only in eval mode when weights are provided) ===
-        if combined_weights is not None:
-            if combined_weights.dim() == 3:
-                weights = combined_weights[0]
-            else:
-                weights = combined_weights
+            # Compute reward with obstacle penalty
+            reward = self.get_reward(
+                goal, collision, action_i, closest_robots, distance,
+                min_clearance, self.obstacle_proximity_threshold, self.reward_phase,
+                prev_distance=prev_distance
+            )
             
-            weights_np = weights.cpu().numpy() if weights.is_cuda else weights.numpy()
-            
-            for i in range(self.num_robots):
-                pos_i = positions[i]
-                i_weights = weights_np[i]
+            # Update previous distance for next step
+            self.prev_distances[i] = distance
+
+            position = [robot_state[0].item(), robot_state[1].item()]
+            goal_position = [robot_goal[0].item(), robot_goal[1].item()]
+
+            distances.append(distance)
+            coss.append(cos)
+            sins.append(sin)
+            collisions.append(collision)
+            goals.append(goal)
+            rewards.append(reward)
+            positions.append(position)
+            poses.append([
+                robot_state[0].item(),
+                robot_state[1].item(),
+                robot_state[2].item()
+            ])
+            goal_positions.append(goal_position)
+
+            # Visualization (if weights provided)
+            if combined_weights is not None:
+                # combined_weights has shape (batch, n_robots, n_total) where n_total = n_robots + n_obstacles
+                # Squeeze batch dimension if present
+                if combined_weights.dim() == 3:
+                    weights = combined_weights[0]  # Remove batch dim -> (n_robots, n_total)
+                else:
+                    weights = combined_weights  # Already (n_robots, n_total)
                 
-                # Robot-robot attention lines
+                i_weights_all = weights[i].tolist()
+                n_weights = len(i_weights_all)
+                
+                # Visualize robot-robot attention weights (blue lines)
                 for j in range(self.num_robots):
                     if i == j:
                         continue
-                    w = float(i_weights[j])
-                    if w > 0.01:
-                        pos_j = positions[j]
+                    if j >= n_weights:
+                        break
+                    weight = i_weights_all[j]  # Direct indexing by j
+                    
+                    # Ensure weight is a scalar float
+                    if isinstance(weight, (list, np.ndarray)):
+                        weight = float(weight[0] if len(weight) > 0 else 0.0)
+                    else:
+                        weight = float(weight)
+                    
+                    if weight > 0.01:  # Only draw if weight is significant
+                        other_robot_state = self.env.robot_list[j].state
+                        other_pos = [other_robot_state[0].item(), other_robot_state[1].item()]
+                        rx = [position[0], other_pos[0]]
+                        ry = [position[1], other_pos[1]]
                         self.env.draw_trajectory(
-                            np.array([[pos_i[0], pos_j[0]], [pos_i[1], pos_j[1]]]),
-                            refresh=True, linewidth=w * 2, color='blue', alpha=0.6
+                            np.array([rx, ry]), refresh=True, linewidth=weight * 2, color='blue', alpha=0.6
                         )
                 
-                # Robot-obstacle attention lines
-                for k in range(min(self.num_obstacles, len(i_weights) - self.num_robots)):
-                    w = float(i_weights[self.num_robots + k])
-                    if w > 0.01:
+                # Visualize robot-obstacle attention weights (red lines)
+                # Number of obstacle weights available in combined_weights
+                n_obs_weights = n_weights - self.num_robots
+                for k in range(min(self.num_obstacles, n_obs_weights)):
+                    obs_idx = self.num_robots + k
+                    weight = i_weights_all[obs_idx]
+                    
+                    # Ensure weight is a scalar float
+                    if isinstance(weight, (list, np.ndarray)):
+                        weight = float(weight[0] if len(weight) > 0 else 0.0)
+                    else:
+                        weight = float(weight)
+                    
+                    if weight > 0.01:  # Only draw if weight is significant
                         obs_pos = self.env.obstacle_list[k].position.flatten()
+                        obs_x, obs_y = obs_pos[0], obs_pos[1]
+                        rx = [position[0], obs_x]
+                        ry = [position[1], obs_y]
                         self.env.draw_trajectory(
-                            np.array([[pos_i[0], obs_pos[0]], [pos_i[1], obs_pos[1]]]),
-                            refresh=True, linewidth=w * 2, color='red', alpha=0.6
+                            np.array([rx, ry]), refresh=True, linewidth=weight * 2, color='red', alpha=0.6
                         )
 
-        # === Per-robot goal reset (only for robots that arrived — usually 0-1) ===
-        if self.per_robot_goal_reset:
-            for i in range(self.num_robots):
-                if all_arrives[i]:
-                    self.env.robot_list[i].set_random_goal(
-                        obstacle_list=self.env.obstacle_list,
-                        init=True,
-                        range_limits=[
-                            [self.x_range[0] + 1, self.y_range[0] + 1, -np.pi],
-                            [self.x_range[1] - 1, self.y_range[1] - 1, np.pi],
-                        ],
-                    )
-                    self.prev_distances[i] = None
+            # Reset goal if reached
+            if self.per_robot_goal_reset and goal:
+                self.env.robot_list[i].set_random_goal(
+                    obstacle_list=self.env.obstacle_list,
+                    init=True,
+                    range_limits=[
+                        [self.x_range[0] + 1, self.y_range[0] + 1, -np.pi],
+                        [self.x_range[1] - 1, self.y_range[1] - 1, np.pi],
+                    ],
+                )
+                # Reset prev_distance for this robot to avoid spurious progress reward
+                # when goal changes (new goal has different distance)
+                self.prev_distances[i] = None
 
         # Get obstacle states
         obstacle_states = self.get_obstacle_states()
@@ -304,9 +348,9 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
             collisions,
             goals,
             action,
-            rewards_list,
+            rewards,
             positions,
-            goal_positions_out,
+            goal_positions,
             obstacle_states,
         )
 
@@ -426,85 +470,6 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
             goal_positions,
             obstacle_states,
         )
-
-    @staticmethod
-    def _compute_rewards_vectorized(
-        goals, collisions, actions, cl_penalties, distances,
-        min_clearances, obstacle_threshold, phase, prev_distances,
-    ):
-        """
-        Compute rewards for ALL robots at once using numpy vectorization.
-
-        Args:
-            goals (list[bool]): Per-robot goal-reached flags.
-            collisions (list[bool]): Per-robot collision flags.
-            actions (np.ndarray): Actions of shape (N, 2).
-            cl_penalties (np.ndarray): Pre-computed robot proximity penalties (N,).
-            distances (np.ndarray): Goal distances (N,).
-            min_clearances (np.ndarray): Min obstacle clearances (N,).
-            obstacle_threshold (float): Obstacle penalty threshold.
-            phase (int): Reward phase.
-            prev_distances (np.ndarray): Previous goal distances (N,), NaN if None.
-
-        Returns:
-            np.ndarray: Per-robot rewards (N,).
-        """
-        N = len(goals)
-        goals_arr = np.array(goals, dtype=bool)
-        collisions_arr = np.array(collisions, dtype=bool)
-        lin_vel = actions[:, 0]
-        ang_vel = actions[:, 1]
-
-        # Obstacle penalty (shared across phases 1, 3, 5, 6)
-        obs_close = min_clearances < obstacle_threshold
-        obs_pen_base = np.where(obs_close, (obstacle_threshold - min_clearances) ** 2, 0.0)
-
-        # Default: all get the "normal" reward, then override goal/collision
-        rewards = np.zeros(N)
-
-        match phase:
-            case 1:
-                r_dist = 1.5 / np.maximum(distances, 1e-10)
-                rewards = lin_vel - 0.5 * np.abs(ang_vel) - cl_penalties - obs_pen_base + r_dist
-                rewards = np.where(goals_arr, 100.0, rewards)
-                rewards = np.where(collisions_arr, -100.0 * 3 * lin_vel, rewards)
-
-            case 2:
-                rewards = np.full(N, -0.1)
-                rewards = np.where(goals_arr, 100.0, rewards)
-                rewards = np.where(collisions_arr, -100.0, rewards)
-
-            case 3:
-                r_dist = 10 * np.exp(-distances)
-                obs_pen = 2.0 * obs_pen_base
-                rewards = lin_vel - 0.5 * np.abs(ang_vel) - cl_penalties - obs_pen + r_dist
-                rewards = np.where(goals_arr, 100.0, rewards)
-                rewards = np.where(collisions_arr, -100.0 * 3 * lin_vel, rewards)
-
-            case 5:
-                k_p = 5.0
-                has_prev = ~np.isnan(prev_distances)
-                progress = np.where(has_prev, prev_distances - distances, 0.0)
-                r_progress = k_p * progress
-                obs_pen = 2.0 * obs_pen_base
-                rewards = lin_vel - 0.5 * np.abs(ang_vel) - cl_penalties - obs_pen + r_progress
-                rewards = np.where(goals_arr, 100.0, rewards)
-                rewards = np.where(collisions_arr, -100.0 * 3 * lin_vel, rewards)
-
-            case 6:
-                k_p = 5.0
-                has_prev = ~np.isnan(prev_distances)
-                progress = np.where(has_prev, prev_distances - distances, 0.0)
-                r_progress = k_p * progress
-                obs_pen = 2.0 * obs_pen_base
-                rewards = lin_vel - cl_penalties - obs_pen + r_progress
-                rewards = np.where(goals_arr, 100.0, rewards)
-                rewards = np.where(collisions_arr, -100.0 * 3 * lin_vel, rewards)
-
-            case _:
-                raise ValueError(f"Unknown reward phase: {phase}")
-
-        return rewards
 
     @staticmethod
     def get_reward(

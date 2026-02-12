@@ -58,8 +58,10 @@ CONFIG = {
     "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/best.pt",
 
     # Decentralized model configuration (used for all action generation)
-    "decentralized_model_name": "TD3-MARL-obstacle-14robots",
-    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.8_obstacle_14robot_transfer",
+    # "decentralized_model_name": "TD3-MARL-obstacle-14robots",
+    "decentralized_model_name": "TD3-MARL-obstacle-6robots_epoch2400",
+    # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.8_obstacle_14robot_transfer",
+    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2",
 
     # Test configuration
     "test_episodes": 100,
@@ -70,8 +72,8 @@ CONFIG = {
     "selection_interval": 10,
 
     # Policy configuration
-    "num_robots": 14,
-    "num_obstacles": 7,
+    "num_robots": 6,
+    "num_obstacles": 4,
     "state_dim": 11,
     "obstacle_state_dim": 4,
     "embedding_dim": 256,
@@ -84,7 +86,8 @@ CONFIG = {
     "extra_aggregations": ["mean", "min"],
 
     # World configuration
-    "world_file": "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
+    # "world_file": "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
+    "world_file": "robot_nav/worlds/multi_robot_world_obstacle.yaml",
     "obstacle_proximity_threshold": 1.5,
 
     # Device configuration

@@ -105,7 +105,7 @@ def main(args=None):
         load_model=False,
         load_model_name="TD3-MARL-obstacle-6robots",
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots"),
-        model_name="TD3-MARL-obstacle-6robots",
+        model_name="TD3-MARL-obstacle-6robots-reward6",
         save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v4"),
     )
 

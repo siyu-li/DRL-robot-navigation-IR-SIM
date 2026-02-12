@@ -125,7 +125,7 @@ def main(args=None):
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
         disable_plotting=False,  # Enable plotting for visualization
-        reward_phase=5,
+        reward_phase=6,
         per_robot_goal_reset=False,  # We handle resets manually
         obstacle_proximity_threshold=1.5,
     )
@@ -144,9 +144,11 @@ def main(args=None):
         obstacle_state_dim=obstacle_state_dim,
         device=device,
         load_model=True,
-        model_name="TD3-MARL-obstacle-14robots",
-        load_model_name="TD3-MARL-obstacle-14robots",
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.8_obstacle_14robot_transfer"),
+        model_name="TD3-MARL-obstacle-14robots-gpu",
+        load_model_name="TD3-MARL-obstacle-14robots-gpu_epoch800",
+        # load_model_name="TD3-MARL-obstacle-14robots",
+        # load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2"),
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu"),
         # load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_14robots"),
 
     )
@@ -213,7 +215,7 @@ def main(args=None):
             # Print instant rewards for each robot (condensed for 14 robots)
             if steps % 10 == 0 or any(collision) or any(goal):
                 reward_str = " | ".join([f"R{i}:{r:+.2f}" for i, r in enumerate(reward)])
-                print(f"[Ep {episode+1} Step {steps}] {reward_str} | Total: {step_total_reward:+.2f}")
+                # print(f"[Ep {episode+1} Step {steps}] {reward_str} | Total: {step_total_reward:+.2f}")
 
             # Accumulate rewards for trajectories
             for i in range(sim.num_robots):
@@ -225,19 +227,19 @@ def main(args=None):
                 if collision[i]:
                     # Trajectory ended with collision
                     completed_trajectories.append((i, 'collision', trajectory_rewards[i]))
-                    print(f"  >> Robot {i} COLLISION - Trajectory reward: {trajectory_rewards[i]:.2f}")
+                    # print(f"  >> Robot {i} COLLISION - Trajectory reward: {trajectory_rewards[i]:.2f}")
                     trajectory_rewards[i] = 0.0
                     robots_to_reset.append(i)
                 elif goal[i]:
                     # Trajectory ended with goal reach
                     completed_trajectories.append((i, 'goal', trajectory_rewards[i]))
-                    print(f"  >> Robot {i} GOAL REACHED - Trajectory reward: {trajectory_rewards[i]:.2f}")
+                    # print(f"  >> Robot {i} GOAL REACHED - Trajectory reward: {trajectory_rewards[i]:.2f}")
                     trajectory_rewards[i] = 0.0
                     robots_to_reset.append(i)
                 elif robot_outside_bounds(poses[i], sim):
                     # Trajectory ended by going out of bounds (treat as collision)
                     completed_trajectories.append((i, 'collision', trajectory_rewards[i]))
-                    print(f"  >> Robot {i} OUT OF BOUNDS - Trajectory reward: {trajectory_rewards[i]:.2f}")
+                    # print(f"  >> Robot {i} OUT OF BOUNDS - Trajectory reward: {trajectory_rewards[i]:.2f}")
                     trajectory_rewards[i] = 0.0
                     robots_to_reset.append(i)
 

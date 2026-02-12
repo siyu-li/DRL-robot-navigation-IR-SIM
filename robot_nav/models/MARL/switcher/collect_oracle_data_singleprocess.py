@@ -27,7 +27,6 @@ Data Collection Methods:
 """
 
 import logging
-import multiprocessing as mp
 import random
 from dataclasses import dataclass
 from datetime import datetime
@@ -76,9 +75,6 @@ CONFIG = {
     "disable_plotting": True,
     "obstacle_proximity_threshold": 1.5,
     "max_steps_per_episode": 400,   # Reset episode after this many steps
-    
-    # Parallel oracle evaluation
-    "n_workers": 4,                 # Number of parallel worker processes (0 = sequential)
 }
 
 
@@ -132,192 +128,6 @@ def outside_of_bounds(poses: List[List[float]], sim) -> bool:
 
 
 # =============================================================================
-# Parallel Worker Process (runs in a separate OS process)
-# =============================================================================
-def _worker_process(
-    worker_id: int,
-    task_queue: mp.Queue,
-    result_queue: mp.Queue,
-    config: Dict,
-    all_groups: List[List[int]],
-):
-    """
-    Worker process for parallel oracle group evaluation.
-
-    Each worker creates its own irsim environment and TD3Obstacle policy
-    (separate OS process avoids irsim global-state conflicts).
-
-    Protocol:
-        - Receives tasks: (sample_id, snapshot_data, env_state, groups_chunk, chunk_idx)
-        - Returns results: (sample_id, chunk_idx, scores_list)
-        - Shuts down on receiving None sentinel.
-    """
-    from robot_nav.models.MARL.marlTD3.marlTD3_obstacle import TD3Obstacle
-    from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
-
-    # Each worker gets its own sim (separate irsim global state in this process)
-    sim = MARL_SIM_OBSTACLE(
-        world_file=config["world_file"],
-        disable_plotting=True,
-        reward_phase=5,
-        per_robot_goal_reset=True,
-        obstacle_proximity_threshold=config["obstacle_proximity_threshold"],
-    )
-
-    # Each worker gets its own CPU-only policy for inference
-    policy = TD3Obstacle(
-        state_dim=config["state_dim"],
-        action_dim=2,
-        max_action=1.0,
-        device=torch.device("cpu"),
-        num_robots=config["n_robots"],
-        num_obstacles=config["n_obstacles"],
-        obstacle_state_dim=config["obstacle_state_dim"],
-        load_model=True,
-        model_name=config["decentralized_model_name"],
-        load_model_name=config["decentralized_model_name"],
-        load_directory=Path(config["decentralized_model_directory"]),
-        save_directory=Path(config["decentralized_model_directory"]),
-    )
-
-    # Create a collector for this worker (uses worker's own sim & policy)
-    collector = OracleDataCollector(
-        sim=sim,
-        policy=policy,
-        groups=all_groups,
-        horizon=config["oracle_horizon"],
-        n_rollouts_per_group=config["n_rollouts_per_group"],
-        device=torch.device("cpu"),
-    )
-
-    while True:
-        task = task_queue.get()
-        if task is None:
-            break  # Shutdown sentinel
-
-        sample_id, snapshot_data, env_state, groups_chunk, chunk_idx = task
-
-        # Restore snapshot to this worker's sim
-        snapshot = SimulationSnapshot(
-            robot_states=snapshot_data["robot_states"],
-            robot_goals=snapshot_data["robot_goals"],
-            prev_distances=snapshot_data["prev_distances"],
-            obstacle_states=snapshot_data["obstacle_states"],
-        )
-        snapshot.restore_to_sim(sim)
-
-        # Unpack environment state
-        poses = env_state["poses"]
-        distance = env_state["distance"]
-        cos_ = env_state["cos"]
-        sin_ = env_state["sin"]
-        collision = env_state["collision"]
-        action = env_state["action"]
-        goal_positions = env_state["goal_positions"]
-        obstacle_states = env_state["obstacle_states"]
-
-        # Evaluate each group in this chunk
-        scores = []
-        for group in groups_chunk:
-            # Restore before each group evaluation (rollout modifies sim state)
-            snapshot.restore_to_sim(sim)
-            score = collector._evaluate_group(
-                group, poses, distance, cos_, sin_, collision, action,
-                goal_positions, obstacle_states, snapshot,
-            )
-            scores.append(score)
-
-        result_queue.put((sample_id, chunk_idx, scores))
-
-
-class ParallelOraclePool:
-    """
-    Manages a pool of worker processes for parallel oracle evaluation.
-
-    Workers are persistent (created once, reused for all samples).
-    Groups are split into roughly equal chunks and distributed to workers.
-    """
-
-    def __init__(self, n_workers: int, config: Dict, all_groups: List[List[int]]):
-        self.n_workers = n_workers
-        self.all_groups = all_groups
-        self.task_queue = mp.Queue()
-        self.result_queue = mp.Queue()
-        self.workers: List[mp.Process] = []
-
-        for wid in range(n_workers):
-            p = mp.Process(
-                target=_worker_process,
-                args=(wid, self.task_queue, self.result_queue, config, all_groups),
-                daemon=True,
-            )
-            p.start()
-            self.workers.append(p)
-
-    def evaluate_groups_parallel(
-        self,
-        sample_id: int,
-        snapshot: "SimulationSnapshot",
-        env_state: Dict,
-        groups: List[List[int]],
-    ) -> List[float]:
-        """
-        Distribute group evaluations across workers and collect results.
-
-        Args:
-            sample_id: Identifier for this sample (for matching results).
-            snapshot: SimulationSnapshot to restore in each worker.
-            env_state: Dict with poses, distance, cos, sin, collision, action,
-                       goal_positions, obstacle_states.
-            groups: Full list of groups to evaluate.
-
-        Returns:
-            scores: List[float] of scores, one per group, in original order.
-        """
-        # Serialize snapshot to plain data (already numpy/list, fully picklable)
-        snapshot_data = {
-            "robot_states": [s.copy() for s in snapshot.robot_states],
-            "robot_goals": [g.copy() for g in snapshot.robot_goals],
-            "prev_distances": list(snapshot.prev_distances),
-            "obstacle_states": [s.copy() for s in snapshot.obstacle_states],
-        }
-
-        # Split groups into chunks, one per worker
-        n = len(groups)
-        chunk_size = (n + self.n_workers - 1) // self.n_workers
-        chunks = []
-        for i in range(0, n, chunk_size):
-            chunks.append(groups[i : i + chunk_size])
-
-        # Submit tasks
-        for chunk_idx, chunk in enumerate(chunks):
-            self.task_queue.put((sample_id, snapshot_data, env_state, chunk, chunk_idx))
-
-        # Collect results
-        results_by_chunk: Dict[int, List[float]] = {}
-        for _ in range(len(chunks)):
-            sid, cidx, scores = self.result_queue.get()
-            assert sid == sample_id, f"Result mismatch: expected {sample_id}, got {sid}"
-            results_by_chunk[cidx] = scores
-
-        # Reassemble in order
-        all_scores: List[float] = []
-        for cidx in range(len(chunks)):
-            all_scores.extend(results_by_chunk[cidx])
-
-        return all_scores
-
-    def shutdown(self):
-        """Send shutdown sentinels and join all worker processes."""
-        for _ in self.workers:
-            self.task_queue.put(None)
-        for p in self.workers:
-            p.join(timeout=10)
-            if p.is_alive():
-                p.terminate()
-
-
-# =============================================================================
 # Simulation State Snapshot for Rollback
 # =============================================================================
 @dataclass
@@ -331,7 +141,6 @@ class SimulationSnapshot:
     robot_states: List[np.ndarray]  # Per-robot [x, y, theta]
     robot_goals: List[np.ndarray]   # Per-robot goal positions
     prev_distances: List[Optional[float]]  # For progress-based reward
-    obstacle_states: List[np.ndarray]  # Per-obstacle [x, y, theta]
     
     @classmethod
     def from_sim(cls, sim) -> "SimulationSnapshot":
@@ -344,15 +153,10 @@ class SimulationSnapshot:
             robot_states.append(state)
             robot_goals.append(robot.goal.copy())
         
-        obstacle_states = []
-        for obs in sim.env.obstacle_list:
-            obstacle_states.append(obs.state.copy())
-        
         return cls(
             robot_states=robot_states,
             robot_goals=robot_goals,
             prev_distances=sim.prev_distances.copy(),
-            obstacle_states=obstacle_states,
         )
     
     def restore_to_sim(self, sim):
@@ -360,8 +164,6 @@ class SimulationSnapshot:
         for i, robot in enumerate(sim.env.robot_list):
             robot.set_state(state=self.robot_states[i], init=True)
             robot.set_goal(self.robot_goals[i], init=True)
-        for i, obs in enumerate(sim.env.obstacle_list):
-            obs.set_state(state=self.obstacle_states[i], init=True)
         sim.prev_distances = self.prev_distances.copy()
 
 
@@ -389,7 +191,6 @@ class OracleDataCollector:
         horizon: int = 10,            # Number of steps to simulate forward
         n_rollouts_per_group: int = 3,
         device: torch.device = None,
-        parallel_pool: Optional[ParallelOraclePool] = None,
     ):
         """
         Args:
@@ -399,7 +200,6 @@ class OracleDataCollector:
             horizon: Number of simulation steps for oracle evaluation
             n_rollouts_per_group: Number of rollouts to average for each group score
             device: Device for tensors
-            parallel_pool: Optional ParallelOraclePool for parallel group evaluation
         """
         self.sim = sim
         self.policy = policy
@@ -409,7 +209,6 @@ class OracleDataCollector:
         self.device = device or torch.device("cpu")
         self.num_robots = sim.num_robots
         self.num_obstacles = sim.num_obstacles
-        self.parallel_pool = parallel_pool
     
     def get_action_for_group(
         self,
@@ -1053,38 +852,16 @@ class OracleDataCollector:
         extra = self._get_extra_features(poses, distance, goal_positions)
         
         # Evaluate each group with rollouts
-        if self.parallel_pool is not None:
-            # Parallel: distribute group evaluations across worker processes
-            env_state = {
-                "poses": [list(p) for p in poses],
-                "distance": list(distance),
-                "cos": list(cos),
-                "sin": list(sin),
-                "collision": list(collision),
-                "action": [list(a) for a in action],
-                "goal_positions": [list(g) for g in goal_positions],
-                "obstacle_states": np.array(obstacle_states),
-            }
-            scores_list = self.parallel_pool.evaluate_groups_parallel(
-                sample_id=scenario_id if scenario_id is not None else 0,
-                snapshot=snapshot,
-                env_state=env_state,
-                groups=self.groups,
-            )
-            group_scores = torch.tensor(scores_list, dtype=torch.float32)
-        else:
-            # Sequential fallback
-            group_scores = []
-            for group in self.groups:
-                score = self._evaluate_group(
-                    group, poses, distance, cos, sin, collision, action,
-                    goal_positions, obstacle_states, snapshot,
-                )
-                group_scores.append(score)
-            group_scores = torch.tensor(group_scores, dtype=torch.float32)
+        group_scores = []
         
-        # Restore main sim to snapshot (workers don't touch main sim)
-        snapshot.restore_to_sim(self.sim)
+        for group in self.groups:
+            score = self._evaluate_group(
+                group, poses, distance, cos, sin, collision, action,
+                goal_positions, obstacle_states, snapshot,
+            )
+            group_scores.append(score)
+        
+        group_scores = torch.tensor(group_scores, dtype=torch.float32)
         
         return {
             "h": h.cpu(),
@@ -1217,8 +994,6 @@ def main():
     print(f"Embedding dimension: {config['embed_dim']}")
     print(f"Oracle horizon: {config['oracle_horizon']} steps")
     print(f"Rollouts per group: {config['n_rollouts_per_group']}")
-    n_workers = config.get("n_workers", 0)
-    print(f"Parallel workers: {n_workers}" + (" (sequential)" if n_workers == 0 else ""))
     print("=" * 70 + "\n")
     
     # Device
@@ -1267,17 +1042,6 @@ def main():
     logger.info(f"  Size-2: {sum(1 for g in candidate_groups if len(g) == 2)}")
     logger.info(f"  Size-3: {sum(1 for g in candidate_groups if len(g) == 3)}")
     
-    # Create parallel pool if n_workers > 0
-    parallel_pool = None
-    if n_workers > 0:
-        logger.info(f"Creating parallel oracle pool with {n_workers} workers...")
-        parallel_pool = ParallelOraclePool(
-            n_workers=n_workers,
-            config=config,
-            all_groups=candidate_groups,
-        )
-        logger.info(f"Parallel pool ready ({n_workers} workers)")
-    
     # Create oracle data collector
     collector = OracleDataCollector(
         sim=sim,
@@ -1286,22 +1050,14 @@ def main():
         horizon=config["oracle_horizon"],
         n_rollouts_per_group=config["n_rollouts_per_group"],
         device=device,
-        parallel_pool=parallel_pool,
     )
     
     # Collect data
-    try:
-        data = collector.collect_dataset(
-            n_samples=config["n_samples"],
-            save_path=None,  # We'll save below
-            verbose=True,
-        )
-    finally:
-        # Always shut down workers cleanly
-        if parallel_pool is not None:
-            logger.info("Shutting down parallel pool...")
-            parallel_pool.shutdown()
-            logger.info("Parallel pool shut down.")
+    data = collector.collect_dataset(
+        n_samples=config["n_samples"],
+        save_path=None,  # We'll save below
+        verbose=True,
+    )
     
     # Save
     output_path = Path(config["output_path"])

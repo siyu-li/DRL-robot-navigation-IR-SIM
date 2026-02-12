@@ -340,4 +340,4 @@ if __name__ == "__main__":
     filtered_groups_14 = filter_groups_by_size(all_groups_14, min_size=1, max_size=3)
     print(f"Before filtering: {len(all_groups_14)} groups")
     print(f"After filtering (size <= 3): {len(filtered_groups_14)} groups")
-    print_group_statistics(filtered_groups_14, n=14, max_display_per_size=20)
+    print_group_statistics(filtered_groups_14, n=14, max_display_per_size=30)
