@@ -219,6 +219,9 @@ class TD3Obstacle:
         model_name (str, optional): Base filename for checkpoints.
         load_model_name (str or None, optional): Filename base to load.
         load_directory (Path, optional): Directory to load checkpoints from.
+        inference_only (bool, optional): If True, skips SummaryWriter and optimizer
+            creation. Use for inference-only contexts (e.g. worker processes,
+            evaluation scripts). Defaults to False.
     """
 
     def __init__(
@@ -238,6 +241,7 @@ class TD3Obstacle:
         model_name="marlTD3_obstacle",
         load_model_name=None,
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint"),
+        inference_only=False,
     ):
         self.num_robots = num_robots
         self.num_obstacles = num_obstacles
@@ -252,22 +256,24 @@ class TD3Obstacle:
         self.actor_target = ActorObstacle(action_dim, embedding_dim=256).to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
 
-        self.attn_params = list(self.actor.attention.parameters())
-        self.policy_params = list(self.actor.policy_head.parameters())
-        self.actor_optimizer = torch.optim.Adam(
-            self.policy_params + self.attn_params, lr=lr_actor
-        )
+        if not inference_only:
+            self.attn_params = list(self.actor.attention.parameters())
+            self.policy_params = list(self.actor.policy_head.parameters())
+            self.actor_optimizer = torch.optim.Adam(
+                self.policy_params + self.attn_params, lr=lr_actor
+            )
 
         # Initialize Critic networks
         self.critic = CriticObstacle(action_dim, embedding_dim=256).to(self.device)
         self.critic_target = CriticObstacle(action_dim, embedding_dim=256).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic_optimizer = torch.optim.Adam(
-            params=self.critic.parameters(), lr=lr_critic
-        )
+        if not inference_only:
+            self.critic_optimizer = torch.optim.Adam(
+                params=self.critic.parameters(), lr=lr_critic
+            )
 
         # Logging and saving
-        self.writer = SummaryWriter(comment=model_name)
+        self.writer = None if inference_only else SummaryWriter(comment=model_name)
         self.iter_count = 0
         self.save_every = save_every
         self.model_name = model_name
@@ -621,10 +627,10 @@ class TD3Obstacle:
 
     def load(self, filename, directory):
         """Load model parameters from files."""
-        self.actor.load_state_dict(torch.load(f"{directory}/{filename}_actor.pth"))
-        self.actor_target.load_state_dict(torch.load(f"{directory}/{filename}_actor_target.pth"))
-        self.critic.load_state_dict(torch.load(f"{directory}/{filename}_critic.pth"))
-        self.critic_target.load_state_dict(torch.load(f"{directory}/{filename}_critic_target.pth"))
+        self.actor.load_state_dict(torch.load(f"{directory}/{filename}_actor.pth", map_location=self.device))
+        self.actor_target.load_state_dict(torch.load(f"{directory}/{filename}_actor_target.pth", map_location=self.device))
+        self.critic.load_state_dict(torch.load(f"{directory}/{filename}_critic.pth", map_location=self.device))
+        self.critic_target.load_state_dict(torch.load(f"{directory}/{filename}_critic_target.pth", map_location=self.device))
         print(f"Loaded weights from: {directory}")
 
     def prepare_state(

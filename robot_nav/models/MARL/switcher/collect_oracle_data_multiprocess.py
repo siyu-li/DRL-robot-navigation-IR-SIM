@@ -38,7 +38,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from tqdm import tqdm
-
+# Suppress IRSim warnings - irsim uses loguru, not standard logging
+from loguru import logger
+logger.disable("irsim")
 
 # =============================================================================
 # Configuration Dictionary - Edit these values directly
@@ -178,6 +180,7 @@ def _worker_process(
         load_model_name=config["decentralized_model_name"],
         load_directory=Path(config["decentralized_model_directory"]),
         save_directory=Path(config["decentralized_model_directory"]),
+        inference_only=True,
     )
 
     # Create a collector for this worker (uses worker's own sim & policy)
@@ -1199,6 +1202,10 @@ class OracleDataCollector:
 
 def main():
     """Main function to collect oracle data."""
+    # Must set spawn method before any workers are created,
+    # otherwise CUDA cannot be re-initialized in forked subprocesses.
+    mp.set_start_method("spawn", force=True)
+
     from robot_nav.models.MARL.marlTD3.marlTD3_obstacle import TD3Obstacle
     from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
     
@@ -1251,6 +1258,7 @@ def main():
         load_model_name=config["decentralized_model_name"],
         load_directory=Path(config["decentralized_model_directory"]),
         save_directory=Path(config["decentralized_model_directory"]),
+        inference_only=True,
     )
     logger.info("Loaded decentralized policy successfully")
     
