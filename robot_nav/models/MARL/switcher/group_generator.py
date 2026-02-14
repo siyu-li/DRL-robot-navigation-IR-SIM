@@ -337,7 +337,7 @@ if __name__ == "__main__":
     print("="*60)
     
     all_groups_14 = generate_all_groups(m=4, n=14, use_complement=True)
-    filtered_groups_14 = filter_groups_by_size(all_groups_14, min_size=1, max_size=3)
+    filtered_groups_14 = filter_groups_by_size(all_groups_14, min_size=1, max_size=7)
     print(f"Before filtering: {len(all_groups_14)} groups")
     print(f"After filtering (size <= 3): {len(filtered_groups_14)} groups")
-    print_group_statistics(filtered_groups_14, n=14, max_display_per_size=30)
+    print_group_statistics(filtered_groups_14, n=14, max_display_per_size=5)

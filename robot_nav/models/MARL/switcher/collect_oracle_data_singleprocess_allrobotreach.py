@@ -67,6 +67,16 @@ CONFIG = {
     "include_size_1": True,         # Include individual robots as candidates
     "include_size_2": True,         # Include pairs
     "include_size_3": True,         # Include triplets
+    "include_size_4": False,        # Include size-4 groups (rotation-coupled if enabled)
+    "include_size_7": False,        # Include size-7 groups (rotation-coupled if enabled)
+    
+    # Rotation coupling for large groups (size > 3):
+    # When True, groups with size > 3 use coupled rotation in addition to
+    # coupled linear velocity. All robots in the group rotate at the same
+    # angular velocity (average of individual angular velocities) and move
+    # at the same linear velocity (minimum of individual linear velocities).
+    # Groups with size <= 3 always keep individual angular velocities.
+    "use_rotation_coupling": True,
     
     # Model configuration
     "state_dim": 11,
@@ -110,6 +120,8 @@ def generate_candidate_groups(
     include_size_1: bool = True,
     include_size_2: bool = True,
     include_size_3: bool = True,
+    include_size_4: bool = False,
+    include_size_7: bool = False,
 ) -> List[List[int]]:
     """
     Generate candidate groups using binary allocation method.
@@ -123,9 +135,11 @@ def generate_candidate_groups(
         include_size_1: Include singletons (individual robots).
         include_size_2: Include pairs.
         include_size_3: Include triplets.
+        include_size_4: Include size-4 groups (rotation-coupled).
+        include_size_7: Include size-7 groups (rotation-coupled).
 
     Returns:
-        List of robot index groups with size <= 3.
+        List of robot index groups filtered by the requested sizes.
     """
     if num_robots <= 6:
         m = 3
@@ -139,17 +153,20 @@ def generate_candidate_groups(
 
     all_groups = generate_all_groups(m=m, n=num_robots, use_complement=True)
 
-    min_size = 1 if include_size_1 else 2
-    max_size = 3 if include_size_3 else (2 if include_size_2 else 1)
+    # Determine which sizes to include
+    allowed_sizes = set()
+    if include_size_1:
+        allowed_sizes.add(1)
+    if include_size_2:
+        allowed_sizes.add(2)
+    if include_size_3:
+        allowed_sizes.add(3)
+    if include_size_4:
+        allowed_sizes.add(4)
+    if include_size_7:
+        allowed_sizes.add(7)
 
-    filtered_groups = filter_groups_by_size(all_groups, min_size=min_size, max_size=max_size)
-
-    if not include_size_1:
-        filtered_groups = [g for g in filtered_groups if len(g) > 1]
-    if not include_size_2:
-        filtered_groups = [g for g in filtered_groups if len(g) != 2]
-    if not include_size_3:
-        filtered_groups = [g for g in filtered_groups if len(g) < 3]
+    filtered_groups = [g for g in all_groups if len(g) in allowed_sizes]
 
     return filtered_groups
 
@@ -214,8 +231,13 @@ class OracleDataCollector:
     For each candidate group, simulates forward H steps and accumulates rewards.
     Uses only the decentralized TD3Obstacle policy:
     - For size-1 groups: use individual robot's action directly
-    - For size-2/3 groups: average linear velocities of robots in the group
+    - For size-2/3 groups: min linear velocities of robots in the group
       to get coupled linear velocity, keep individual angular velocities
+    - For size-4/7 groups (rotation-coupled, if use_rotation_coupling=True):
+      min linear velocity AND average angular velocity — all robots in the
+      group move and rotate at the same speed
+    - For size-4/7 groups (if use_rotation_coupling=False):
+      same as size-2/3 (coupled linear only, individual angular)
     
     This follows the same pattern as ShortHorizonOracle in coupled_action_oracle_eval.py.
     """
@@ -256,9 +278,14 @@ class OracleDataCollector:
         """
         Get action for a specific group using the decentralized policy.
         
-        For groups with size > 1, we compute the coupled linear velocity by
-        taking the minimum of the linear velocities of all robots in the group.
-        Each robot keeps its individual angular velocity.
+        Coupling rules:
+        - Size 1: Individual robot action, no coupling.
+        - Size 2-3: Coupled linear velocity (min of group), individual angular velocity.
+        - Size > 3 (if use_rotation_coupling): Coupled linear velocity (min) AND
+          coupled angular velocity (average). All robots in the group rotate and
+          move at the same speed.
+        - Size > 3 (if NOT use_rotation_coupling): Same as size 2-3 (coupled
+          linear velocity only, individual angular velocity).
         
         Args:
             robot_obs: Robot observations, shape (num_robots, state_dim).
@@ -276,6 +303,7 @@ class OracleDataCollector:
         # action is (num_robots, 2) with values in [-1, 1]
         
         group_size = len(group)
+        use_rotation_coupling = CONFIG.get("use_rotation_coupling", True)
         
         if group_size == 1:
             # Size-1: Use individual robot's action directly
@@ -290,7 +318,7 @@ class OracleDataCollector:
                     a_out.append([0.0, 0.0])
             return a_out
         else:
-            # Size-2/3: Compute coupled linear velocity using minimum
+            # Size >= 2: Compute coupled linear velocity using minimum
             # Get scaled linear velocities for robots in the group
             scaled_lin_vels = []
             for idx in group:
@@ -301,12 +329,26 @@ class OracleDataCollector:
             # This ensures safety - coupled robots move at the slowest robot's speed
             v_coupled = min(scaled_lin_vels)
             
+            # Determine angular velocity coupling
+            if group_size > 3 and use_rotation_coupling:
+                # Size > 3 with rotation coupling: use average angular velocity
+                ang_vels = [action[idx][1] for idx in group]
+                w_coupled = sum(ang_vels) / len(ang_vels)
+            else:
+                # Size 2-3 (or size > 3 without rotation coupling):
+                # individual angular velocity
+                w_coupled = None  # marker: use per-robot angular velocity
+            
             # Build output actions
             a_out = []
             for i in range(self.num_robots):
                 if i in group:
-                    # Use coupled linear velocity, individual angular velocity
-                    a_out.append([v_coupled, action[i][1]])
+                    if w_coupled is not None:
+                        # Coupled rotation: same angular velocity for all in group
+                        a_out.append([v_coupled, w_coupled])
+                    else:
+                        # Individual angular velocity
+                        a_out.append([v_coupled, action[i][1]])
                 else:
                     a_out.append([0.0, 0.0])
             return a_out
@@ -1440,6 +1482,7 @@ class OracleDataCollector:
                 "n_rollouts_per_group": self.n_rollouts_per_group,
                 "collection_method": "simulation_rollout_singleprocess_allreach",
                 "scoring": "sync_newreach_laggard",
+                "use_rotation_coupling": CONFIG.get("use_rotation_coupling", True),
                 "k_reach": CONFIG.get("k_reach", 50.0),
                 "k_progress": CONFIG.get("k_progress", 3.0),
                 "k_sync": CONFIG.get("k_sync", 8.0),
@@ -1498,6 +1541,18 @@ def main():
           f"sync reward (k={config.get('k_sync', 8.0)}), "
           f"laggard progress (k={config.get('k_progress', 3.0)})")
     print(f"Episode reset: ALL robots reached OR max {config['max_steps_per_episode']} steps")
+    # Group size info
+    sizes_included = []
+    if config["include_size_1"]: sizes_included.append("1")
+    if config["include_size_2"]: sizes_included.append("2")
+    if config["include_size_3"]: sizes_included.append("3")
+    if config.get("include_size_4", False): sizes_included.append("4")
+    if config.get("include_size_7", False): sizes_included.append("7")
+    print(f"Group sizes included: {', '.join(sizes_included)}")
+    if config.get("use_rotation_coupling", True):
+        print(f"Rotation coupling: ON for groups with size > 3 (avg angular vel, min linear vel)")
+    else:
+        print(f"Rotation coupling: OFF (all groups use individual angular vel)")
     phase2_mode = config.get("phase2_selection", "random")
     if phase2_mode == "top_k":
         print(f"Phase 2 selection: top-{config.get('phase2_top_k', 5)} (sample from top-k oracle-scored groups)")
@@ -1547,12 +1602,18 @@ def main():
         include_size_1=config["include_size_1"],
         include_size_2=config["include_size_2"],
         include_size_3=config["include_size_3"],
+        include_size_4=config.get("include_size_4", False),
+        include_size_7=config.get("include_size_7", False),
     )
     
     logger.info(f"Candidate groups: {len(candidate_groups)} total")
     logger.info(f"  Size-1: {sum(1 for g in candidate_groups if len(g) == 1)}")
     logger.info(f"  Size-2: {sum(1 for g in candidate_groups if len(g) == 2)}")
     logger.info(f"  Size-3: {sum(1 for g in candidate_groups if len(g) == 3)}")
+    logger.info(f"  Size-4: {sum(1 for g in candidate_groups if len(g) == 4)}")
+    logger.info(f"  Size-7: {sum(1 for g in candidate_groups if len(g) == 7)}")
+    if config.get("use_rotation_coupling", True):
+        logger.info("  Rotation coupling: ON for groups with size > 3")
     
     # Create oracle data collector
     collector = OracleDataCollector(
