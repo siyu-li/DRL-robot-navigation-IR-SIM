@@ -44,8 +44,12 @@ CONFIG = {
     # Data configuration
     "data_path": "robot_nav/models/MARL/switcher/data/oracle_data.pt",
     "embed_dim": 512,              # Dimension of per-robot embeddings: Will be adjust based on data if None
-    "extra_features": ["dist_to_goal", "clearance"], # If empty list, no extra features
-    "extra_aggregations": ["mean", "min"],
+    "extra_features": [
+        "dist_to_goal", "clearance", "reached",
+        "frac_reached_global", "max_dist_to_goal",
+        "var_dist_to_goal", "steps_elapsed_frac",
+    ],
+    "extra_aggregations": ["mean", "min", "mean", "mean", "mean", "mean", "mean"],
     
     # Model architecture
     "embed_hidden": 256,            # Tower 1 output dimension
@@ -279,8 +283,14 @@ class TrainingConfig:
     # Data
     data_path: str = "oracle_data.pt"
     embed_dim: int = 256
-    extra_features: List[str] = field(default_factory=lambda: ["dist_to_goal", "clearance"])
-    extra_aggregations: List[str] = field(default_factory=lambda: ["mean", "min"])
+    extra_features: List[str] = field(default_factory=lambda: [
+        "dist_to_goal", "clearance", "reached",
+        "frac_reached_global", "max_dist_to_goal",
+        "var_dist_to_goal", "steps_elapsed_frac",
+    ])
+    extra_aggregations: List[str] = field(default_factory=lambda: [
+        "mean", "min", "mean", "mean", "mean", "mean", "mean",
+    ])
     
     # Model
     embed_hidden: int = 256
