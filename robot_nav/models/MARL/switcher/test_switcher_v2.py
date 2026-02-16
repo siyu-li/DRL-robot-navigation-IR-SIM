@@ -3,7 +3,8 @@ Test script for evaluating the trained Group Switcher network (v2 - Episode-Leve
 
 Key differences from v1:
 - NO per-robot reset: all robots reset together when ALL reach their goals.
-- Fast robots wait for slow robots (action = [0, 0] once a robot reaches its goal).
+- Robots continue to receive policy actions after reaching their goal — the
+  learned policy naturally keeps them near the goal (no manual zeroing).
 - Episode-level success: an episode is "successful" only if ALL robots reach their
   goals AND no collisions occurred during the episode.
 - Deterministic seeding: setting the same seed guarantees identical obstacle/robot
@@ -38,18 +39,20 @@ from robot_nav.models.MARL.switcher import (
     filter_groups_by_size,
 )
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
-
+# Suppress IRSim warnings - irsim uses loguru, not standard logging
+from loguru import logger
+logger.disable("irsim")
 
 # =============================================================================
 # Configuration Dictionary - Edit these values directly
 # =============================================================================
 CONFIG = {
     # Selection mode: "switcher" or "random"
-    "selection_mode": "switcher",  # Change to "random" for baseline comparison
+    "selection_mode": "random",  # Change to "random" for baseline comparison
 
     # Top-k selection: randomly select from top k groups instead of always best
     # Set to 1 for deterministic (always best), >1 for stochastic selection
-    "top_k_selection": 3,
+    "top_k_selection": 10,
 
     # Random seed for reproducibility (set to same value for fair comparison)
     "seed": 42,
@@ -59,21 +62,24 @@ CONFIG = {
 
     # Decentralized model configuration (used for all action generation)
     # "decentralized_model_name": "TD3-MARL-obstacle-14robots",
-    "decentralized_model_name": "TD3-MARL-obstacle-6robots_epoch2400",
+    # "decentralized_model_name": "TD3-MARL-obstacle-6robots_epoch2400",
     # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.8_obstacle_14robot_transfer",
-    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2",
+    # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2",
+    # Pretrained model paths (decentralized TD3Obstacle policy)
+    "decentralized_model_name": "TD3-MARL-obstacle-14robots-gpu_epoch800",
+    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu",
 
     # Test configuration
-    "test_episodes": 100,
-    "max_steps_per_episode": 500,
+    "test_episodes": 90,
+    "max_steps_per_episode": 1000,
     "disable_plotting": True,
 
     # Group selection interval (re-select group every N steps)
     "selection_interval": 10,
 
     # Policy configuration
-    "num_robots": 6,
-    "num_obstacles": 4,
+    "num_robots": 14,
+    "num_obstacles": 7,
     "state_dim": 11,
     "obstacle_state_dim": 4,
     "embedding_dim": 256,
@@ -86,8 +92,8 @@ CONFIG = {
     "extra_aggregations": ["mean", "min"],
 
     # World configuration
-    # "world_file": "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
-    "world_file": "robot_nav/worlds/multi_robot_world_obstacle.yaml",
+    "world_file": "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
+    # "world_file": "robot_nav/worlds/multi_robot_world_obstacle.yaml",
     "obstacle_proximity_threshold": 1.5,
 
     # Device configuration
@@ -490,9 +496,9 @@ class SwitcherGroupSelector:
 
         batch_size = robot_tensor.shape[0]
         n_robots = robot_tensor.shape[1]
-        embed_dim_2 = H.shape[-1]
+        embed_dim = H.shape[-1]
 
-        h = H.view(batch_size, n_robots, embed_dim_2).squeeze(0)
+        h = H.view(batch_size, n_robots, embed_dim).squeeze(0)
         attn_rr = hard_weights_rr.squeeze(0)
         attn_ro = hard_weights_ro.squeeze(0)
 
@@ -618,13 +624,14 @@ def get_action_for_group(
     obstacle_obs: np.ndarray,
     group: List[int],
     num_robots: int,
-    reached_goal: List[bool],
 ) -> List[List[float]]:
     """
     Get action for a specific group using the decentralized policy.
 
-    Robots that have already reached their goal are given [0, 0] (wait).
-    Only active (not-yet-arrived) robots in the group get coupled actions.
+    All robots in the group get coupled actions (velocity-matched).
+    Robots NOT in the group get [0, 0].
+    Robots that have already reached their goal continue to receive
+    policy actions — the learned policy will naturally keep them near the goal.
 
     Args:
         policy: TD3Obstacle decentralized policy.
@@ -632,23 +639,16 @@ def get_action_for_group(
         obstacle_obs: Obstacle observations, shape (num_obstacles, obs_dim).
         group: List of robot indices in the active group.
         num_robots: Total number of robots.
-        reached_goal: Per-robot flag indicating whether the robot already reached its goal.
 
     Returns:
         Actions for all robots, shape (num_robots, 2).
     """
     action, _ = policy.get_action(robot_obs, obstacle_obs, add_noise=False)
 
-    # Determine which robots in the group are still active (haven't reached goal)
-    active_in_group = [idx for idx in group if not reached_goal[idx]]
-
-    if len(active_in_group) == 0:
-        # All robots in this group already reached their goals — no movement
-        return [[0.0, 0.0]] * num_robots
-
-    # Get scaled linear velocities for active robots in the group
+    # Get scaled linear velocities for robots in the group
+    group_set = set(group)
     scaled_lin_vels = []
-    for idx in active_in_group:
+    for idx in group:
         scaled_lin_vel = (action[idx][0] + 1) / 4  # [-1,1] -> [0,0.5]
         scaled_lin_vels.append(scaled_lin_vel)
 
@@ -656,10 +656,7 @@ def get_action_for_group(
 
     a_out = []
     for i in range(num_robots):
-        if reached_goal[i]:
-            # Robot already at goal — wait
-            a_out.append([0.0, 0.0])
-        elif i in active_in_group:
+        if i in group_set:
             a_out.append([v_coupled, action[i][1]])
         else:
             # Not in the active group
@@ -688,7 +685,8 @@ def run_test_evaluation(
 
     Episode semantics (v2):
     - An episode starts with a full environment reset (all robots + obstacles).
-    - When a robot reaches its goal it stops (action = [0,0]) and waits.
+    - Robots continue to receive policy actions even after reaching their goal;
+      the learned policy naturally keeps them near the goal.
     - The episode ends (success) when ALL robots have reached their goals.
     - The episode ends (collision) if ANY robot collides or goes out of bounds.
     - The episode ends (timeout) if max_steps is reached.
@@ -725,7 +723,8 @@ def run_test_evaluation(
         steps = 0
         episode_had_collision = False
 
-        # Per-robot "reached goal" flags — once True, robot waits
+        # Per-robot "reached goal" flags — used only to determine episode success.
+        # Robots are NOT made inactive; the policy naturally keeps them near the goal.
         reached_goal = [False] * num_robots
 
         # Per-robot cumulative path length tracking
@@ -767,7 +766,7 @@ def run_test_evaluation(
 
             action_out = get_action_for_group(
                 policy, robot_obs, obstacle_states,
-                current_group, num_robots, reached_goal,
+                current_group, num_robots,
             )
 
             # ----------------------------------------------------------
@@ -785,10 +784,9 @@ def run_test_evaluation(
 
             # Accumulate per-robot path lengths (Euclidean distance moved)
             for i in range(num_robots):
-                if not reached_goal[i]:
-                    dx = poses[i][0] - prev_positions[i][0]
-                    dy = poses[i][1] - prev_positions[i][1]
-                    path_lengths[i] += np.sqrt(dx * dx + dy * dy)
+                dx = poses[i][0] - prev_positions[i][0]
+                dy = poses[i][1] - prev_positions[i][1]
+                path_lengths[i] += np.sqrt(dx * dx + dy * dy)
                 prev_positions[i] = [poses[i][0], poses[i][1]]
 
             # ----------------------------------------------------------

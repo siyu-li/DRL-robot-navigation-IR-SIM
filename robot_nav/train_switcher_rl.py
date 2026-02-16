@@ -1,0 +1,336 @@
+"""
+RL Training Script for PPO Group Switcher (14 Robots).
+
+Trains a categorical PPO policy that selects which robot subgroup to
+activate every ``selection_interval`` simulation steps.  The frozen
+decentralized TD3Obstacle policy generates low-level actions; the
+switcher only decides *which* group moves.
+
+Usage:
+    python -m robot_nav.train_switcher_rl
+
+Edit the CONFIG dictionary below to change hyperparameters.
+"""
+
+import logging
+import random
+import time
+from collections import deque
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from robot_nav.models.MARL.marlTD3.marlTD3_obstacle import TD3Obstacle
+from robot_nav.models.MARL.switcher.group_generator import (
+    generate_all_groups,
+    filter_groups_by_size,
+)
+from robot_nav.models.MARL.switcher.rl_feature_builder import (
+    RLFeatureBuilder,
+    GROUP_SCALAR_DIM,
+    STATE_SCALAR_DIM,
+)
+from robot_nav.models.MARL.switcher.switcher_env import SwitcherEnv
+from robot_nav.models.MARL.switcher.switcher_ppo import SwitcherPPO
+from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
+# Suppress IRSim warnings - irsim uses loguru, not standard logging
+from loguru import logger
+logger.disable("irsim")
+
+# =============================================================================
+# Configuration
+# =============================================================================
+CONFIG = {
+    # ---- Environment ----
+    "world_file": "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
+    "n_robots": 14,
+    "n_obstacles": 7,
+    "disable_plotting": True,
+    "obstacle_proximity_threshold": 1.5,
+    "goal_threshold": 0.3,
+    "max_episode_steps": 1500,          # sim steps per episode
+    "selection_interval": 10,           # sim steps per switcher decision
+    "reward_phase": 5,                  # underlying sim reward phase (unused by switcher)
+    "per_robot_goal_reset": False,      # do NOT auto-reset individual robots on arrival
+
+    # ---- Decentralized policy (frozen) ----
+    "state_dim": 11,
+    "obstacle_state_dim": 4,
+    "decentralized_model_name": "TD3-MARL-obstacle-14robots-gpu_epoch800",
+    "decentralized_model_dir": "robot_nav/models/MARL/marlTD3/checkpoint/"
+                               "Feb.10_obstacle_14robot_transfer_gpu",
+
+    # ---- Group generation ----
+    "include_sizes": (1, 2, 3, 4, 7),  # candidate group sizes
+    "use_rotation_coupling": True,
+    "rotation_coupling_threshold": 3,
+
+    # ---- PPO hyperparameters ----
+    "embed_dim": 512,                   # per-robot embedding dim (H from GAT)
+    "lr_actor": 2e-4,                   # lower LR for more frequent updates
+    "lr_critic": 1e-3,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "eps_clip": 0.2,
+    "entropy_coeff": 0.03,             # higher → more exploration (smaller batch needs more)
+    "value_coeff": 0.5,
+    "max_grad_norm": 1.0,
+    "ppo_epochs": 6,                    # fewer epochs for smaller batch (avoid overfitting)
+    "embed_hidden": 256,                # hidden dim for embedding tower
+    "group_scalar_hidden": 64,
+    "fusion_hidden": 256,
+    "value_embed_hidden": 128,
+    "value_scalar_hidden": 32,
+
+    # ---- Training schedule ----
+    "max_updates": 5000,                # 2× updates to match total experience (256×6000 ≈ 500×3000)
+    "rollout_steps": 256,               # switcher decisions (NOT sim steps) to collect
+
+    "seed": 42,
+    "log_window": 30,                   # wider window for smoother stats
+
+    # ---- Reward coefficients (SwitcherEnv) ----
+    "k_progress": 3.0,
+    "k_reach": 50.0,
+    "k_all_reached": 500.0,            # large bonus when ALL robots reach goals
+    "k_sync": 8.0,
+    "k_evasion": 1.0,
+    "collision_penalty": -200.0,
+    "time_penalty": -0.1,
+    "robot_proximity_threshold": 1.25,
+    "obstacle_proximity_threshold": 1.25,
+
+    # ---- Checkpointing ----
+    "save_every": 40,                   # save every N PPO updates
+    "model_name": "SwitcherPPO-14robots",
+    "save_directory": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots",
+}
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+def _generate_groups(num_robots: int, include_sizes):
+    m = 3 if num_robots <= 6 else 4
+    all_groups = generate_all_groups(m=m, n=num_robots, use_complement=True)
+    allowed = set(include_sizes)
+    return [g for g in all_groups if len(g) in allowed]
+
+
+def _set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = True
+
+
+# =============================================================================
+# Main
+# =============================================================================
+def main():
+    cfg = CONFIG
+    _set_seed(cfg["seed"])
+
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_str)
+    print(f"Device: {device}")
+
+    # ---- 1. Simulation ----
+    sim = MARL_SIM_OBSTACLE(
+        world_file=cfg["world_file"],
+        disable_plotting=cfg["disable_plotting"],
+        reward_phase=cfg["reward_phase"],
+        per_robot_goal_reset=cfg["per_robot_goal_reset"],
+        obstacle_proximity_threshold=cfg["obstacle_proximity_threshold"],
+    )
+    print(f"Sim: {sim.num_robots} robots, {sim.num_obstacles} obstacles, "
+          f"world x={sim.x_range} y={sim.y_range}")
+
+    # ---- 2. Frozen decentralized policy ----
+    policy = TD3Obstacle(
+        state_dim=cfg["state_dim"],
+        action_dim=2,
+        max_action=1,
+        num_robots=sim.num_robots,
+        num_obstacles=sim.num_obstacles,
+        obstacle_state_dim=cfg["obstacle_state_dim"],
+        device=device,
+        load_model=True,
+        model_name=cfg["decentralized_model_name"],
+        load_model_name=cfg["decentralized_model_name"],
+        load_directory=Path(cfg["decentralized_model_dir"]),
+        save_directory=Path(cfg["decentralized_model_dir"]),
+        inference_only=True,
+    )
+    policy.actor.eval()
+    print(f"Loaded frozen policy: {cfg['decentralized_model_name']}")
+
+    # ---- 3. Groups ----
+    groups = _generate_groups(cfg["n_robots"], cfg["include_sizes"])
+    print(f"Candidate groups: {len(groups)}  "
+          f"(sizes: {sorted(set(len(g) for g in groups))})")
+
+    # ---- 4. Feature builder ----
+    fb = RLFeatureBuilder(
+        embed_dim=cfg["embed_dim"],
+        pooling="mean",
+        max_group_size=max(len(g) for g in groups),
+        rotation_coupling_threshold=cfg["rotation_coupling_threshold"],
+    )
+
+    # ---- 5. Switcher environment ----
+    env = SwitcherEnv(
+        sim=sim,
+        policy=policy,
+        groups=groups,
+        feature_builder=fb,
+        selection_interval=cfg["selection_interval"],
+        max_episode_steps=cfg["max_episode_steps"],
+        goal_threshold=cfg["goal_threshold"],
+        use_rotation_coupling=cfg["use_rotation_coupling"],
+        rotation_coupling_threshold=cfg["rotation_coupling_threshold"],
+        device=device_str,
+    )
+    # Override reward coefficients
+    env.k_progress = cfg["k_progress"]
+    env.k_reach = cfg["k_reach"]
+    env.k_all_reached = cfg["k_all_reached"]
+    env.k_sync = cfg["k_sync"]
+    env.k_evasion = cfg["k_evasion"]
+    env.collision_penalty = cfg["collision_penalty"]
+    env.time_penalty = cfg["time_penalty"]
+    env.robot_proximity_threshold = cfg["robot_proximity_threshold"]
+    env.obstacle_proximity_threshold = cfg["obstacle_proximity_threshold"]
+
+    # Enable reward debugging
+    env.debug_rewards = False
+
+    # ---- 6. PPO agent ----
+    ppo = SwitcherPPO(
+        embed_dim=cfg["embed_dim"],
+        group_scalar_dim=GROUP_SCALAR_DIM,
+        state_scalar_dim=STATE_SCALAR_DIM,
+        lr_actor=cfg["lr_actor"],
+        lr_critic=cfg["lr_critic"],
+        gamma=cfg["gamma"],
+        gae_lambda=cfg["gae_lambda"],
+        eps_clip=cfg["eps_clip"],
+        entropy_coeff=cfg["entropy_coeff"],
+        value_coeff=cfg["value_coeff"],
+        max_grad_norm=cfg["max_grad_norm"],
+        device=device_str,
+        save_every=cfg["save_every"],
+        model_name=cfg["model_name"],
+        save_directory=Path(cfg["save_directory"]),
+        # Network architecture kwargs
+        embed_hidden=cfg["embed_hidden"],
+        group_scalar_hidden=cfg["group_scalar_hidden"],
+        fusion_hidden=cfg["fusion_hidden"],
+        value_embed_hidden=cfg["value_embed_hidden"],
+        value_scalar_hidden=cfg["value_scalar_hidden"],
+    )
+
+    # ---- Print summary ----
+    n_params = sum(p.numel() for p in ppo.policy.parameters())
+    print(f"\nSwitcherPPO parameters: {n_params:,}")
+    print(f"Group feature dim (actor input per group): {fb.group_feature_dim}")
+    print(f"State feature dim (critic input): {fb.state_feature_dim}")
+    print(f"Rollout steps per update: {cfg['rollout_steps']}")
+    print(f"PPO epochs per update: {cfg['ppo_epochs']}")
+    print(f"Max updates: {cfg['max_updates']}")
+    max_decisions = cfg["max_episode_steps"] // cfg["selection_interval"]
+    print(f"Max decisions per episode: {max_decisions}")
+    print()
+
+    # ---- 7. Training loop ----
+    # Rolling statistics
+    ep_rewards = deque(maxlen=cfg["log_window"])
+    ep_lengths = deque(maxlen=cfg["log_window"])
+    ep_reached = deque(maxlen=cfg["log_window"])
+    ep_collisions = deque(maxlen=cfg["log_window"])
+    ep_all_reached = deque(maxlen=cfg["log_window"])
+
+    total_episodes = 0
+    total_decisions = 0
+    update_count = 0
+    t_start = time.time()
+
+    # Start first episode
+    group_features, state_features = env.reset()
+    ep_reward = 0.0
+    ep_len = 0
+
+    while update_count < cfg["max_updates"]:
+        # ---- Collect rollout: rollout_steps switcher decisions ----
+        # Each decision = 1 PPO action + 10 sim steps inside env.step()
+        for _ in range(cfg["rollout_steps"]):
+            # Select group via PPO (stores obs/logprob/value in buffer)
+            group_idx = ppo.get_action(group_features, state_features, explore=True)
+
+            # Step environment for selection_interval sim steps
+            group_features, state_features, reward, done, info = env.step(group_idx)
+
+            # Store reward + terminal in PPO buffer
+            ppo.store_reward(reward, done)
+
+            ep_reward += reward
+            ep_len += 1
+            total_decisions += 1
+
+            if done:
+                # Episode finished — log stats
+                ep_rewards.append(ep_reward)
+                ep_lengths.append(ep_len)
+                ep_reached.append(info["n_reached"])
+                ep_collisions.append(1 if info["collision"] or info["oob"] else 0)
+                ep_all_reached.append(1 if info["all_reached"] else 0)
+                total_episodes += 1
+
+                # Reset for next episode
+                group_features, state_features = env.reset()
+                ep_reward = 0.0
+                ep_len = 0
+
+        # ---- PPO update ----
+        ppo.train(iterations=cfg["ppo_epochs"])
+        update_count += 1
+
+        # ---- Logging ----
+        if update_count % 1 == 0 and len(ep_rewards) > 0:
+            elapsed = time.time() - t_start
+            avg_r = np.mean(ep_rewards)
+            avg_len = np.mean(ep_lengths)
+            avg_reached = np.mean(ep_reached)
+            col_rate = np.mean(ep_collisions)
+            all_rate = np.mean(ep_all_reached)
+
+            print(
+                f"[Update {update_count:4d}] "
+                f"ep={total_episodes:5d}  "
+                f"dec={total_decisions:7d}  "
+                f"R={avg_r:+7.1f}  "
+                f"len={avg_len:5.1f}  "
+                f"reached={avg_reached:.1f}/{cfg['n_robots']}  "
+                f"col={col_rate:.2f}  "
+                f"all_reach={all_rate:.2f}  "
+                f"t={elapsed:.0f}s"
+            )
+
+            # TensorBoard logging (via PPO writer)
+            ppo.writer.add_scalar("rollout/mean_reward", avg_r, update_count)
+            ppo.writer.add_scalar("rollout/mean_episode_length", avg_len, update_count)
+            ppo.writer.add_scalar("rollout/mean_reached", avg_reached, update_count)
+            ppo.writer.add_scalar("rollout/collision_rate", col_rate, update_count)
+            ppo.writer.add_scalar("rollout/all_reached_rate", all_rate, update_count)
+
+    # ---- Final save ----
+    ppo.save(filename=cfg["model_name"], directory=Path(cfg["save_directory"]))
+    print(f"\nTraining complete. Final checkpoint saved to {cfg['save_directory']}")
+    print(f"Total episodes: {total_episodes}, total decisions: {total_decisions}")
+
+
+if __name__ == "__main__":
+    main()

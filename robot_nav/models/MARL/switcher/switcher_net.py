@@ -18,20 +18,23 @@ class GroupSwitcher(nn.Module):
     Takes group feature vectors and outputs logits for ranking.
     
     Architecture (Two-Tower Fusion):
-        Tower 1 (embeddings): e = [h_g || h_glob] ∈ R^1024
-            Linear(1024 → 256) → GELU → LayerNorm
+        Tower 1 (embeddings): e = [h_g || h_glob] ∈ R^(2*embed_dim) = R^1024
+            Linear(1024 → embed_hidden) → GELU → LayerNorm
         
-        Tower 2 (scalars): s ∈ R^4 (size_feat + attn_stats)
-            Linear(4 → 32) → GELU → LayerNorm
+        Tower 2 (scalars): s ∈ R^scalar_dim
+            Linear(scalar_dim → scalar_hidden) → GELU → LayerNorm
         
-        Fusion: [e' || s'] ∈ R^288
-            Linear(288 → 256) → GELU → LayerNorm → Dropout
-            Linear(256 → 1)
+        Fusion: [e' || s'] ∈ R^(embed_hidden + scalar_hidden)
+            Linear(→ fusion_hidden) → GELU → LayerNorm → Dropout
+            Linear(fusion_hidden → 1)
     
     Args:
-        embed_dim: Dimension of per-robot embeddings (d). Default 512.
+        embed_dim: Dimension of per-robot embeddings from GAT backbone output
+            (d = 2 * GAT embedding_dim = 512).  ``h_g`` and ``h_glob`` each
+            have this dim.  The embedding tower input is ``2 * embed_dim = 1024``.
         scalar_dim: Dimension of scalar features (size + attn_stats). Default 4.
-        embed_hidden: Hidden dimension for embedding tower. Default 256.
+        embed_hidden: Hidden dimension for embedding tower
+            (Linear(2*embed_dim → embed_hidden)). Default 256.
         scalar_hidden: Hidden dimension for scalar tower. Default 32.
         fusion_hidden: Hidden dimension for fusion layer. Default 256.
         dropout: Dropout probability.
@@ -199,8 +202,9 @@ class GroupSwitcherWithBaseline(nn.Module):
     Uses the same two-tower fusion architecture as GroupSwitcher.
     
     Args:
-        embed_dim: Dimension of per-robot embeddings (d). Default 256.
-        scalar_dim: Dimension of scalar features. Default 4.
+        embed_dim: Dimension of per-robot embeddings from GAT backbone output
+            (d = 512). Default 512.
+        scalar_dim: Dimension of scalar features. Default 6.
         embed_hidden: Hidden dimension for embedding tower. Default 256.
         scalar_hidden: Hidden dimension for scalar tower. Default 32.
         fusion_hidden: Hidden dimension for fusion layer. Default 256.

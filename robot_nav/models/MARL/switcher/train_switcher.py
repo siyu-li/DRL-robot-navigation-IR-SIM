@@ -282,7 +282,7 @@ class TrainingConfig:
     """Training configuration."""
     # Data
     data_path: str = "oracle_data.pt"
-    embed_dim: int = 256
+    embed_dim: int = 512
     extra_features: List[str] = field(default_factory=lambda: [
         "dist_to_goal", "clearance", "reached",
         "frac_reached_global", "max_dist_to_goal",

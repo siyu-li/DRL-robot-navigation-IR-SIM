@@ -29,26 +29,38 @@ class GroupFeatureBuilder(nn.Module):
         - extra_stats: Additional per-robot feature statistics (variable dim)
     
     Args:
-        embed_dim: Dimension of per-robot embeddings (d).
+        embed_dim: Dimension of per-robot embeddings from the GAT backbone
+            output (d).  The attention module produces ``H`` of shape
+            ``(N, 2*embedding_dim)``; with ``embedding_dim=256`` the per-robot
+            vector is 512-dim, so ``embed_dim`` should be **512**.
         global_embed_dim: Dimension of global embedding (dg). If None, uses embed_dim.
         pooling: Pooling method for group embedding ("mean" or "max").
         extra_feature_names: List of extra feature names to include (e.g., ["dist_to_goal", "clearance"]).
         extra_aggregations: Aggregation methods for each extra feature ("mean", "min", "max").
             If single value, applies to all extra features.
+        use_coupling_mode: If True, append a binary coupling_mode feature per group.
+            coupling_mode = 1.0 if group_size > rotation_coupling_threshold and
+            rotation coupling is enabled; 0.0 otherwise.
+        rotation_coupling_threshold: Group sizes strictly above this threshold
+            get rotation coupling. Default 3 (sizes 4, 7 get coupling_mode=1).
     """
     
     def __init__(
         self,
-        embed_dim: int = 256,
+        embed_dim: int = 512,
         global_embed_dim: Optional[int] = None,
         pooling: Literal["mean", "max"] = "mean",
         extra_feature_names: Optional[List[str]] = None,
         extra_aggregations: Optional[List[Literal["mean", "min", "max"]]] = None,
+        use_coupling_mode: bool = False,
+        rotation_coupling_threshold: int = 3,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.global_embed_dim = global_embed_dim if global_embed_dim is not None else embed_dim
         self.pooling = pooling
+        self.use_coupling_mode = use_coupling_mode
+        self.rotation_coupling_threshold = rotation_coupling_threshold
         
         # Extra features configuration
         self.extra_feature_names = extra_feature_names or []
@@ -68,6 +80,7 @@ class GroupFeatureBuilder(nn.Module):
             self.embed_dim +          # h_g
             self.global_embed_dim +   # h_glob
             1 +                       # size_feat
+            (1 if self.use_coupling_mode else 0) +  # coupling_mode
             3 +                       # attn_stats [A_in, A_out, A_obs]
             len(self.extra_feature_names)  # extra_stats
         )
@@ -173,8 +186,13 @@ class GroupFeatureBuilder(nn.Module):
         else:
             raise ValueError(f"Unknown pooling: {self.pooling}")
         
-        # 2. Size feature (normalized by max size=3)
+        # 2. Size feature (normalized by max possible group size)
         size_feat = torch.tensor([group_size / 3.0], device=device, dtype=h.dtype)
+        
+        # 2b. Coupling mode flag (1.0 if rotation-coupled large group, else 0.0)
+        if self.use_coupling_mode:
+            cm = 1.0 if group_size > self.rotation_coupling_threshold else 0.0
+            coupling_mode = torch.tensor([cm], device=device, dtype=h.dtype)
         
         # 3. Attention statistics
         attn_stats = self._compute_attention_stats(
@@ -195,7 +213,11 @@ class GroupFeatureBuilder(nn.Module):
         )
         
         # Concatenate all features
-        feat = torch.cat([h_g, h_glob, size_feat, attn_stats, extra_stats], dim=0)
+        parts = [h_g, h_glob, size_feat]
+        if self.use_coupling_mode:
+            parts.append(coupling_mode)
+        parts.extend([attn_stats, extra_stats])
+        feat = torch.cat(parts, dim=0)
         return feat
     
     def _compute_attention_stats(

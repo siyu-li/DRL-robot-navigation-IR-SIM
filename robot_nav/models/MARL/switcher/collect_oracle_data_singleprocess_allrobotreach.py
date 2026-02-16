@@ -56,7 +56,7 @@ CONFIG = {
     "n_samples": 7000,              # Number of samples to collect
     "n_robots": 14,                  # Number of robots
     "n_obstacles": 7,               # Number of obstacles
-    "embed_dim": 256,               # Embedding dimension from GAT backbone
+    "embed_dim": 512,               # Per-robot embedding dimension from GAT backbone output (2*embedding_dim=2*256)
     "seed": 42,                     # Random seed for reproducibility
     
     # Oracle evaluation settings
@@ -955,7 +955,7 @@ class OracleDataCollector:
             obstacle_obs: Obstacle observations, shape (num_obstacles, obs_dim)
             
         Returns:
-            h: Per-robot embeddings, Tensor[N, embed_dim*2]
+            h: Per-robot embeddings, Tensor[N, embed_dim]
             attn_rr: Robot-robot attention weights, Tensor[N, N]
             attn_ro: Robot-obstacle attention weights, Tensor[N, N_obs]
         """
@@ -969,7 +969,7 @@ class OracleDataCollector:
         with torch.no_grad():
             # Get embeddings and attention from the actor's attention module
             (
-                H,  # Per-robot embeddings: (B*N, embed_dim*2)
+                H,  # Per-robot embeddings: (B*N, embed_dim)
                 hard_logits_rr,
                 hard_logits_ro,
                 dist_rr,
@@ -980,12 +980,12 @@ class OracleDataCollector:
                 combined_weights,
             ) = self.policy.actor.attention(robot_tensor, obstacle_tensor)
         
-        # Reshape H from (B*N, embed_dim*2) to (B, N, embed_dim*2), then remove batch dim
+        # Reshape H from (B*N, embed_dim) to (B, N, embed_dim), then remove batch dim
         batch_size = robot_tensor.shape[0]
         n_robots = robot_tensor.shape[1]
-        embed_dim_2 = H.shape[-1]  # embed_dim * 2
+        embed_dim = H.shape[-1]  # embed_dim (= 2 * GAT embedding_dim = 512)
         
-        h = H.view(batch_size, n_robots, embed_dim_2).squeeze(0)  # (N, embed_dim*2)
+        h = H.view(batch_size, n_robots, embed_dim).squeeze(0)  # (N, embed_dim)
         attn_rr = hard_weights_rr.squeeze(0)  # (N, N)
         attn_ro = hard_weights_ro.squeeze(0)  # (N, N_obs)
         
@@ -1643,7 +1643,7 @@ def main():
     
     print(f"\nSaved {len(data['samples'])} samples to {output_path}")
     print(f"\nData format:")
-    print(f"  samples[i]['h']: Tensor[{n_robots}, {embed_dim * 2}]  (per-robot embeddings)")
+    print(f"  samples[i]['h']: Tensor[{n_robots}, {embed_dim}]  (per-robot embeddings)")
     print(f"  samples[i]['groups']: List of {n_groups} groups")
     print(f"  samples[i]['group_scores']: Tensor[{n_groups}]  (oracle reward scores)")
     print(f"  samples[i]['attn_rr']: Tensor[{n_robots}, {n_robots}]")

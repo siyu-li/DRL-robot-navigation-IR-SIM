@@ -24,10 +24,21 @@ from robot_nav.models.MARL.switcher.feature_builder import (
     GroupFeatureBuilder,
     compute_attention_stats_vectorized,
 )
+from robot_nav.models.MARL.switcher.rl_feature_builder import (
+    RLFeatureBuilder,
+    GROUP_SCALAR_DIM,
+    STATE_SCALAR_DIM,
+)
 from robot_nav.models.MARL.switcher.switcher_net import (
     GroupSwitcher,
     GroupSwitcherWithBaseline,
 )
+from robot_nav.models.MARL.switcher.switcher_ppo import (
+    SwitcherActorCritic,
+    SwitcherPPO,
+    SwitcherRolloutBuffer,
+)
+from robot_nav.models.MARL.switcher.switcher_env import SwitcherEnv
 from robot_nav.models.MARL.switcher.rank_losses import (
     pairwise_logistic_ranking_loss,
     hinge_ranking_loss,
@@ -47,12 +58,21 @@ from robot_nav.models.MARL.switcher.group_generator import (
 )
 
 __all__ = [
-    # Feature builder
+    # Feature builders
     "GroupFeatureBuilder",
     "compute_attention_stats_vectorized",
+    "RLFeatureBuilder",
+    "GROUP_SCALAR_DIM",
+    "STATE_SCALAR_DIM",
     # Switcher networks
     "GroupSwitcher",
     "GroupSwitcherWithBaseline",
+    # PPO switcher
+    "SwitcherActorCritic",
+    "SwitcherPPO",
+    "SwitcherRolloutBuffer",
+    # Switcher environment
+    "SwitcherEnv",
     # Ranking losses
     "pairwise_logistic_ranking_loss",
     "hinge_ranking_loss",

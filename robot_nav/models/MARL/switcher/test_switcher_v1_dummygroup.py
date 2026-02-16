@@ -501,9 +501,9 @@ class SwitcherGroupSelector:
         
         batch_size = robot_tensor.shape[0]
         n_robots = robot_tensor.shape[1]
-        embed_dim_2 = H.shape[-1]
+        embed_dim = H.shape[-1]
         
-        h = H.view(batch_size, n_robots, embed_dim_2).squeeze(0)
+        h = H.view(batch_size, n_robots, embed_dim).squeeze(0)
         attn_rr = hard_weights_rr.squeeze(0)
         attn_ro = hard_weights_ro.squeeze(0)
         
