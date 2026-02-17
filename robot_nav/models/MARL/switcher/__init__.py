@@ -22,7 +22,9 @@ Training:
 
 from robot_nav.models.MARL.switcher.feature_builder import (
     GroupFeatureBuilder,
-    compute_attention_stats_vectorized,
+    DEFAULT_EXTRA_GROUP,
+    DEFAULT_EXTRA_GLOBAL,
+    _BASE_SCALAR_DIM,
 )
 from robot_nav.models.MARL.switcher.rl_feature_builder import (
     RLFeatureBuilder,
@@ -60,7 +62,9 @@ from robot_nav.models.MARL.switcher.group_generator import (
 __all__ = [
     # Feature builders
     "GroupFeatureBuilder",
-    "compute_attention_stats_vectorized",
+    "DEFAULT_EXTRA_GROUP",
+    "DEFAULT_EXTRA_GLOBAL",
+    "_BASE_SCALAR_DIM",
     "RLFeatureBuilder",
     "GROUP_SCALAR_DIM",
     "STATE_SCALAR_DIM",

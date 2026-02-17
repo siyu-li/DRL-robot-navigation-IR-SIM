@@ -61,7 +61,7 @@ from robot_nav.models.MARL.switcher.group_generator import (
 # =============================================================================
 CONFIG = {
     # Output configuration
-    "output_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_couple_group.pt",
+    "output_path": "robot_nav/models/MARL/switcher/data/new/oracle_data_14robots_decouple_couple_group_len1200_urgency.pt",
 
     # Data collection settings
     "n_samples": 8000,              # Number of samples to collect
@@ -101,21 +101,31 @@ CONFIG = {
     "world_file": "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
     "disable_plotting": True,
     "obstacle_proximity_threshold": 1.5,
-    "max_steps_per_episode": 1000,   # Reset episode after this many steps
+    "max_steps_per_episode": 1200,   # Reset episode after this many steps
     
     # Goal reach threshold (matches world yaml goal_threshold)
     "goal_reach_threshold": 0.3,
     
     # Scoring weights
     "k_reach": 50.0,               # New-reach bonus weight
-    "k_progress": 3.0,             # Progress reward weight
-    "k_sync": 8.0,                 # Synchronization reward weight
+    "k_progress": 3.0,             # Progress reward weight (translational)
+    "k_rotation_progress": 2.0,    # Rotation progress reward weight
+    "k_sync": 3.0,                 # Synchronization reward weight (only active when ≥1 robot reached)
+    "k_urgency": 15.0,             # Urgency bonus weight for moving stuck robots
+    
+    # Stuckness detection thresholds
+    "min_displacement_threshold": 0.2,      # Minimum translational displacement to avoid stuckness penalty
+    "min_rotation_threshold": 0.1,          # Minimum average rotation (rad) to avoid stuckness penalty
+    
+    # Urgency tracking (for stuck robot detection)
+    "urgency_lookback_window": 20,          # Number of recent oracle selections to track per robot
+    "urgency_stuck_threshold": 0.3,         # If robot moved < this distance over lookback window, it's stuck
     
     # Phase 2 group selection strategy:
     #   "random"  — uniformly random group (original behavior)
-    #   "top_k"   — randomly sample from the top-k scoring groups (from Phase 1 oracle scores)
-    "phase2_selection": "top_k",
-    "phase2_top_k": 10,             # Number of top groups to sample from when using "top_k"
+    #   "softmax" — sample from all groups weighted by softmax of oracle scores
+    "phase2_selection": "softmax",
+    "phase2_temperature": 1.0,     # Softmax temperature: ~0 = always pick max, higher = more uniform
 }
 
 
@@ -663,6 +673,7 @@ class OracleDataCollector:
         initial_poses: List[List[float]],
         final_poses: List[List[float]],
         min_displacement_threshold: float = 0.2,
+        min_rotation_threshold: float = 0.1,
         had_new_reach: bool = False,
         reached: Optional[List[bool]] = None,
     ) -> float:
@@ -672,11 +683,16 @@ class OracleDataCollector:
         This discourages the switcher from selecting groups that don't make progress.
         Skips already-reached robots (they may orbit near goal, that's OK).
         
+        A group is NOT stuck if either:
+        - Average translational displacement >= min_displacement_threshold, OR
+        - Average rotation >= min_rotation_threshold (rotating towards goal is progress)
+        
         Args:
             group: Robot indices in the group
             initial_poses: Per-robot poses at start [[x, y, theta], ...]
             final_poses: Per-robot poses at end [[x, y, theta], ...]
             min_displacement_threshold: Minimum expected displacement over horizon
+            min_rotation_threshold: Minimum expected rotation (rad) over horizon
             had_new_reach: If True, don't penalize (a robot newly reached goal)
             reached: Per-robot reached flags (skip already-reached robots)
             
@@ -701,17 +717,32 @@ class OracleDataCollector:
         
         # Compute average displacement of unreached robots in the group
         total_displacement = 0.0
+        total_rotation = 0.0
         for i in unreached_in_group:
-            xi_init, yi_init, _ = initial_poses[i]
-            xi_final, yi_final, _ = final_poses[i]
+            xi_init, yi_init, theta_init = initial_poses[i]
+            xi_final, yi_final, theta_final = final_poses[i]
+            
+            # Translational displacement
             displacement = np.sqrt((xi_final - xi_init)**2 + (yi_final - yi_init)**2)
             total_displacement += displacement
+            
+            # Rotational displacement (absolute angle change)
+            angle_diff = np.abs(theta_final - theta_init)
+            # Normalize to [0, pi] (we care about magnitude of rotation, not direction)
+            angle_diff = min(angle_diff, 2*np.pi - angle_diff)
+            total_rotation += angle_diff
         
         avg_displacement = total_displacement / len(unreached_in_group)
+        avg_rotation = total_rotation / len(unreached_in_group)
         
-        # Penalize if below threshold
-        if avg_displacement < min_displacement_threshold:
-            return -k_stuck * (min_displacement_threshold - avg_displacement)
+        # Group is NOT stuck if EITHER translational OR rotational movement is sufficient
+        is_stuck = (avg_displacement < min_displacement_threshold) and (avg_rotation < min_rotation_threshold)
+        
+        # Penalize if stuck (both displacement AND rotation below threshold)
+        # Penalty is based ONLY on displacement deficit, rotation is only used to determine if stuck
+        if is_stuck:
+            displacement_deficit = max(0, min_displacement_threshold - avg_displacement)
+            return -k_stuck * displacement_deficit
         
         return 0.0
     
@@ -728,9 +759,11 @@ class OracleDataCollector:
         n_new_reached: int,
         n_already_reached_before: int,
         reached_before_rollout: List[bool],
+        goal_positions: List[List[float]],
         robot_proximity_threshold: float = 1.5,
         obstacle_proximity_threshold: float = 1.5,
         min_displacement_threshold: float = 0.2,
+        urgency_flags: Optional[List[bool]] = None,
     ) -> float:
         """
         Compute trajectory-based score for an oracle rollout.
@@ -742,10 +775,15 @@ class OracleDataCollector:
            (more valuable when fewer robots remain unreached)
         3. Progress reward: Laggard-weighted — robots farther from goal get
            more reward per meter of progress. Already-reached robots excluded.
-        4. Synchronization reward: Reduces variance of dist_to_goal across
-           ALL robots — encourages balanced progress.
-        5. Evasion reward: Unchanged from original.
-        6. Stuckness penalty: Unchanged, but skips already-reached robots.
+        4. Rotation progress reward: Reward for aligning heading with goal direction.
+        5. Urgency bonus: Extra reward for SINGLE-ROBOT groups (size 1) that move
+           stuck robots. Only applies when the robot has been stuck for a long time
+           (haven't made progress in recent oracle selections). Multi-robot groups
+           don't get this bonus as they dilute the targeted help.
+        6. Synchronization reward: Reduces variance of dist_to_goal across
+           ALL robots — only active when ≥1 robot has reached goal.
+        7. Evasion reward: Unchanged from original.
+        8. Stuckness penalty: Unchanged, but skips already-reached robots.
         
         Args:
             group: Robot indices in the group
@@ -762,6 +800,7 @@ class OracleDataCollector:
             robot_proximity_threshold: Threshold for evasion reward (robots)
             obstacle_proximity_threshold: Threshold for evasion reward (obstacles)
             min_displacement_threshold: Minimum displacement to avoid stuckness penalty
+            urgency_flags: Per-robot urgency flags (True = robot has been stuck for a while)
             
         Returns:
             score: Trajectory score (higher = better)
@@ -770,12 +809,18 @@ class OracleDataCollector:
         k_reach = CONFIG.get("k_reach", 50.0)
         k_progress = CONFIG.get("k_progress", 3.0)
         k_sync = CONFIG.get("k_sync", 8.0)
+        k_urgency = CONFIG.get("k_urgency", 15.0)
         
         # 1. Collision penalty
         if had_collision:
             return -50.0
-        
-        score = 0.0
+
+        # Extra score for coupled group (size > 3)
+        # Only give bonus if NO robots in the group have already reached
+        # (coupling doesn't make sense if some robots are already at goal)
+        any_in_group_reached = any(reached_before_rollout[i] for i in group)
+        coupled_group_score = 5.0 if (len(group) > 3 and not any_in_group_reached) else 0.0
+        score = coupled_group_score
         
         # 2. New-reach bonus: k_reach / n_remaining per newly reached robot
         # The fewer robots remaining, the more valuable each new reach is.
@@ -789,7 +834,7 @@ class OracleDataCollector:
                     if remaining_at_time > 0:
                         score += k_reach / remaining_at_time
         
-        # 3. Laggard-weighted progress reward
+        # 3. Laggard-weighted progress reward (translational)
         # Only for unreached robots. Weight = dist[i] / mean_dist (farther = more reward)
         unreached_indices = [
             i for i in range(N) if not reached_before_rollout[i]
@@ -808,19 +853,85 @@ class OracleDataCollector:
                 progress_reward += k_progress * progress * laggard_weight
             score += progress_reward
         
-        # 4. Synchronization reward: var(dist_to_goal) reduction across ALL robots
-        # Use ALL robots (reached robots have dist ≈ 0, naturally "synchronized").
-        # If we used only unreached robots, moving one robot toward goal would
-        # increase variance among the unreached subset, penalizing good progress.
-        if N >= 2:
+        # 3b. Rotation progress reward: rotating towards goal is also progress
+        k_rotation_progress = CONFIG.get("k_rotation_progress", 2.0)
+        rotation_progress_reward = 0.0
+        for i in group:
+            if reached_before_rollout[i]:
+                continue
+            
+            xi_init, yi_init, theta_init = initial_poses[i]
+            xi_final, yi_final, theta_final = final_poses[i]
+            
+            # Get goal positions for robot i
+            goal_x, goal_y = goal_positions[i]
+            
+            # Compute heading error at initial and final states
+            # Heading error = angle between robot heading and direction to goal
+            dx_init = goal_x - xi_init
+            dy_init = goal_y - yi_init
+            angle_to_goal_init = np.arctan2(dy_init, dx_init)
+            heading_error_init = np.abs(theta_init - angle_to_goal_init)
+            # Normalize to [0, pi]
+            heading_error_init = min(heading_error_init, 2*np.pi - heading_error_init)
+            
+            dx_final = goal_x - xi_final
+            dy_final = goal_y - yi_final
+            angle_to_goal_final = np.arctan2(dy_final, dx_final)
+            heading_error_final = np.abs(theta_final - angle_to_goal_final)
+            # Normalize to [0, pi]
+            heading_error_final = min(heading_error_final, 2*np.pi - heading_error_final)
+            
+            # Reward for reducing heading error (aligning with goal direction)
+            heading_improvement = heading_error_init - heading_error_final
+            rotation_progress_reward += k_rotation_progress * heading_improvement
+        
+        score += rotation_progress_reward
+        
+        # 4. Urgency bonus: reward SINGLE-ROBOT groups that move stuck robots
+        # Only size-1 groups get this bonus - they're specifically helping that robot.
+        # Multi-robot groups dilute the help and shouldn't get urgency bonus.
+        # NOTE: Batch version doesn't track urgency flags, so this is always 0
+        # If urgency tracking is needed, it must be added to the data collection loop
+        urgency_bonus = 0.0
+        if urgency_flags is not None and len(group) == 1:
+            robot_idx = group[0]
+            if not reached_before_rollout[robot_idx] and urgency_flags[robot_idx]:
+                # This single-robot group is moving a stuck robot
+                # Reward based on displacement (movement) rather than just goal progress
+                # A stuck robot needs to get unstuck first, even if it means moving
+                # away from goal temporarily
+                xi_init, yi_init, _ = initial_poses[robot_idx]
+                xi_final, yi_final, _ = final_poses[robot_idx]
+                displacement = np.sqrt((xi_final - xi_init)**2 + (yi_final - yi_init)**2)
+                
+                # Also consider goal progress (if moving toward goal, that's even better)
+                progress = initial_distances[robot_idx] - final_distances[robot_idx]
+                
+                # Give bonus for displacement (getting unstuck), with extra bonus if
+                # also making goal progress
+                if displacement > 0.01:  # Small threshold to filter noise
+                    urgency_bonus = k_urgency * displacement
+                    # Extra bonus if progress is positive (moving toward goal)
+                    if progress > 0:
+                        urgency_bonus += k_urgency * progress * 0.5
+        score += urgency_bonus
+        
+        # 5. Synchronization reward
+        # Only activate when at least one robot has reached goal.
+        # At the beginning when all robots just start, synchronization doesn't make sense.
+        # Once some robots reach, we want to encourage others to catch up (reduce variance).
+        sync_reward = 0.0
+        any_robot_reached = any(reached_before_rollout)
+        if N >= 2 and any_robot_reached:
             initial_all_dists = np.array(initial_distances)
             final_all_dists = np.array(final_distances)
             var_before = np.var(initial_all_dists)
             var_after = np.var(final_all_dists)
             sync_reward = k_sync * (var_before - var_after)
-            score += sync_reward
+        score += sync_reward
         
-        # 5. Evasion reward: reward for rotating/moving away from nearby entities
+        # 6. Evasion reward: reward for rotating/moving away from nearby entities
         evasion_reward, _ = self.compute_evasion_reward(
             group=group,
             initial_poses=initial_poses,
@@ -834,11 +945,13 @@ class OracleDataCollector:
         score += evasion_reward
         
         # 6. Stuckness penalty: penalize groups with very low displacement
+        min_rotation_threshold = CONFIG.get("min_rotation_threshold", 0.1)
         stuckness_penalty = self.compute_stuckness_penalty(
             group=group,
             initial_poses=initial_poses,
             final_poses=final_poses,
             min_displacement_threshold=min_displacement_threshold,
+            min_rotation_threshold=min_rotation_threshold,
             had_new_reach=(n_new_reached > 0),
             reached=reached_before_rollout,
         )
@@ -884,6 +997,7 @@ class OracleDataCollector:
         obstacle_states: np.ndarray,
         snapshot: SimulationSnapshot,
         reached: Optional[List[bool]] = None,
+        urgency_flags: Optional[List[bool]] = None,
     ) -> List[float]:
         """
         Evaluate ALL groups using batched GPU inference.
@@ -902,6 +1016,7 @@ class OracleDataCollector:
                 Current environment state (shared starting point for all groups).
             snapshot: Simulation snapshot to restore after each group's rollout step.
             reached: Episode-level sticky reached flags per robot (None = all False).
+            urgency_flags: Per-robot urgency flags (stuck robots).
             
         Returns:
             scores: List of float scores, one per group, in self.groups order.
@@ -1039,9 +1154,11 @@ class OracleDataCollector:
                 n_new_reached=gs["n_new_reached"],
                 n_already_reached_before=n_already_reached,
                 reached_before_rollout=reached_before,
+                goal_positions=goal_positions,
                 robot_proximity_threshold=1.5,
                 obstacle_proximity_threshold=self.sim.obstacle_proximity_threshold,
                 min_displacement_threshold=0.2,
+                urgency_flags=urgency_flags,
             )
             scores.append(trajectory_score)
         
@@ -1064,6 +1181,7 @@ class OracleDataCollector:
         snapshot: SimulationSnapshot,
         precomputed_raw_actions: Optional[np.ndarray] = None,
         reached: Optional[List[bool]] = None,
+        urgency_flags: Optional[List[bool]] = None,
     ) -> float:
         """
         Evaluate a single group (fallback, used when n_rollouts_per_group > 1).
@@ -1078,6 +1196,7 @@ class OracleDataCollector:
             snapshot: Simulation snapshot to restore after each rollout.
             precomputed_raw_actions: Optional pre-computed raw actions for step 0.
             reached: Episode-level sticky reached flags per robot.
+            urgency_flags: Per-robot urgency flags (stuck robots).
             
         Returns:
             score: Average cumulative reward across rollouts (higher = better)
@@ -1156,9 +1275,11 @@ class OracleDataCollector:
                 n_new_reached=n_new_reached,
                 n_already_reached_before=n_already_reached,
                 reached_before_rollout=reached_before,
+                goal_positions=goal_positions,
                 robot_proximity_threshold=1.5,
                 obstacle_proximity_threshold=self.sim.obstacle_proximity_threshold,
                 min_displacement_threshold=0.2,
+                urgency_flags=urgency_flags,
             )
             
             snapshot.restore_to_sim(self.sim)
@@ -1224,24 +1345,45 @@ class OracleDataCollector:
         distance: List[float],
         goal_positions: List[List[float]],
         reached: Optional[List[bool]] = None,
+        urgency_flags: Optional[List[bool]] = None,
         step_in_episode: int = 0,
         max_steps: int = 400,
     ) -> Dict[str, torch.Tensor]:
         """
-        Get extra per-robot features from environment state.
+        Get extra features from environment state for GroupFeatureBuilder.
+        
+        Returns two kinds of tensors:
+        
+        Per-robot tensors (shape ``(N,)``) — GroupFeatureBuilder aggregates
+        these over the robots *in each group*:
+          - ``dist_to_goal``   → mean → mean_dist_goal_g   (feat 6)
+          -                    → min  → min_dist_goal_g    (feat 7)
+          - ``clearance``      → min  → min_clearance_g    (feat 8)
+          - ``reached``        → mean → frac_reached_g     (feat 9)
+          - ``heading_error``  → mean → mean_heading_err_g (feat 10)
+          - ``urgency``        → mean → frac_urgent_g      (feat 11)
+        
+        Global scalars (shape ``(1,)``) — GroupFeatureBuilder broadcasts
+        the same value to every group:
+          - ``var_dist_goal_global``  — distance variance  (feat 12)
+          - ``frac_reached_global``   — completion fraction (feat 13)
+          - ``steps_elapsed_frac``    — time pressure       (feat 14)
         
         Args:
             poses: Per-robot poses [[x, y, theta], ...]
             distance: Per-robot distances to goal
             goal_positions: Per-robot goals [[gx, gy], ...]
             reached: Per-robot sticky reached flags
+            urgency_flags: Per-robot urgency flags (stuck robots)
             step_in_episode: Current step in the episode
             max_steps: Maximum steps per episode
             
         Returns:
-            extra: Dict with per-robot feature tensors.
+            extra: Dict with per-robot and global feature tensors.
         """
         N = self.num_robots
+        
+        # ── Per-robot tensors (N,) ──
         
         # Distance to goal
         dist_to_goal = torch.tensor(distance, dtype=torch.float32)
@@ -1253,42 +1395,60 @@ class OracleDataCollector:
             clearances.append(min_clearance)
         clearance = torch.tensor(clearances, dtype=torch.float32)
         
-        # Reached flags (broadcast per robot)
+        # Reached flags (0.0 / 1.0)
         if reached is None:
             reached = [False] * N
         reached_float = torch.tensor(
             [1.0 if r else 0.0 for r in reached], dtype=torch.float32
         )
         
-        # Fraction of all robots that have reached (same value for all robots,
-        # broadcast to per-robot tensor so GroupFeatureBuilder can aggregate)
-        frac_reached_global_val = sum(reached) / N
-        frac_reached_global = torch.full((N,), frac_reached_global_val, dtype=torch.float32)
+        # Heading error: |heading − goal_direction| in radians
+        heading_errors = []
+        for i in range(N):
+            x, y, theta = poses[i][0], poses[i][1], poses[i][2]
+            gx, gy = goal_positions[i][0], goal_positions[i][1]
+            goal_dir = np.arctan2(gy - y, gx - x)
+            diff = goal_dir - theta
+            diff = (diff + np.pi) % (2 * np.pi) - np.pi
+            heading_errors.append(abs(diff))
+        heading_error = torch.tensor(heading_errors, dtype=torch.float32)
         
-        # Max dist_to_goal (per-robot tensor, same value for all — the max across all robots)
-        # This gives context about the worst-case robot
-        max_dist_val = max(distance) if distance else 0.0
-        max_dist_to_goal = torch.full((N,), max_dist_val, dtype=torch.float32)
+        # Urgency flags (per-robot binary indicator for stuck robots)
+        if urgency_flags is None:
+            urgency_flags = [False] * N
+        urgency_float = torch.tensor(
+            [1.0 if u else 0.0 for u in urgency_flags], dtype=torch.float32
+        )
         
-        # Variance of dist_to_goal across unreached robots
+        # ── Global scalars (1,) ──
+        
+        # Variance of dist_to_goal across all robots (sync signal)
         unreached_dists = [distance[i] for i in range(N) if not reached[i]]
         if len(unreached_dists) >= 2:
             var_dist_val = float(np.var(unreached_dists))
         else:
             var_dist_val = 0.0
-        var_dist_to_goal = torch.full((N,), var_dist_val, dtype=torch.float32)
+        var_dist_goal_global = torch.tensor([var_dist_val], dtype=torch.float32)
         
-        # Steps elapsed fraction (same for all robots)
+        # Fraction of all robots that have reached
+        frac_reached_global = torch.tensor(
+            [sum(reached) / N], dtype=torch.float32
+        )
+        
+        # Steps elapsed fraction
         steps_frac = step_in_episode / max(max_steps, 1)
-        steps_elapsed_frac = torch.full((N,), steps_frac, dtype=torch.float32)
+        steps_elapsed_frac = torch.tensor([steps_frac], dtype=torch.float32)
         
         return {
+            # Per-robot (N,)
             "dist_to_goal": dist_to_goal,
             "clearance": clearance,
             "reached": reached_float,
+            "heading_error": heading_error,
+            "urgency": urgency_float,
+            # Global (1,)
+            "var_dist_goal_global": var_dist_goal_global,
             "frac_reached_global": frac_reached_global,
-            "max_dist_to_goal": max_dist_to_goal,
-            "var_dist_to_goal": var_dist_to_goal,
             "steps_elapsed_frac": steps_elapsed_frac,
         }
     
@@ -1304,6 +1464,7 @@ class OracleDataCollector:
         obstacle_states: np.ndarray,
         scenario_id: Optional[int] = None,
         reached: Optional[List[bool]] = None,
+        urgency_flags: Optional[List[bool]] = None,
         step_in_episode: int = 0,
         max_steps: int = 400,
     ) -> Dict:
@@ -1321,6 +1482,7 @@ class OracleDataCollector:
                 Current environment state from sim.step() or sim.reset()
             scenario_id: Optional identifier for this sample
             reached: Episode-level sticky reached flags per robot
+            urgency_flags: Per-robot urgency flags (stuck robots)
             step_in_episode: Current step in the episode
             max_steps: Maximum steps per episode
             
@@ -1339,10 +1501,11 @@ class OracleDataCollector:
         # === GPU CALL: Get embeddings and attention (1 forward pass) ===
         h, attn_rr, attn_ro = self._get_embeddings_and_attention(robot_obs, obstacle_states)
         
-        # Get extra features (CPU, fast) — now includes reached, sync features
+        # Get extra features (CPU, fast) — now includes reached, sync features, urgency
         extra = self._get_extra_features(
             poses, distance, goal_positions,
             reached=reached,
+            urgency_flags=urgency_flags,
             step_in_episode=step_in_episode,
             max_steps=max_steps,
         )
@@ -1354,6 +1517,7 @@ class OracleDataCollector:
                 poses, distance, cos, sin, collision, action,
                 goal_positions, obstacle_states, snapshot,
                 reached=reached,
+                urgency_flags=urgency_flags,
             )
         else:
             # Fallback: sequential per-group evaluation with multiple rollouts
@@ -1365,6 +1529,7 @@ class OracleDataCollector:
                     goal_positions, obstacle_states, snapshot,
                     precomputed_raw_actions=precomputed_raw_actions,
                     reached=reached,
+                    urgency_flags=urgency_flags,
                 )
                 group_scores_list.append(score)
         
@@ -1425,6 +1590,12 @@ class OracleDataCollector:
         # Episode-level sticky reached flags
         reached = [False] * N
         
+        # Urgency tracking: maintain a sliding window of recent distances per robot
+        urgency_lookback = CONFIG.get("urgency_lookback_window", 20)
+        urgency_stuck_threshold = CONFIG.get("urgency_stuck_threshold", 0.3)
+        robot_distance_history = [[] for _ in range(N)]  # List of lists: per-robot distance history
+        urgency_flags = [False] * N  # Current urgency flags
+        
         # Statistics
         t_start = time.time()
         gpu_calls = 0
@@ -1436,14 +1607,40 @@ class OracleDataCollector:
         total_oracle_groups_evaluated = 0  # Total group rollouts across all samples
         total_oracle_collisions = 0  # Group rollouts that ended in collision (score == -50)
         
+        # Phase 2 group selection tracking
+        phase2_group_counts = {i: 0 for i in range(len(self.groups))}
+        
         for i in pbar:
-            # Collect sample at current state (pass reached state)
+            # Update urgency tracking: check if robots have been stuck
+            # Add current distances to history for unreached robots ONLY
+            for robot_idx in range(N):
+                if not reached[robot_idx]:
+                    robot_distance_history[robot_idx].append(distance[robot_idx])
+                    # Keep only recent lookback_window samples
+                    if len(robot_distance_history[robot_idx]) > urgency_lookback:
+                        robot_distance_history[robot_idx].pop(0)
+                    
+                    # Compute urgency: if robot has full history and made little progress
+                    if len(robot_distance_history[robot_idx]) >= urgency_lookback:
+                        oldest_dist = robot_distance_history[robot_idx][0]
+                        current_dist = robot_distance_history[robot_idx][-1]
+                        progress_over_window = oldest_dist - current_dist
+                        urgency_flags[robot_idx] = (progress_over_window < urgency_stuck_threshold)
+                    else:
+                        urgency_flags[robot_idx] = False
+                else:
+                    # Robot has reached goal - clear urgency tracking
+                    urgency_flags[robot_idx] = False
+                    # Clear distance history to prevent stale data if robot un-reaches somehow
+                    robot_distance_history[robot_idx] = []
+            
+            # Collect sample at current state (pass reached state and urgency flags)
             sample = self.collect_sample(
                 poses, distance, cos, sin, collision, action,
                 goal_positions, obstacle_states,
                 scenario_id=i,
                 reached=reached,
-                step_in_episode=step_in_episode,
+                urgency_flags=urgency_flags,
                 max_steps=max_steps,
             )
             samples.append(sample)
@@ -1460,22 +1657,26 @@ class OracleDataCollector:
             #          meaningfully different configuration for next sample.
             #
             #   Selection strategies:
-            #     "random" — uniform random from all groups
-            #     "top_k"  — random sample from the top-k oracle-scored groups
+            #     "random"  — uniform random from all groups
+            #     "softmax" — sample weighted by softmax of oracle scores
             # =================================================================
             phase2_mode = CONFIG.get("phase2_selection", "random")
-            phase2_top_k = CONFIG.get("phase2_top_k", 5)
+            phase2_temperature = CONFIG.get("phase2_temperature", 1.0)
             
-            if phase2_mode == "top_k":
-                # Use Phase 1 oracle scores to pick from top-k groups
+            if phase2_mode == "softmax":
+                # Softmax-weighted sampling: higher scores → higher probability
                 scores = sample["group_scores"]  # Tensor[n_groups]
-                k = min(phase2_top_k, len(self.groups))
-                _, top_indices = torch.topk(scores, k)
-                chosen_idx = top_indices[random.randint(0, k - 1)].item()
+                logits = scores / phase2_temperature
+                probs = torch.softmax(logits, dim=0)
+                chosen_idx = torch.multinomial(probs, num_samples=1).item()
                 selected_group = self.groups[chosen_idx]
             else:
                 # Original: uniform random
-                selected_group = random.choice(self.groups)
+                chosen_idx = random.randint(0, len(self.groups) - 1)
+                selected_group = self.groups[chosen_idx]
+            
+            # Track Phase 2 group selection
+            phase2_group_counts[chosen_idx] += 1
             
             phase2_horizon = self.horizon  # Same as oracle horizon (e.g. 10)
             
@@ -1541,6 +1742,9 @@ class OracleDataCollector:
                 ) = self.sim.reset(random_obstacles=True)
                 step_in_episode = 0
                 reached = [False] * N  # Reset all reached flags
+                # Reset urgency tracking
+                robot_distance_history = [[] for _ in range(N)]
+                urgency_flags = [False] * N
             
             # Progress reporting
             if verbose and isinstance(pbar, tqdm):
@@ -1585,6 +1789,21 @@ class OracleDataCollector:
                   f"({oracle_collision_rate*100:.1f}%)")
             print(f"  Non-collision rollouts (success): {total_oracle_groups_evaluated - total_oracle_collisions} "
                   f"({oracle_success_rate*100:.1f}%)")
+            
+            # Phase 2 group selection statistics
+            print(f"\n--- Phase 2 Group Selection Statistics ---")
+            print(f"Phase 2 selection mode: {phase2_mode}")
+            if phase2_mode == "softmax":
+                print(f"Temperature: {phase2_temperature}")
+            print(f"Total Phase 2 selections: {n_samples}")
+            print(f"\nGroup selection breakdown:")
+            print(f"{'Group':<8} {'Robots':<20} {'Count':<10} {'Percentage':<10}")
+            print("-" * 50)
+            for group_idx in sorted(phase2_group_counts.keys()):
+                count = phase2_group_counts[group_idx]
+                percentage = (count / n_samples * 100) if n_samples > 0 else 0
+                robots_str = str(self.groups[group_idx])
+                print(f"{group_idx:<8} {robots_str:<20} {count:<10} {percentage:>6.2f}%")
         
         data = {
             "samples": samples,
@@ -1598,11 +1817,15 @@ class OracleDataCollector:
                 "horizon": self.horizon,
                 "n_rollouts_per_group": self.n_rollouts_per_group,
                 "collection_method": "simulation_rollout_batch_allreach",
-                "scoring": "sync_newreach_laggard",
+                "scoring": "sync_newreach_laggard_urgency",
                 "use_rotation_coupling": CONFIG.get("use_rotation_coupling", True),
                 "k_reach": CONFIG.get("k_reach", 50.0),
                 "k_progress": CONFIG.get("k_progress", 3.0),
+                "k_rotation_progress": CONFIG.get("k_rotation_progress", 2.0),
+                "k_urgency": CONFIG.get("k_urgency", 15.0),
                 "k_sync": CONFIG.get("k_sync", 8.0),
+                "urgency_lookback_window": CONFIG.get("urgency_lookback_window", 20),
+                "urgency_stuck_threshold": CONFIG.get("urgency_stuck_threshold", 0.3),
                 "goal_reach_threshold": goal_threshold,
                 "max_steps_per_episode": max_steps,
                 "episodes_total": episode_count,
@@ -1614,8 +1837,9 @@ class OracleDataCollector:
                 "oracle_collision_rollouts": total_oracle_collisions,
                 "extra_features": [
                     "dist_to_goal", "clearance", "reached",
-                    "frac_reached_global", "max_dist_to_goal",
-                    "var_dist_to_goal", "steps_elapsed_frac",
+                    "heading_error", "urgency",
+                    "var_dist_goal_global", "frac_reached_global",
+                    "steps_elapsed_frac",
                 ],
                 "timestamp": datetime.now().isoformat(),
             },
@@ -1651,9 +1875,12 @@ def main():
     print(f"Oracle horizon: {config['oracle_horizon']} steps")
     print(f"Rollouts per group: {config['n_rollouts_per_group']}")
     print(f"Goal reach threshold: {config.get('goal_reach_threshold', 0.3)}")
-    print(f"Scoring: new-reach bonus (k={config.get('k_reach', 50.0)}), "
-          f"sync reward (k={config.get('k_sync', 8.0)}), "
-          f"laggard progress (k={config.get('k_progress', 3.0)})")
+    print(f"Scoring components:")
+    print(f"  - New-reach bonus: k={config.get('k_reach', 50.0)}")
+    print(f"  - Laggard progress: k={config.get('k_progress', 3.0)}")
+    print(f"  - Rotation progress: k={config.get('k_rotation_progress', 2.0)}")
+    print(f"  - Urgency bonus: k={config.get('k_urgency', 15.0)}")
+    print(f"  - Sync reward: k={config.get('k_sync', 3.0)} (only when ≥1 robot reached)")
     print(f"Episode reset: ALL robots reached OR max {config['max_steps_per_episode']} steps")
     # Group size info
     sizes_included = []
@@ -1668,11 +1895,10 @@ def main():
     else:
         print(f"Rotation coupling: OFF (all groups use individual angular vel)")
     phase2_mode = config.get("phase2_selection", "random")
-    if phase2_mode == "top_k":
-        print(f"Phase 2 selection: top-{config.get('phase2_top_k', 5)} (sample from top-k oracle-scored groups)")
+    if phase2_mode == "softmax":
+        print(f"Phase 2 selection: softmax (temperature={config.get('phase2_temperature', 1.0)}, higher score → higher sample prob)")
     else:
         print(f"Phase 2 selection: random (uniform random group)")
-    print(f"Optimization: Batched GPU inference (~41x fewer forward passes)")
     print("=" * 70 + "\n")
     
     # Device
@@ -1761,14 +1987,21 @@ def main():
     print(f"  samples[i]['attn_rr']: Tensor[{n_robots}, {n_robots}]")
     print(f"  samples[i]['attn_ro']: Tensor[{n_robots}, N_obs]")
     print(f"  samples[i]['extra']:")
-    print(f"    'dist_to_goal': Tensor[{n_robots}]")
-    print(f"    'clearance': Tensor[{n_robots}]")
-    print(f"    'reached': Tensor[{n_robots}]  (sticky binary flag)")
-    print(f"    'frac_reached_global': Tensor[{n_robots}]  (broadcast scalar)")
-    print(f"    'max_dist_to_goal': Tensor[{n_robots}]  (broadcast scalar)")
-    print(f"    'var_dist_to_goal': Tensor[{n_robots}]  (broadcast scalar)")
-    print(f"    'steps_elapsed_frac': Tensor[{n_robots}]  (broadcast scalar)")
-    print(f"\n  Scoring: new-reach bonus + laggard-weighted progress + sync reward")
+    print(f"    Per-robot (N,):")
+    print(f"      'dist_to_goal': Tensor[{n_robots}]  (per-robot distance to goal)")
+    print(f"      'clearance': Tensor[{n_robots}]  (per-robot min obstacle clearance)")
+    print(f"      'reached': Tensor[{n_robots}]  (per-robot sticky binary flag)")
+    print(f"      'heading_error': Tensor[{n_robots}]  (per-robot |heading - goal_dir|)")
+    print(f"    Global scalars (1,):")
+    print(f"      'var_dist_goal_global': Tensor[1]  (distance variance across all robots)")
+    print(f"      'frac_reached_global': Tensor[1]  (global completion fraction)")
+    print(f"      'steps_elapsed_frac': Tensor[1]  (time pressure)")
+    print(f"\n  13 per-group scalars (via GroupFeatureBuilder):")
+    print(f"    Per-group: size_feat, coupling_mode, A_in, A_out, A_obs,")
+    print(f"               mean_dist_goal_g, min_dist_goal_g, min_clearance_g,")
+    print(f"               frac_reached_g, mean_heading_err_g")
+    print(f"    Global:    var_dist_goal_global, frac_reached_global, steps_elapsed_frac")
+    print(f"\n  Scoring: new-reach bonus + laggard progress + rotation progress + urgency bonus (N/A) + sync reward (conditional)")
     print(f"  Episode reset: all robots reached OR max {config['max_steps_per_episode']} steps")
     print(f"  Episodes: {data['config'].get('episodes_total', '?')} total, "
           f"{data['config'].get('episodes_all_reached', '?')} all-reached")

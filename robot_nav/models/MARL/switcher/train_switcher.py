@@ -27,6 +27,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from robot_nav.models.MARL.switcher import (
     GroupFeatureBuilder,
+    DEFAULT_EXTRA_GROUP,
+    DEFAULT_EXTRA_GLOBAL,
     GroupSwitcher,
     GroupSwitcherWithBaseline,
     pairwise_logistic_ranking_loss,
@@ -44,16 +46,32 @@ CONFIG = {
     # Data configuration
     "data_path": "robot_nav/models/MARL/switcher/data/oracle_data.pt",
     "embed_dim": 512,              # Dimension of per-robot embeddings: Will be adjust based on data if None
-    "extra_features": [
-        "dist_to_goal", "clearance", "reached",
-        "frac_reached_global", "max_dist_to_goal",
-        "var_dist_to_goal", "steps_elapsed_frac",
+    
+    # GroupFeatureBuilder config
+    #   Features 1-5 are always on (size_feat, coupling_mode, A_in, A_out, A_obs).
+    #   extra_group: list of (extra_key, aggregation) for per-group scalars
+    #                aggregated over group members. Set to [] to disable.
+    #   extra_global: list of extra_key names for global scalars (same for
+    #                 every group). Set to [] to disable.
+    #   scalar_dim = 5 + len(extra_group) + len(extra_global)
+    "max_group_size": 7,
+    "rotation_coupling_threshold": 3,
+    "extra_group": [
+        ("dist_to_goal", "mean"),   # mean_dist_goal_g
+        ("dist_to_goal", "min"),    # min_dist_goal_g
+        ("clearance",    "min"),    # min_clearance_g
+        ("reached",      "mean"),   # frac_reached_g
+        ("heading_error","mean"),   # mean_heading_err_g
     ],
-    "extra_aggregations": ["mean", "min", "mean", "mean", "mean", "mean", "mean"],
+    "extra_global": [
+        "var_dist_goal_global",     # distance variance (sync signal)
+        "frac_reached_global",      # global completion fraction
+        "steps_elapsed_frac",       # time pressure
+    ],
     
     # Model architecture
     "embed_hidden": 256,            # Tower 1 output dimension
-    "scalar_hidden": 32,            # Tower 2 output dimension
+    "scalar_hidden": 64,            # Tower 2 output dimension
     "fusion_hidden": 256,           # Fusion layer hidden dimension
     "dropout": 0.1,
     "use_baseline": False,          # Use GroupSwitcherWithBaseline for RL training
@@ -161,15 +179,21 @@ class SwitcherDataset(Dataset):
         self,
         data_path: str,
         embed_dim: Optional[int] = None,
-        extra_feature_names: Optional[List[str]] = None,
-        extra_aggregations: Optional[List[str]] = None,
+        max_group_size: int = 7,
+        rotation_coupling_threshold: int = 3,
+        extra_group: Optional[List[Tuple[str, str]]] = None,
+        extra_global: Optional[List[str]] = None,
     ):
         """
         Args:
             data_path: Path to oracle data file (.pt)
             embed_dim: Dimension of robot embeddings. If None, inferred from data.
-            extra_feature_names: Names of extra features to include
-            extra_aggregations: Aggregation methods for extra features
+            max_group_size: Normalisation constant for size_feat.
+            rotation_coupling_threshold: Groups > this size get coupling_mode=1.
+            extra_group: Per-group extra features as ``(key, agg)`` pairs.
+                ``None`` → defaults.  ``[]`` → disabled.
+            extra_global: Global extra feature key names.
+                ``None`` → defaults.  ``[]`` → disabled.
         """
         self.data = torch.load(data_path)
         self.samples = self.data["samples"]
@@ -179,11 +203,13 @@ class SwitcherDataset(Dataset):
         if embed_dim is None:
             embed_dim = self.samples[0]["h"].shape[-1]
         
-        # Feature builder
+        # Feature builder (configurable scalar layout)
         self.feature_builder = GroupFeatureBuilder(
             embed_dim=embed_dim,
-            extra_feature_names=extra_feature_names or [],
-            extra_aggregations=extra_aggregations,
+            max_group_size=max_group_size,
+            rotation_coupling_threshold=rotation_coupling_threshold,
+            extra_group=extra_group,
+            extra_global=extra_global,
         )
         
         # Validate and preprocess
@@ -198,11 +224,18 @@ class SwitcherDataset(Dataset):
         assert "groups" in sample, "Missing 'groups'"
         assert "group_scores" in sample, "Missing 'group_scores'"
         
+        fb = self.feature_builder
         print(f"Loaded {len(self.samples)} samples")
         print(f"  Embedding dim: {sample['h'].shape[-1]}")
         print(f"  Groups per sample: {len(sample['groups'])}")
+        print(f"  Scalar dim: {fb.scalar_dim}  "
+              f"(5 base + {len(fb.extra_group)} group + {len(fb.extra_global)} global)")
+        if fb.extra_group:
+            print(f"  extra_group: {fb.extra_group}")
+        if fb.extra_global:
+            print(f"  extra_global: {fb.extra_global}")
         if "extra" in sample:
-            print(f"  Extra features: {list(sample['extra'].keys())}")
+            print(f"  Extra keys in data: {list(sample['extra'].keys())}")
     
     def __len__(self) -> int:
         return len(self.samples)
@@ -257,8 +290,8 @@ class SwitcherDataset(Dataset):
     
     @property
     def scalar_dim(self) -> int:
-        """Scalar feature dimension (size + attn + extras)."""
-        return 1 + 3 + len(self.feature_builder.extra_feature_names)
+        """Scalar feature dimension (5 base + extra_group + extra_global)."""
+        return self.feature_builder.scalar_dim
 
 
 def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -283,14 +316,10 @@ class TrainingConfig:
     # Data
     data_path: str = "oracle_data.pt"
     embed_dim: int = 512
-    extra_features: List[str] = field(default_factory=lambda: [
-        "dist_to_goal", "clearance", "reached",
-        "frac_reached_global", "max_dist_to_goal",
-        "var_dist_to_goal", "steps_elapsed_frac",
-    ])
-    extra_aggregations: List[str] = field(default_factory=lambda: [
-        "mean", "min", "mean", "mean", "mean", "mean", "mean",
-    ])
+    max_group_size: int = 7
+    rotation_coupling_threshold: int = 3
+    extra_group: Optional[List[Tuple[str, str]]] = None   # None → defaults
+    extra_global: Optional[List[str]] = None               # None → defaults
     
     # Model
     embed_hidden: int = 256
@@ -370,8 +399,10 @@ class SwitcherTrainer:
         full_dataset = SwitcherDataset(
             data_path=config.data_path,
             embed_dim=None,  # Infer from data
-            extra_feature_names=config.extra_features,
-            extra_aggregations=config.extra_aggregations,
+            max_group_size=config.max_group_size,
+            rotation_coupling_threshold=config.rotation_coupling_threshold,
+            extra_group=config.extra_group,
+            extra_global=config.extra_global,
         )
         
         # Split into train/val
@@ -672,8 +703,10 @@ def main():
     config = TrainingConfig(
         data_path=cfg["data_path"],
         embed_dim=cfg["embed_dim"],
-        extra_features=cfg["extra_features"],
-        extra_aggregations=cfg["extra_aggregations"],
+        max_group_size=cfg["max_group_size"],
+        rotation_coupling_threshold=cfg["rotation_coupling_threshold"],
+        extra_group=cfg["extra_group"],
+        extra_global=cfg["extra_global"],
         embed_hidden=cfg["embed_hidden"],
         scalar_hidden=cfg["scalar_hidden"],
         fusion_hidden=cfg["fusion_hidden"],
