@@ -324,6 +324,7 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         robot_goal=None,
         random_obstacles=False,
         random_obstacle_ids=None,
+        obstacle_states=None,
     ):
         """
         Reset the simulation environment.
@@ -333,6 +334,8 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
             robot_goal: Fixed goal position(s). If None, random goals are generated.
             random_obstacles (bool): If True, reposition obstacles randomly.
             random_obstacle_ids (list or None): IDs of obstacles to randomize.
+            obstacle_states (np.ndarray or None): Obstacle states (N_obs, 3) as [[x], [y], [theta]].
+                If provided, these exact positions are used instead of randomizing.
 
         Returns:
             tuple: (
@@ -375,7 +378,12 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
             init_states.append(pos)
             robot.set_state(state=np.array(robot_state), init=True)
 
-        if random_obstacles:
+        # Set obstacle positions - either from provided states or randomize
+        if obstacle_states is not None:
+            # Use provided obstacle states
+            for oi, obs in enumerate(self.env.obstacle_list):
+                obs.set_state(state=obstacle_states[oi], init=True)
+        elif random_obstacles:
             if random_obstacle_ids is None:
                 random_obstacle_ids = [i + self.num_robots for i in range(7)]
             self.env.random_obstacle_position(

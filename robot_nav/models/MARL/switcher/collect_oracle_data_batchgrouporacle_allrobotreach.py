@@ -61,10 +61,10 @@ from robot_nav.models.MARL.switcher.group_generator import (
 # =============================================================================
 CONFIG = {
     # Output configuration
-    "output_path": "robot_nav/models/MARL/switcher/data/new/oracle_data_14robots_decouple_couple_group_len1200_urgency.pt",
+    "output_path": "robot_nav/models/MARL/switcher/data/new/oracle_data_14robots_decouple_couple_group_len1200_urgency_success.pt",
 
     # Data collection settings
-    "n_samples": 8000,              # Number of samples to collect
+    "n_samples": 10000,              # Number of samples to collect
     "n_robots": 14,                  # Number of robots
     "n_obstacles": 7,               # Number of obstacles
     "embed_dim": 512,               # Per-robot embedding dimension from GAT backbone output (2*embedding_dim=2*256)
@@ -890,8 +890,6 @@ class OracleDataCollector:
         
         # 4. Urgency bonus: reward SINGLE-ROBOT groups that move stuck robots
         # Only size-1 groups get this bonus - they're specifically helping that robot.
-        # Multi-robot groups dilute the help and shouldn't get urgency bonus.
-        # NOTE: Batch version doesn't track urgency flags, so this is always 0
         # If urgency tracking is needed, it must be added to the data collection loop
         urgency_bonus = 0.0
         if urgency_flags is not None and len(group) == 1:
@@ -1606,6 +1604,10 @@ class OracleDataCollector:
         timeout_reset_count = 0  # Episodes reset due to max steps
         total_oracle_groups_evaluated = 0  # Total group rollouts across all samples
         total_oracle_collisions = 0  # Group rollouts that ended in collision (score == -50)
+        discarded_samples = 0  # Samples discarded from failed trajectories
+        
+        # Episode buffer: collect samples during episode, only commit if successful
+        episode_buffer = []
         
         # Phase 2 group selection tracking
         phase2_group_counts = {i: 0 for i in range(len(self.groups))}
@@ -1634,16 +1636,17 @@ class OracleDataCollector:
                     # Clear distance history to prevent stale data if robot un-reaches somehow
                     robot_distance_history[robot_idx] = []
             
-            # Collect sample at current state (pass reached state and urgency flags)
+            # Collect sample at current state (always collect, decide later whether to keep)
             sample = self.collect_sample(
                 poses, distance, cos, sin, collision, action,
                 goal_positions, obstacle_states,
-                scenario_id=i,
+                scenario_id=len(samples) + len(episode_buffer),  # Total samples that would be saved
                 reached=reached,
                 urgency_flags=urgency_flags,
+                step_in_episode=step_in_episode,
                 max_steps=max_steps,
             )
-            samples.append(sample)
+            episode_buffer.append(sample)
             gpu_calls += 1 + self.horizon  # embedding + batched steps
             
             # Track oracle rollout statistics
@@ -1677,6 +1680,7 @@ class OracleDataCollector:
             
             # Track Phase 2 group selection
             phase2_group_counts[chosen_idx] += 1
+            
             
             phase2_horizon = self.horizon  # Same as oracle horizon (e.g. 10)
             
@@ -1717,23 +1721,39 @@ class OracleDataCollector:
             
             # Check for episode reset conditions
             all_robots_reached = all(reached)
-            should_reset = (
-                any(collision) or 
-                step_in_episode >= max_steps or
-                outside_of_bounds(poses, self.sim) or
-                all_robots_reached
-            )
+            had_collision = any(collision)
+            is_oob = outside_of_bounds(poses, self.sim)
+            timeout = step_in_episode >= max_steps
+            
+            should_reset = had_collision or timeout or is_oob or all_robots_reached
             
             if should_reset:
-                if all_robots_reached:
-                    all_reached_count += 1
-                if any(collision):
-                    collision_reset_count += 1
-                if outside_of_bounds(poses, self.sim):
-                    oob_reset_count += 1
-                if step_in_episode >= max_steps and not all_robots_reached:
-                    timeout_reset_count += 1
                 episode_count += 1
+                
+                # Determine if episode was successful (only all_robots_reached counts as success)
+                episode_successful = all_robots_reached and not had_collision and not is_oob
+                
+                if episode_successful:
+                    # Success! Commit all buffered samples to the dataset
+                    all_reached_count += 1
+                    samples.extend(episode_buffer)
+                    # Update scenario IDs to be sequential
+                    for idx, sample in enumerate(episode_buffer):
+                        sample["metadata"]["scenario_id"] = len(samples) - len(episode_buffer) + idx
+                else:
+                    # Episode failed - discard all buffered samples
+                    discarded_samples += len(episode_buffer)
+                    
+                    # Track failure reasons
+                    if had_collision:
+                        collision_reset_count += 1
+                    if is_oob:
+                        oob_reset_count += 1
+                    if timeout and not all_robots_reached:
+                        timeout_reset_count += 1
+                
+                # Clear episode buffer for next episode
+                episode_buffer = []
                 
                 # Full reset: all robots get new random positions and goals
                 (
@@ -1745,27 +1765,34 @@ class OracleDataCollector:
                 # Reset urgency tracking
                 robot_distance_history = [[] for _ in range(N)]
                 urgency_flags = [False] * N
-            
-            # Progress reporting
+                
+                # Check if we've collected enough valid samples
+                if len(samples) >= n_samples:
+                    break            # Progress reporting
             if verbose and isinstance(pbar, tqdm):
                 elapsed = time.time() - t_start
-                samples_per_sec = (i + 1) / elapsed if elapsed > 0 else 0
-                eta = (n_samples - i - 1) / samples_per_sec if samples_per_sec > 0 else 0
+                samples_per_sec = len(samples) / elapsed if elapsed > 0 else 0
+                eta = (n_samples - len(samples)) / samples_per_sec if samples_per_sec > 0 else 0
                 n_reached = sum(reached)
                 pbar.set_postfix({
-                    "s/sample": f"{elapsed/(i+1):.2f}",
+                    "s/sample": f"{elapsed/max(len(samples),1):.2f}",
                     "ETA": f"{eta/60:.1f}m",
                     "ep_step": step_in_episode,
                     "reached": f"{n_reached}/{N}",
                     "ep": episode_count,
+                    "valid": len(samples),
+                    "buffer": len(episode_buffer),
+                    "discarded": discarded_samples,
                 })
         
         elapsed_total = time.time() - t_start
+        actual_samples = len(samples)
         if verbose:
-            print(f"\nCollection complete: {n_samples} samples in {elapsed_total:.1f}s "
-                  f"({elapsed_total/n_samples:.2f}s/sample)")
+            print(f"\nCollection complete: {actual_samples} valid samples in {elapsed_total:.1f}s "
+                  f"({elapsed_total/actual_samples:.2f}s/sample)")
+            print(f"Discarded samples (from failed trajectories): {discarded_samples}")
             print(f"Total GPU forward passes: {gpu_calls} "
-                  f"(avg {gpu_calls/n_samples:.0f}/sample)")
+                  f"(avg {gpu_calls/actual_samples:.0f}/sample)")
             
             # Episode-level statistics
             print(f"\n--- Episode Statistics ---")
@@ -1784,7 +1811,7 @@ class OracleDataCollector:
             oracle_success_rate = 1.0 - oracle_collision_rate
             print(f"\n--- Oracle Rollout Statistics ---")
             print(f"Total group rollouts evaluated: {total_oracle_groups_evaluated} "
-                  f"({n_samples} samples × {len(self.groups)} groups)")
+                  f"({actual_samples} samples × {len(self.groups)} groups)")
             print(f"  Collision rollouts: {total_oracle_collisions} "
                   f"({oracle_collision_rate*100:.1f}%)")
             print(f"  Non-collision rollouts (success): {total_oracle_groups_evaluated - total_oracle_collisions} "
@@ -1795,20 +1822,22 @@ class OracleDataCollector:
             print(f"Phase 2 selection mode: {phase2_mode}")
             if phase2_mode == "softmax":
                 print(f"Temperature: {phase2_temperature}")
-            print(f"Total Phase 2 selections: {n_samples}")
+            print(f"Total Phase 2 selections: {actual_samples}")
             print(f"\nGroup selection breakdown:")
             print(f"{'Group':<8} {'Robots':<20} {'Count':<10} {'Percentage':<10}")
             print("-" * 50)
             for group_idx in sorted(phase2_group_counts.keys()):
                 count = phase2_group_counts[group_idx]
-                percentage = (count / n_samples * 100) if n_samples > 0 else 0
+                percentage = (count / actual_samples * 100) if actual_samples > 0 else 0
                 robots_str = str(self.groups[group_idx])
                 print(f"{group_idx:<8} {robots_str:<20} {count:<10} {percentage:>6.2f}%")
         
         data = {
             "samples": samples,
             "config": {
-                "n_samples": n_samples,
+                "n_samples": actual_samples,
+                "n_samples_requested": n_samples,
+                "n_samples_discarded": discarded_samples,
                 "embed_dim": CONFIG["embed_dim"],
                 "n_robots": self.num_robots,
                 "n_obstacles": self.num_obstacles,

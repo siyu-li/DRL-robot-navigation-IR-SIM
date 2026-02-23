@@ -44,7 +44,7 @@ from robot_nav.models.MARL.switcher import (
 # =============================================================================
 CONFIG = {
     # Data configuration
-    "data_path": "robot_nav/models/MARL/switcher/data/oracle_data.pt",
+    "data_path": "robot_nav/models/MARL/switcher/data/new/oracle_data_14robots_decouple_couple_group_len1200_urgency_success.pt",
     "embed_dim": 512,              # Dimension of per-robot embeddings: Will be adjust based on data if None
     
     # GroupFeatureBuilder config
@@ -53,7 +53,7 @@ CONFIG = {
     #                aggregated over group members. Set to [] to disable.
     #   extra_global: list of extra_key names for global scalars (same for
     #                 every group). Set to [] to disable.
-    #   scalar_dim = 5 + len(extra_group) + len(extra_global)
+    #   scalar_dim = 5 + len(extra_group) + len(extra_global) + 1 (urgency_flag)
     "max_group_size": 7,
     "rotation_coupling_threshold": 3,
     "extra_group": [
@@ -68,6 +68,11 @@ CONFIG = {
         "frac_reached_global",      # global completion fraction
         "steps_elapsed_frac",       # time pressure
     ],
+    
+    # Urgency flag: Binary indicator for single-robot groups with urgent robots
+    #   1.0 if group size == 1 AND that robot is urgent
+    #   0.0 otherwise (all multi-robot groups OR non-urgent single robots)
+    "use_urgency_flag": True,
     
     # Model architecture
     "embed_hidden": 256,            # Tower 1 output dimension
@@ -173,6 +178,7 @@ class SwitcherDataset(Dataset):
     Each sample contains:
     - Group features (built from embeddings + attention + extras)
     - Oracle scores for ranking supervision
+    - Urgency flag (binary scalar appended to each group's features)
     """
     
     def __init__(
@@ -183,6 +189,7 @@ class SwitcherDataset(Dataset):
         rotation_coupling_threshold: int = 3,
         extra_group: Optional[List[Tuple[str, str]]] = None,
         extra_global: Optional[List[str]] = None,
+        use_urgency_flag: bool = True,
     ):
         """
         Args:
@@ -194,10 +201,12 @@ class SwitcherDataset(Dataset):
                 ``None`` → defaults.  ``[]`` → disabled.
             extra_global: Global extra feature key names.
                 ``None`` → defaults.  ``[]`` → disabled.
+            use_urgency_flag: If True, append urgency flag to group features.
         """
         self.data = torch.load(data_path)
         self.samples = self.data["samples"]
         self.config = self.data.get("config", {})
+        self.use_urgency_flag = use_urgency_flag
         
         # Infer embed_dim from data if not provided
         if embed_dim is None:
@@ -228,12 +237,18 @@ class SwitcherDataset(Dataset):
         print(f"Loaded {len(self.samples)} samples")
         print(f"  Embedding dim: {sample['h'].shape[-1]}")
         print(f"  Groups per sample: {len(sample['groups'])}")
-        print(f"  Scalar dim: {fb.scalar_dim}  "
-              f"(5 base + {len(fb.extra_group)} group + {len(fb.extra_global)} global)")
+        base_scalar_dim = fb.scalar_dim
+        urgency_dim = 1 if self.use_urgency_flag else 0
+        total_scalar_dim = base_scalar_dim + urgency_dim
+        print(f"  Scalar dim: {total_scalar_dim}  "
+              f"(5 base + {len(fb.extra_group)} group + {len(fb.extra_global)} global"
+              f"{' + 1 urgency_flag' if self.use_urgency_flag else ''})")
         if fb.extra_group:
             print(f"  extra_group: {fb.extra_group}")
         if fb.extra_global:
             print(f"  extra_global: {fb.extra_global}")
+        if self.use_urgency_flag:
+            print(f"  urgency_flag: binary (1.0 only for size-1 urgent groups)")
         if "extra" in sample:
             print(f"  Extra keys in data: {list(sample['extra'].keys())}")
     
@@ -254,7 +269,7 @@ class SwitcherDataset(Dataset):
         attn_ro = sample.get("attn_ro", None)
         extra = sample.get("extra", None)
         
-        # Build group features
+        # Build group features (without urgency flag)
         X = self.feature_builder(
             h=h,
             groups=groups,
@@ -262,7 +277,12 @@ class SwitcherDataset(Dataset):
             attn_rr=attn_rr,
             attn_ro=attn_ro,
             extra=extra,
-        )
+        )  # (M, D_base)
+        
+        # Add urgency flag as additional scalar feature
+        if self.use_urgency_flag:
+            urgency_flags = self._compute_urgency_flags(groups, extra)  # (M,)
+            X = torch.cat([X, urgency_flags.unsqueeze(1)], dim=1)  # (M, D_base + 1)
         
         # Build ranking pairs
         pairs = build_pairs_from_scores(group_scores)
@@ -271,17 +291,57 @@ class SwitcherDataset(Dataset):
         best_idx = group_scores.argmax().item()
         
         return {
-            "X": X,                      # (M, D) group features
+            "X": X,                      # (M, D) group features (with urgency if enabled)
             "group_scores": group_scores, # (M,) oracle scores
             "pairs": pairs,              # (K, 2) ranking pairs
             "best_idx": best_idx,        # int: best group index
             "n_groups": len(groups),     # int: number of groups
         }
     
+    def _compute_urgency_flags(
+        self,
+        groups: List[List[int]],
+        extra: Optional[Dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """
+        Compute urgency flags for all groups.
+        
+        Urgency flag logic:
+        - 1.0 if group size == 1 AND that robot is urgent (extra["urgency"][robot_id] == 1.0)
+        - 0.0 otherwise (all multi-robot groups OR non-urgent single robots)
+        
+        Args:
+            groups: List of M groups
+            extra: Extra features dict containing "urgency" tensor of shape (N,)
+            
+        Returns:
+            urgency_flags: Tensor of shape (M,) with values 0.0 or 1.0
+        """
+        if extra is None or "urgency" not in extra:
+            # No urgency data available, all flags are 0
+            return torch.zeros(len(groups), dtype=torch.float32)
+        
+        urgency_per_robot = extra["urgency"]  # (N,) with values 0.0 or 1.0
+        
+        urgency_flags = []
+        for group in groups:
+            if len(group) == 1:
+                # Single-robot group: check if that robot is urgent
+                robot_id = group[0]
+                is_urgent = urgency_per_robot[robot_id].item()
+                urgency_flags.append(is_urgent)
+            else:
+                # Multi-robot group: urgency flag is always 0
+                urgency_flags.append(0.0)
+        
+        return torch.tensor(urgency_flags, dtype=torch.float32)
+    
     @property
     def feature_dim(self) -> int:
-        """Output dimension of group features."""
-        return self.feature_builder.output_dim
+        """Output dimension of group features (including urgency flag if enabled)."""
+        base_dim = self.feature_builder.output_dim
+        urgency_dim = 1 if self.use_urgency_flag else 0
+        return base_dim + urgency_dim
     
     @property
     def embed_dim(self) -> int:
@@ -320,6 +380,7 @@ class TrainingConfig:
     rotation_coupling_threshold: int = 3
     extra_group: Optional[List[Tuple[str, str]]] = None   # None → defaults
     extra_global: Optional[List[str]] = None               # None → defaults
+    use_urgency_flag: bool = True  # Append urgency flag as additional scalar
     
     # Model
     embed_hidden: int = 256
@@ -403,6 +464,7 @@ class SwitcherTrainer:
             rotation_coupling_threshold=config.rotation_coupling_threshold,
             extra_group=config.extra_group,
             extra_global=config.extra_global,
+            use_urgency_flag=config.use_urgency_flag,
         )
         
         # Split into train/val
@@ -432,9 +494,11 @@ class SwitcherTrainer:
             num_workers=0,
         )
         
-        # Store dimensions
+        # Store dimensions (scalar_dim includes urgency flag if enabled)
         self.embed_dim = full_dataset.embed_dim
-        self.scalar_dim = full_dataset.scalar_dim
+        base_scalar_dim = full_dataset.feature_builder.scalar_dim
+        urgency_dim = 1 if config.use_urgency_flag else 0
+        self.scalar_dim = base_scalar_dim + urgency_dim
     
     def _setup_model(self):
         """Setup model."""
@@ -707,6 +771,7 @@ def main():
         rotation_coupling_threshold=cfg["rotation_coupling_threshold"],
         extra_group=cfg["extra_group"],
         extra_global=cfg["extra_global"],
+        use_urgency_flag=cfg["use_urgency_flag"],
         embed_hidden=cfg["embed_hidden"],
         scalar_hidden=cfg["scalar_hidden"],
         fusion_hidden=cfg["fusion_hidden"],

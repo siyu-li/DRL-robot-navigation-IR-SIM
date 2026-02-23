@@ -48,17 +48,31 @@ logger.disable("irsim")
 # =============================================================================
 CONFIG = {
     # Selection mode: "switcher" or "random"
-    "selection_mode": "random",  # Change to "random" for baseline comparison
+    "selection_mode": "switcher",  # Change to "random" for baseline comparison
 
-    # Top-k selection: randomly select from top k groups instead of always best
+    # Group selection strategy for switcher mode:
+    #   "argmax"  — always select the highest-scoring group (deterministic)
+    #   "top_k"   — uniformly random from top k groups (original behavior)
+    #   "softmax" — sample from all groups weighted by softmax of scores
+    "selection_strategy": "softmax",  # Options: "argmax", "top_k", "softmax"
+    
+    # Top-k selection: randomly select from top k groups (only used if selection_strategy="top_k")
     # Set to 1 for deterministic (always best), >1 for stochastic selection
-    "top_k_selection": 10,
+    "top_k_selection": 60,
+    
+    # Softmax temperature: controls randomness in softmax selection (only used if selection_strategy="softmax")
+    # Lower temperature (~0.01-0.1) → more deterministic (favors high scores)
+    # Higher temperature (1.0+) → more random (more uniform distribution)
+    "softmax_temperature": 0.1,
 
     # Random seed for reproducibility (set to same value for fair comparison)
     "seed": 42,
+    
+    # Number of trials per episode (same obstacles/start/goal configuration)
+    "trials_per_episode": 3,
 
     # Switcher model configuration
-    "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/best.pt",
+    "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_60.pt",
 
     # Decentralized model configuration (used for all action generation)
     # "decentralized_model_name": "TD3-MARL-obstacle-14robots",
@@ -70,12 +84,19 @@ CONFIG = {
     "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu",
 
     # Test configuration
-    "test_episodes": 90,
-    "max_steps_per_episode": 1000,
+    "test_episodes": 50,
+    "max_steps_per_episode": 1500,
     "disable_plotting": True,
 
     # Group selection interval (re-select group every N steps)
     "selection_interval": 10,
+    
+    # Group generation settings (must match training data)
+    "include_size_1": True,         # Include individual robots
+    "include_size_2": True,         # Include pairs
+    "include_size_3": True,         # Include triplets
+    "include_size_4": True,         # Include size-4 groups (rotation-coupled)
+    "include_size_7": True,         # Include size-7 groups (rotation-coupled)
 
     # Policy configuration
     "num_robots": 14,
@@ -88,8 +109,32 @@ CONFIG = {
     "pooling": "mean",
 
     # Switcher feature configuration (must match training)
-    "extra_features": ["dist_to_goal", "clearance"],
-    "extra_aggregations": ["mean", "min"],
+    # GroupFeatureBuilder config
+    #   Features 1-5 are always on (size_feat, coupling_mode, A_in, A_out, A_obs).
+    #   extra_group: list of (extra_key, aggregation) for per-group scalars
+    #                aggregated over group members. Set to [] to disable.
+    #   extra_global: list of extra_key names for global scalars (same for
+    #                 every group). Set to [] to disable.
+    #   scalar_dim = 5 + len(extra_group) + len(extra_global) + 1 (urgency_flag)
+    "max_group_size": 7,
+    "rotation_coupling_threshold": 3,
+    "extra_group": [
+        ("dist_to_goal", "mean"),   # mean_dist_goal_g
+        ("dist_to_goal", "min"),    # min_dist_goal_g
+        ("clearance",    "min"),    # min_clearance_g
+        ("reached",      "mean"),   # frac_reached_g
+        ("heading_error","mean"),   # mean_heading_err_g
+    ],
+    "extra_global": [
+        "var_dist_goal_global",     # distance variance (sync signal)
+        "frac_reached_global",      # global completion fraction
+        "steps_elapsed_frac",       # time pressure
+    ],
+    
+    # Urgency tracking (for stuck robot detection)
+    "use_urgency_flag": True,       # Enable urgency flag as additional scalar feature
+    "urgency_lookback_window": 20,  # Number of steps to track per robot
+    "urgency_stuck_threshold": 0.3, # If robot moved < this distance over lookback, it's stuck
 
     # World configuration
     "world_file": "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
@@ -125,18 +170,26 @@ def generate_candidate_groups(
     include_size_1: bool = True,
     include_size_2: bool = True,
     include_size_3: bool = True,
+    include_size_4: bool = False,
+    include_size_7: bool = False,
 ) -> List[List[int]]:
     """
-    Generate all candidate groups using binary allocation method.
+    Generate candidate groups using binary allocation method.
+
+    Uses the group_generator module which produces groups via binary allocation
+    rules instead of exhaustive combinatorial enumeration. This is critical for
+    14 robots where exhaustive combinations would be too many.
 
     Args:
         num_robots: Total number of robots.
         include_size_1: Include singletons (individual robots).
         include_size_2: Include pairs.
         include_size_3: Include triplets.
+        include_size_4: Include size-4 groups (rotation-coupled).
+        include_size_7: Include size-7 groups (rotation-coupled).
 
     Returns:
-        List of robot index groups with size <= 3.
+        List of robot index groups filtered by the requested sizes.
     """
     if num_robots <= 6:
         m = 3
@@ -150,17 +203,20 @@ def generate_candidate_groups(
 
     all_groups = generate_all_groups(m=m, n=num_robots, use_complement=True)
 
-    min_size = 1 if include_size_1 else 2
-    max_size = 3 if include_size_3 else (2 if include_size_2 else 1)
+    # Determine which sizes to include
+    allowed_sizes = set()
+    if include_size_1:
+        allowed_sizes.add(1)
+    if include_size_2:
+        allowed_sizes.add(2)
+    if include_size_3:
+        allowed_sizes.add(3)
+    if include_size_4:
+        allowed_sizes.add(4)
+    if include_size_7:
+        allowed_sizes.add(7)
 
-    filtered_groups = filter_groups_by_size(all_groups, min_size=min_size, max_size=max_size)
-
-    if not include_size_1:
-        filtered_groups = [g for g in filtered_groups if len(g) > 1]
-    if not include_size_2:
-        filtered_groups = [g for g in filtered_groups if len(g) != 2]
-    if not include_size_3:
-        filtered_groups = [g for g in filtered_groups if len(g) < 3]
+    filtered_groups = [g for g in all_groups if len(g) in allowed_sizes]
 
     return filtered_groups
 
@@ -194,15 +250,20 @@ class TestStatistics:
 
     An episode is "successful" if and only if ALL robots reach their goals
     with zero collisions during the episode. Otherwise, it is "failed".
+    
+    Now supports multiple trials per episode configuration.
     """
 
-    # Episode-level metrics
+    # Episode-level metrics (per trial)
     episode_rewards: List[float] = field(default_factory=list)
     episode_steps: List[int] = field(default_factory=list)
     episode_outcomes: List[str] = field(default_factory=list)
     # "success" = all robots reached goal, no collisions
     # "collision" = at least one collision or out-of-bounds occurred
     # "timeout" = max_steps reached without all robots finishing
+    
+    # Episode configuration tracking (episode_idx for each trial)
+    trial_episode_indices: List[int] = field(default_factory=list)
 
     # Per-robot path lengths for successful episodes only
     # Each entry is a list of length num_robots with the cumulative path length
@@ -277,32 +338,50 @@ class TestStatistics:
         total_reward: float,
         steps: int,
         outcome: str,
+        episode_idx: int,
         path_lengths: Optional[List[float]] = None,
     ):
         """Record episode-level metrics."""
         self.episode_rewards.append(float(total_reward))
         self.episode_steps.append(int(steps))
         self.episode_outcomes.append(outcome)
+        self.trial_episode_indices.append(episode_idx)
         if outcome == "success" and path_lengths is not None:
             self.success_episode_path_lengths.append(list(path_lengths))
 
-    def get_summary(self) -> Dict:
+    def get_summary(self, trials_per_episode: int = 1) -> Dict:
         """Get summary statistics."""
-        num_episodes = len(self.episode_rewards)
+        num_trials = len(self.episode_rewards)
+        num_episodes = len(set(self.trial_episode_indices)) if self.trial_episode_indices else num_trials
         total_executions = sum(self.executed_size_counts.values())
 
-        # Episode statistics
+        # Episode statistics (per trial)
         avg_reward = np.mean(self.episode_rewards) if self.episode_rewards else 0.0
         avg_steps = np.mean(self.episode_steps) if self.episode_steps else 0.0
 
-        # Episode-level success / collision / timeout counts
-        success_count = sum(1 for o in self.episode_outcomes if o == "success")
-        collision_count = sum(1 for o in self.episode_outcomes if o == "collision")
-        timeout_count = sum(1 for o in self.episode_outcomes if o == "timeout")
+        # Trial-level success / collision / timeout counts
+        trial_success_count = sum(1 for o in self.episode_outcomes if o == "success")
+        trial_collision_count = sum(1 for o in self.episode_outcomes if o == "collision")
+        trial_timeout_count = sum(1 for o in self.episode_outcomes if o == "timeout")
 
-        success_rate = success_count / max(num_episodes, 1)
-        collision_rate = collision_count / max(num_episodes, 1)
-        timeout_rate = timeout_count / max(num_episodes, 1)
+        trial_success_rate = trial_success_count / max(num_trials, 1)
+        trial_collision_rate = trial_collision_count / max(num_trials, 1)
+        trial_timeout_rate = trial_timeout_count / max(num_trials, 1)
+        
+        # Episode-level success (at least one trial succeeded)
+        episode_success_count = 0
+        if self.trial_episode_indices:
+            episode_outcomes = {}  # episode_idx -> list of outcomes
+            for episode_idx, outcome in zip(self.trial_episode_indices, self.episode_outcomes):
+                if episode_idx not in episode_outcomes:
+                    episode_outcomes[episode_idx] = []
+                episode_outcomes[episode_idx].append(outcome)
+            
+            for episode_idx, outcomes in episode_outcomes.items():
+                if "success" in outcomes:
+                    episode_success_count += 1
+        
+        episode_success_rate = episode_success_count / max(num_episodes, 1)
 
         # Average rewards by outcome
         success_rewards = [
@@ -354,7 +433,7 @@ class TestStatistics:
 
         # Collision rate by group size
         collision_rate_by_size = {}
-        for size in [1, 2, 3]:
+        for size in [1, 2, 3, 4, 7]:
             size_groups = [g for g in self.group_execution_counts.keys() if len(g) == size]
             total_exec = sum(self.group_execution_counts.get(g, 0) for g in size_groups)
             total_coll = sum(self.group_collision_counts.get(g, 0) for g in size_groups)
@@ -382,7 +461,7 @@ class TestStatistics:
 
         # Collision breakdown by size
         collision_breakdown = {}
-        for size in [1, 2, 3]:
+        for size in [1, 2, 3, 4, 7]:
             size_groups = [g for g in self.group_execution_counts.keys() if len(g) == size]
             total_exec = sum(self.group_execution_counts.get(g, 0) for g in size_groups)
             intra = sum(self.group_intra_collisions.get(g, 0) for g in size_groups)
@@ -413,15 +492,21 @@ class TestStatistics:
 
         return {
             "num_episodes": num_episodes,
+            "num_trials": num_trials,
+            "trials_per_episode": trials_per_episode,
             "total_executions": total_executions,
             "avg_episode_reward": avg_reward,
             "avg_steps": avg_steps,
-            "success_count": success_count,
-            "collision_count": collision_count,
-            "timeout_count": timeout_count,
-            "success_rate": success_rate,
-            "collision_rate": collision_rate,
-            "timeout_rate": timeout_rate,
+            # Trial-level metrics
+            "trial_success_count": trial_success_count,
+            "trial_collision_count": trial_collision_count,
+            "trial_timeout_count": trial_timeout_count,
+            "trial_success_rate": trial_success_rate,
+            "trial_collision_rate": trial_collision_rate,
+            "trial_timeout_rate": trial_timeout_rate,
+            # Episode-level metrics (at least one trial succeeded)
+            "episode_success_count": episode_success_count,
+            "episode_success_rate": episode_success_rate,
             "avg_success_reward": avg_success_reward,
             "avg_collision_reward": avg_collision_reward,
             "avg_timeout_reward": avg_timeout_reward,
@@ -460,7 +545,10 @@ class SwitcherGroupSelector:
         policy: TD3Obstacle,
         groups: List[List[int]],
         device: torch.device,
+        selection_strategy: str = "argmax",
         top_k: int = 1,
+        softmax_temperature: float = 1.0,
+        use_urgency_flag: bool = True,
     ):
         self.switcher = switcher.to(device)
         self.switcher.eval()
@@ -468,7 +556,19 @@ class SwitcherGroupSelector:
         self.policy = policy
         self.groups = groups
         self.device = device
+        self.use_urgency_flag = use_urgency_flag
+        
+        # Selection strategy
+        if selection_strategy not in ["argmax", "top_k", "softmax"]:
+            raise ValueError(f"Invalid selection_strategy: {selection_strategy}. "
+                           f"Must be 'argmax', 'top_k', or 'softmax'.")
+        self.selection_strategy = selection_strategy
+        
+        # Top-k parameters (only used if strategy="top_k")
         self.top_k = max(1, min(top_k, len(groups)))
+        
+        # Softmax temperature (only used if strategy="softmax")
+        self.softmax_temperature = max(0.01, softmax_temperature)  # Avoid division by zero
 
     def get_embeddings_and_attention(
         self,
@@ -507,20 +607,92 @@ class SwitcherGroupSelector:
     def get_extra_features(
         self,
         distance: List[float],
+        reached_goal: List[bool],
+        poses: List[List[float]],
+        goals: List[List[float]],
         sim: MARL_SIM_OBSTACLE,
+        current_step: int,
+        max_steps: int,
+        urgency_flags: Optional[List[bool]] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Get extra per-robot features."""
+        """
+        Get extra per-robot and global features.
+        
+        Per-robot features:
+        - dist_to_goal: Distance to goal for each robot
+        - clearance: Minimum obstacle clearance for each robot
+        - reached: Whether each robot reached its goal (0 or 1)
+        - heading_error: Absolute heading error to goal for each robot
+        - urgency: Whether each robot is stuck (0 or 1)
+        
+        Global features:
+        - var_dist_goal_global: Variance of distances to goals
+        - frac_reached_global: Fraction of robots that reached goals
+        - steps_elapsed_frac: Fraction of max steps elapsed
+        """
+        num_robots = sim.num_robots
+        
+        # Per-robot features
         dist_to_goal = torch.tensor(distance, dtype=torch.float32, device=self.device)
 
         clearances = []
-        for i in range(sim.num_robots):
+        for i in range(num_robots):
             min_clearance = sim.get_min_obstacle_clearance(i)
             clearances.append(min_clearance)
         clearance = torch.tensor(clearances, dtype=torch.float32, device=self.device)
+        
+        reached = torch.tensor(
+            [1.0 if r else 0.0 for r in reached_goal],
+            dtype=torch.float32,
+            device=self.device
+        )
+        
+        # Heading error: angle difference between current heading and goal direction
+        heading_errors = []
+        for i in range(num_robots):
+            dx = goals[i][0] - poses[i][0]
+            dy = goals[i][1] - poses[i][1]
+            goal_angle = np.arctan2(dy, dx)
+            current_angle = poses[i][2]  # Current heading
+            angle_diff = abs(goal_angle - current_angle)
+            # Normalize to [0, pi]
+            angle_diff = min(angle_diff, 2 * np.pi - angle_diff)
+            heading_errors.append(angle_diff)
+        heading_error = torch.tensor(heading_errors, dtype=torch.float32, device=self.device)
+        
+        # Urgency flags (per-robot binary indicator for stuck robots)
+        if urgency_flags is None:
+            urgency_flags = [False] * num_robots
+        urgency = torch.tensor(
+            [1.0 if u else 0.0 for u in urgency_flags],
+            dtype=torch.float32,
+            device=self.device
+        )
+        
+        # Global features (must be tensors, not scalars)
+        var_dist_goal_global = torch.var(dist_to_goal)
+        frac_reached_global = torch.tensor(
+            sum(reached_goal) / max(num_robots, 1),
+            dtype=torch.float32,
+            device=self.device
+        )
+        steps_elapsed_frac = torch.tensor(
+            current_step / max(max_steps, 1),
+            dtype=torch.float32,
+            device=self.device
+        )
 
         return {
+            # Per-robot features
             "dist_to_goal": dist_to_goal,
             "clearance": clearance,
+            "reached": reached,
+            "heading_error": heading_error,
+            "urgency": urgency,
+            # Global features
+            "var_dist_goal_global": var_dist_goal_global,
+            "frac_reached_global": frac_reached_global,
+            "steps_elapsed_frac": steps_elapsed_frac,
         }
 
     @torch.no_grad()
@@ -529,16 +701,27 @@ class SwitcherGroupSelector:
         robot_obs: np.ndarray,
         obstacle_obs: np.ndarray,
         distance: List[float],
+        reached_goal: List[bool],
+        poses: List[List[float]],
+        goals: List[List[float]],
         sim: MARL_SIM_OBSTACLE,
+        current_step: int,
+        max_steps: int,
+        urgency_flags: Optional[List[bool]] = None,
     ) -> List[int]:
         """
         Select a group using the trained switcher.
 
-        If top_k > 1, randomly selects from the top k groups.
-        If top_k == 1, always selects the best group (deterministic).
+        Three selection strategies:
+        - "argmax": Always select the highest-scoring group (deterministic).
+        - "top_k": Uniformly random from top k groups.
+        - "softmax": Sample from all groups weighted by softmax of scores.
         """
         h, attn_rr, attn_ro = self.get_embeddings_and_attention(robot_obs, obstacle_obs)
-        extra = self.get_extra_features(distance, sim)
+        extra = self.get_extra_features(
+            distance, reached_goal, poses, goals, sim, current_step, max_steps,
+            urgency_flags=urgency_flags,
+        )
 
         X = self.feature_builder(
             h=h,
@@ -547,19 +730,77 @@ class SwitcherGroupSelector:
             attn_rr=attn_rr,
             attn_ro=attn_ro,
             extra=extra,
-        )
+        )  # (M, D_base)
+        
+        # Add urgency flag as additional scalar feature (same as training)
+        if self.use_urgency_flag:
+            urgency_flags_tensor = self._compute_urgency_flags(self.groups, extra)
+            X = torch.cat([X, urgency_flags_tensor.unsqueeze(1).to(self.device)], dim=1)
 
         X = X.to(self.device)
         logits = self.switcher(X)
 
-        if self.top_k == 1:
+        if self.selection_strategy == "argmax":
+            # Deterministic: always pick the highest score
             selected_idx = logits.argmax().item()
-        else:
+            
+        elif self.selection_strategy == "top_k":
+            # Random from top k
             _, top_k_indices = torch.topk(logits, k=self.top_k)
             random_idx = random.randint(0, self.top_k - 1)
             selected_idx = top_k_indices[random_idx].item()
+            
+        elif self.selection_strategy == "softmax":
+            # Softmax sampling: higher scores → higher probability
+            # Apply temperature scaling to logits
+            scaled_logits = logits / self.softmax_temperature
+            probs = torch.softmax(scaled_logits, dim=0)
+            
+            # Sample from the distribution
+            selected_idx = torch.multinomial(probs, num_samples=1).item()
+            
+        else:
+            raise ValueError(f"Unknown selection strategy: {self.selection_strategy}")
 
         return self.groups[selected_idx]
+    
+    def _compute_urgency_flags(
+        self,
+        groups: List[List[int]],
+        extra: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute urgency flags for all groups (same logic as training).
+        
+        Urgency flag logic:
+        - 1.0 if group size == 1 AND that robot is urgent (extra["urgency"][robot_id] == 1.0)
+        - 0.0 otherwise (all multi-robot groups OR non-urgent single robots)
+        
+        Args:
+            groups: List of M groups
+            extra: Extra features dict containing "urgency" tensor of shape (N,)
+            
+        Returns:
+            urgency_flags: Tensor of shape (M,) with values 0.0 or 1.0
+        """
+        if "urgency" not in extra:
+            # No urgency data available, all flags are 0
+            return torch.zeros(len(groups), dtype=torch.float32, device=self.device)
+        
+        urgency_per_robot = extra["urgency"]  # (N,) with values 0.0 or 1.0
+        
+        urgency_flags = []
+        for group in groups:
+            if len(group) == 1:
+                # Single-robot group: check if that robot is urgent
+                robot_id = group[0]
+                is_urgent = urgency_per_robot[robot_id].item()
+                urgency_flags.append(is_urgent)
+            else:
+                # Multi-robot group: urgency flag is always 0
+                urgency_flags.append(0.0)
+        
+        return torch.tensor(urgency_flags, dtype=torch.float32, device=self.device)
 
 
 # =============================================================================
@@ -624,11 +865,16 @@ def get_action_for_group(
     obstacle_obs: np.ndarray,
     group: List[int],
     num_robots: int,
+    rotation_coupling_threshold: int = 3,
 ) -> List[List[float]]:
     """
     Get action for a specific group using the decentralized policy.
 
-    All robots in the group get coupled actions (velocity-matched).
+    All robots in the group get coupled linear velocity (minimum of the group).
+    For groups with size > rotation_coupling_threshold, angular velocity is also
+    coupled (average of the group). For smaller groups, angular velocity remains
+    individual.
+    
     Robots NOT in the group get [0, 0].
     Robots that have already reached their goal continue to receive
     policy actions — the learned policy will naturally keep them near the goal.
@@ -639,25 +885,42 @@ def get_action_for_group(
         obstacle_obs: Obstacle observations, shape (num_obstacles, obs_dim).
         group: List of robot indices in the active group.
         num_robots: Total number of robots.
+        rotation_coupling_threshold: Groups with size > this threshold use coupled rotation.
 
     Returns:
         Actions for all robots, shape (num_robots, 2).
     """
     action, _ = policy.get_action(robot_obs, obstacle_obs, add_noise=False)
 
-    # Get scaled linear velocities for robots in the group
     group_set = set(group)
+    group_size = len(group)
+    
+    # Get scaled linear velocities for robots in the group
     scaled_lin_vels = []
     for idx in group:
         scaled_lin_vel = (action[idx][0] + 1) / 4  # [-1,1] -> [0,0.5]
         scaled_lin_vels.append(scaled_lin_vel)
 
+    # Coupled linear velocity: minimum of the group
     v_coupled = min(scaled_lin_vels)
+    
+    # Rotation coupling for large groups (size > threshold)
+    if group_size > rotation_coupling_threshold:
+        # Coupled angular velocity: average of the group
+        angular_vels = [action[idx][1] for idx in group]
+        omega_coupled = sum(angular_vels) / len(angular_vels)
+    else:
+        omega_coupled = None  # No rotation coupling for small groups
 
     a_out = []
     for i in range(num_robots):
         if i in group_set:
-            a_out.append([v_coupled, action[i][1]])
+            if omega_coupled is not None:
+                # Large group: coupled rotation
+                a_out.append([v_coupled, omega_coupled])
+            else:
+                # Small group: individual rotation
+                a_out.append([v_coupled, action[i][1]])
         else:
             # Not in the active group
             a_out.append([0.0, 0.0])
@@ -677,6 +940,8 @@ def run_test_evaluation(
     num_episodes: int = 100,
     max_steps: int = 500,
     selection_interval: int = 10,
+    rotation_coupling_threshold: int = 3,
+    trials_per_episode: int = 1,
     seed: int = 42,
     verbose: bool = True,
 ) -> TestStatistics:
@@ -695,10 +960,18 @@ def run_test_evaluation(
     Deterministic seeding: before each episode, the RNG is seeded with
     (base_seed + episode_index) so that the same episode index always
     produces the same obstacle/robot configuration regardless of selection mode.
+    
+    Multiple trials per episode: each episode configuration (obstacles, start, goal)
+    is tested trials_per_episode times with different random seeds for action selection.
     """
     stats = TestStatistics()
     num_robots = sim.num_robots
+    
+    # Urgency tracking configuration
+    urgency_lookback_window = CONFIG.get("urgency_lookback_window", 20)
+    urgency_stuck_threshold = CONFIG.get("urgency_stuck_threshold", 0.3)
 
+    total_trials = num_episodes * trials_per_episode
     pbar = (
         tqdm(range(num_episodes), desc=f"Testing ({selection_mode})")
         if verbose
@@ -706,144 +979,198 @@ def run_test_evaluation(
     )
 
     for episode in pbar:
-        # ------------------------------------------------------------------
-        # Deterministic per-episode seed
-        # ------------------------------------------------------------------
-        episode_seed = seed + episode
-        set_global_seed(episode_seed)
+        # Run multiple trials with the same environment configuration
+        for trial in range(trials_per_episode):
+            # ------------------------------------------------------------------
+            # Deterministic per-episode seed for environment configuration
+            # Use the same seed for all trials of the same episode to get the same
+            # obstacle/start/goal configuration
+            # ------------------------------------------------------------------
+            episode_seed = seed + episode
+            set_global_seed(episode_seed)
 
-        # Reset environment (all robots + random obstacles)
-        (
-            poses, distance, cos, sin, collision, goals, action, reward,
-            positions, goal_positions, obstacle_states,
-        ) = sim.reset(random_obstacles=True)
+            # Reset environment with the same seed (same configuration across trials)
+            (
+                poses, distance, cos, sin, collision, goals, action, reward,
+                positions, goal_positions, obstacle_states,
+            ) = sim.reset(random_obstacles=True)
 
-        episode_reward = 0.0
-        current_group = None
-        steps = 0
-        episode_had_collision = False
+            episode_reward = 0.0
+            current_group = None
+            steps = 0
+            episode_had_collision = False
 
-        # Per-robot "reached goal" flags — used only to determine episode success.
-        # Robots are NOT made inactive; the policy naturally keeps them near the goal.
-        reached_goal = [False] * num_robots
+            # Per-robot "reached goal" flags — used only to determine episode success.
+            # Robots are NOT made inactive; the policy naturally keeps them near the goal.
+            reached_goal = [False] * num_robots
 
-        # Per-robot cumulative path length tracking
-        path_lengths = [0.0] * num_robots
-        prev_positions = [[poses[i][0], poses[i][1]] for i in range(num_robots)]
+            # Per-robot cumulative path length tracking
+            path_lengths = [0.0] * num_robots
+            prev_positions = [[poses[i][0], poses[i][1]] for i in range(num_robots)]
+            
+            # Urgency tracking: maintain a sliding window of recent positions per robot
+            robot_position_history = [[] for _ in range(num_robots)]  # List of lists: per-robot position history
+            urgency_flags = [False] * num_robots  # Current urgency flags
 
-        while steps < max_steps:
-            # ----------------------------------------------------------
-            # Check termination: all robots reached goals (success)
-            # ----------------------------------------------------------
-            if all(reached_goal):
-                break
+            while steps < max_steps:
+                # ----------------------------------------------------------
+                # Update urgency tracking: check if robots have been stuck
+                # ----------------------------------------------------------
+                for robot_idx in range(num_robots):
+                    # Only track urgency for unreached robots
+                    if not reached_goal[robot_idx]:
+                        # Add current position to history
+                        robot_position_history[robot_idx].append([poses[robot_idx][0], poses[robot_idx][1]])
+                        
+                        # Keep only the most recent lookback_window positions
+                        if len(robot_position_history[robot_idx]) > urgency_lookback_window:
+                            robot_position_history[robot_idx].pop(0)
+                        
+                        # Check if robot is stuck (hasn't moved much over the lookback window)
+                        if len(robot_position_history[robot_idx]) >= urgency_lookback_window:
+                            oldest_pos = robot_position_history[robot_idx][0]
+                            current_pos = robot_position_history[robot_idx][-1]
+                            displacement = np.linalg.norm(
+                                np.array(current_pos) - np.array(oldest_pos)
+                            )
+                            urgency_flags[robot_idx] = (displacement < urgency_stuck_threshold)
+                        else:
+                            urgency_flags[robot_idx] = False
+                    else:
+                        # Already reached robots are not urgent
+                        urgency_flags[robot_idx] = False
+                
+                # ----------------------------------------------------------
+                # Check termination: all robots reached goals (success)
+                # ----------------------------------------------------------
+                if all(reached_goal):
+                    break
 
-            # ----------------------------------------------------------
-            # Select group at intervals
-            # ----------------------------------------------------------
-            if steps % selection_interval == 0 or current_group is None:
+                # ----------------------------------------------------------
+                # Select group at intervals
+                # ----------------------------------------------------------
+                if steps % selection_interval == 0 or current_group is None:
+                    robot_state, _ = policy.prepare_state(
+                        poses, distance, cos, sin, collision, action, goal_positions
+                    )
+                    robot_obs = np.array(robot_state)
+
+                    if selection_mode == "switcher" and switcher_selector is not None:
+                        current_group = switcher_selector.select_group(
+                            robot_obs=robot_obs,
+                            obstacle_obs=obstacle_states,
+                            distance=distance,
+                            reached_goal=reached_goal,
+                            poses=poses,
+                            goals=goal_positions,
+                            sim=sim,
+                            current_step=steps,
+                            max_steps=max_steps,
+                            urgency_flags=urgency_flags,
+                        )
+                    else:
+                        current_group = random.choice(groups)
+
+                    stats.record_group_execution(current_group)
+
+                # ----------------------------------------------------------
+                # Get actions (robots at goal get [0,0])
+                # ----------------------------------------------------------
                 robot_state, _ = policy.prepare_state(
                     poses, distance, cos, sin, collision, action, goal_positions
                 )
                 robot_obs = np.array(robot_state)
 
-                if selection_mode == "switcher" and switcher_selector is not None:
-                    current_group = switcher_selector.select_group(
-                        robot_obs, obstacle_states, distance, sim
-                    )
-                else:
-                    current_group = random.choice(groups)
-
-                stats.record_group_execution(current_group)
-
-            # ----------------------------------------------------------
-            # Get actions (robots at goal get [0,0])
-            # ----------------------------------------------------------
-            robot_state, _ = policy.prepare_state(
-                poses, distance, cos, sin, collision, action, goal_positions
-            )
-            robot_obs = np.array(robot_state)
-
-            action_out = get_action_for_group(
-                policy, robot_obs, obstacle_states,
-                current_group, num_robots,
-            )
-
-            # ----------------------------------------------------------
-            # Step simulation
-            # ----------------------------------------------------------
-            (
-                poses, distance, cos, sin, collision, goals,
-                action, reward, positions, goal_positions, obstacle_states,
-            ) = sim.step(action_out, None, None)
-
-            steps += 1
-
-            # Accumulate episode reward (all robots)
-            episode_reward += sum(reward)
-
-            # Accumulate per-robot path lengths (Euclidean distance moved)
-            for i in range(num_robots):
-                dx = poses[i][0] - prev_positions[i][0]
-                dy = poses[i][1] - prev_positions[i][1]
-                path_lengths[i] += np.sqrt(dx * dx + dy * dy)
-                prev_positions[i] = [poses[i][0], poses[i][1]]
-
-            # ----------------------------------------------------------
-            # Check for newly reached goals (latch)
-            # ----------------------------------------------------------
-            for i in range(num_robots):
-                if not reached_goal[i] and goals[i]:
-                    reached_goal[i] = True
-
-            # ----------------------------------------------------------
-            # Check for collisions / out-of-bounds → episode failure
-            # ----------------------------------------------------------
-            collided_indices = []
-            for i in range(num_robots):
-                if collision[i] or robot_outside_bounds(poses[i], sim):
-                    collided_indices.append(i)
-
-            if collided_indices:
-                episode_had_collision = True
-
-                # Record collision details for current group
-                collision_types = classify_collisions(
-                    collision, poses, current_group, sim
+                action_out = get_action_for_group(
+                    policy, robot_obs, obstacle_states,
+                    current_group, num_robots,
+                    rotation_coupling_threshold=rotation_coupling_threshold,
                 )
-                stats.record_collision(current_group, collided_indices, collision_types)
 
-                # Episode ends immediately on collision
-                break
+                # ----------------------------------------------------------
+                # Step simulation
+                # ----------------------------------------------------------
+                (
+                    poses, distance, cos, sin, collision, goals,
+                    action, reward, positions, goal_positions, obstacle_states,
+                ) = sim.step(action_out, None, None)
 
-        # ------------------------------------------------------------------
-        # Determine episode outcome
-        # ------------------------------------------------------------------
-        if episode_had_collision:
-            outcome = "collision"
-        elif all(reached_goal):
-            outcome = "success"
-        else:
-            outcome = "timeout"
+                steps += 1
 
-        stats.record_episode(
-            total_reward=episode_reward,
-            steps=steps,
-            outcome=outcome,
-            path_lengths=path_lengths,
-        )
+                # Accumulate episode reward (all robots)
+                episode_reward += sum(reward)
+
+                # Accumulate per-robot path lengths (Euclidean distance moved)
+                for i in range(num_robots):
+                    dx = poses[i][0] - prev_positions[i][0]
+                    dy = poses[i][1] - prev_positions[i][1]
+                    path_lengths[i] += np.sqrt(dx * dx + dy * dy)
+                    prev_positions[i] = [poses[i][0], poses[i][1]]
+
+                # ----------------------------------------------------------
+                # Check for newly reached goals (latch)
+                # ----------------------------------------------------------
+                for i in range(num_robots):
+                    if not reached_goal[i] and goals[i]:
+                        reached_goal[i] = True
+
+                # ----------------------------------------------------------
+                # Check for collisions / out-of-bounds → episode failure
+                # ----------------------------------------------------------
+                collided_indices = []
+                for i in range(num_robots):
+                    if collision[i] or robot_outside_bounds(poses[i], sim):
+                        collided_indices.append(i)
+
+                if collided_indices:
+                    episode_had_collision = True
+
+                    # Record collision details for current group
+                    collision_types = classify_collisions(
+                        collision, poses, current_group, sim
+                    )
+                    stats.record_collision(current_group, collided_indices, collision_types)
+
+                    # Episode ends immediately on collision
+                    break
+
+            # ------------------------------------------------------------------
+            # Determine trial outcome
+            # ------------------------------------------------------------------
+            if episode_had_collision:
+                outcome = "collision"
+            elif all(reached_goal):
+                outcome = "success"
+            else:
+                outcome = "timeout"
+
+            stats.record_episode(
+                total_reward=episode_reward,
+                steps=steps,
+                outcome=outcome,
+                episode_idx=episode,
+                path_lengths=path_lengths,
+            )
 
         if verbose and isinstance(pbar, tqdm):
-            running_success = sum(1 for o in stats.episode_outcomes if o == "success")
-            running_collision = sum(1 for o in stats.episode_outcomes if o == "collision")
-            running_timeout = sum(1 for o in stats.episode_outcomes if o == "timeout")
-            n = len(stats.episode_outcomes)
+            # Calculate running statistics
+            running_trial_success = sum(1 for o in stats.episode_outcomes if o == "success")
+            running_trial_collision = sum(1 for o in stats.episode_outcomes if o == "collision")
+            running_trial_timeout = sum(1 for o in stats.episode_outcomes if o == "timeout")
+            n_trials = len(stats.episode_outcomes)
+            
+            # Calculate episode-level success (at least one trial succeeded)
+            episode_outcomes = {}
+            for ep_idx, outcome in zip(stats.trial_episode_indices, stats.episode_outcomes):
+                if ep_idx not in episode_outcomes:
+                    episode_outcomes[ep_idx] = []
+                episode_outcomes[ep_idx].append(outcome)
+            running_episode_success = sum(1 for outcomes in episode_outcomes.values() if "success" in outcomes)
+            n_episodes = len(episode_outcomes)
 
             pbar.set_postfix({
-                "reward": f"{episode_reward:.1f}",
-                "S": f"{running_success}/{n}",
-                "C": f"{running_collision}/{n}",
-                "T": f"{running_timeout}/{n}",
+                "T_S": f"{running_trial_success}/{n_trials}",
+                "E_S": f"{running_episode_success}/{n_episodes}",
             })
 
     return stats
@@ -903,15 +1230,19 @@ def main():
     # ------------------------------------------------------------------
     groups = generate_candidate_groups(
         num_robots=config["num_robots"],
-        include_size_1=True,
-        include_size_2=True,
-        include_size_3=True,
+        include_size_1=config.get("include_size_1", True),
+        include_size_2=config.get("include_size_2", True),
+        include_size_3=config.get("include_size_3", True),
+        include_size_4=config.get("include_size_4", False),
+        include_size_7=config.get("include_size_7", False),
     )
 
     logger.info(f"Candidate groups: {len(groups)} total")
     logger.info(f"  Size-1: {sum(1 for g in groups if len(g) == 1)}")
     logger.info(f"  Size-2: {sum(1 for g in groups if len(g) == 2)}")
     logger.info(f"  Size-3: {sum(1 for g in groups if len(g) == 3)}")
+    logger.info(f"  Size-4: {sum(1 for g in groups if len(g) == 4)}")
+    logger.info(f"  Size-7: {sum(1 for g in groups if len(g) == 7)}")
 
     # ------------------------------------------------------------------
     # Setup switcher selector if needed
@@ -930,14 +1261,21 @@ def main():
         model_config = checkpoint.get("config", {})
         embed_dim = model_config.get("embed_dim", config["embedding_dim"] * 2)
 
-        extra_features = config["extra_features"]
-        scalar_dim = 1 + 3 + len(extra_features)
-
+        # Build feature_builder with same config as training
         feature_builder = GroupFeatureBuilder(
             embed_dim=embed_dim,
-            extra_feature_names=extra_features,
-            extra_aggregations=config["extra_aggregations"],
+            max_group_size=config.get("max_group_size", 7),
+            rotation_coupling_threshold=config.get("rotation_coupling_threshold", 3),
+            extra_group=config.get("extra_group", None),
+            extra_global=config.get("extra_global", None),
         )
+        
+        # scalar_dim is computed by GroupFeatureBuilder
+        # If urgency flag is enabled, add 1 to scalar_dim for the model
+        base_scalar_dim = feature_builder.scalar_dim
+        use_urgency_flag = config.get("use_urgency_flag", True)
+        urgency_dim = 1 if use_urgency_flag else 0
+        scalar_dim = base_scalar_dim + urgency_dim
 
         switcher = GroupSwitcher(
             embed_dim=embed_dim,
@@ -950,6 +1288,11 @@ def main():
 
         switcher.load_state_dict(checkpoint["model_state_dict"])
         logger.info(f"Loaded switcher from {checkpoint_path}")
+        logger.info(f"  Embed dim: {embed_dim}, Scalar dim: {scalar_dim}")
+        logger.info(f"  Extra group features: {len(config.get('extra_group', []))}")
+        logger.info(f"  Extra global features: {len(config.get('extra_global', []))}")
+        if use_urgency_flag:
+            logger.info(f"  Urgency flag: enabled (adds 1 scalar dimension)")
 
         switcher_selector = SwitcherGroupSelector(
             switcher=switcher,
@@ -957,17 +1300,27 @@ def main():
             policy=policy,
             groups=groups,
             device=device,
+            selection_strategy=config.get("selection_strategy", "argmax"),
             top_k=config.get("top_k_selection", 1),
+            softmax_temperature=config.get("softmax_temperature", 1.0),
+            use_urgency_flag=use_urgency_flag,
         )
-        logger.info(
-            f"Switcher selector will randomly choose from top "
-            f"{config.get('top_k_selection', 1)} groups"
-        )
+        
+        # Log the selection strategy
+        strategy = config.get("selection_strategy", "argmax")
+        if strategy == "argmax":
+            logger.info("Switcher selector: deterministic (always best group)")
+        elif strategy == "top_k":
+            logger.info(f"Switcher selector: random from top {config.get('top_k_selection', 1)} groups")
+        elif strategy == "softmax":
+            logger.info(f"Switcher selector: softmax sampling (temperature={config.get('softmax_temperature', 1.0)})")
 
     # ------------------------------------------------------------------
     # Run evaluation
     # ------------------------------------------------------------------
     logger.info(f"\nRunning test evaluation for {config['test_episodes']} episodes...")
+    logger.info(f"Trials per episode: {config.get('trials_per_episode', 1)}")
+    logger.info(f"Total trials: {config['test_episodes'] * config.get('trials_per_episode', 1)}")
     logger.info(f"Selection interval: every {config['selection_interval']} steps")
 
     stats = run_test_evaluation(
@@ -979,6 +1332,8 @@ def main():
         num_episodes=config["test_episodes"],
         max_steps=config["max_steps_per_episode"],
         selection_interval=config["selection_interval"],
+        rotation_coupling_threshold=config.get("rotation_coupling_threshold", 3),
+        trials_per_episode=config.get("trials_per_episode", 1),
         seed=config["seed"],
         verbose=True,
     )
@@ -986,37 +1341,45 @@ def main():
     # ------------------------------------------------------------------
     # Print summary
     # ------------------------------------------------------------------
-    summary = stats.get_summary()
+    summary = stats.get_summary(trials_per_episode=config.get("trials_per_episode", 1))
 
     logger.info("\n" + "=" * 70)
     logger.info(f"SWITCHER TEST RESULTS (v2) - Mode: {config['selection_mode'].upper()}")
     logger.info("=" * 70)
 
-    logger.info("\n--- Episode Statistics ---")
+    logger.info("\n--- Test Configuration ---")
     logger.info(f"Episodes: {summary['num_episodes']}")
+    logger.info(f"Trials per episode: {summary['trials_per_episode']}")
+    logger.info(f"Total trials: {summary['num_trials']}")
     logger.info(f"Average episode reward: {summary['avg_episode_reward']:.2f}")
-    logger.info(f"Average steps per episode: {summary['avg_steps']:.1f}")
+    logger.info(f"Average steps per trial: {summary['avg_steps']:.1f}")
 
-    logger.info("\n--- Episode-Level Outcomes ---")
-    logger.info(f"  Success (all robots reached goal, 0 collisions): "
-                f"{summary['success_count']}/{summary['num_episodes']}")
-    logger.info(f"  Collision (episode ended by collision/OOB):       "
-                f"{summary['collision_count']}/{summary['num_episodes']}")
-    logger.info(f"  Timeout  (max steps without all goals reached):   "
-                f"{summary['timeout_count']}/{summary['num_episodes']}")
+    logger.info("\n" + "=" * 70)
+    logger.info("TRIAL-LEVEL RESULTS (Per-Trial Success Rate)")
+    logger.info("=" * 70)
+    logger.info(f"  Success trials:   {summary['trial_success_count']}/{summary['num_trials']}")
+    logger.info(f"  Collision trials: {summary['trial_collision_count']}/{summary['num_trials']}")
+    logger.info(f"  Timeout trials:   {summary['trial_timeout_count']}/{summary['num_trials']}")
+    logger.info(f"\n  TRIAL SUCCESS RATE:   {summary['trial_success_rate']:.2%}")
+    logger.info(f"  TRIAL COLLISION RATE: {summary['trial_collision_rate']:.2%}")
+    logger.info(f"  TRIAL TIMEOUT RATE:   {summary['trial_timeout_rate']:.2%}")
 
-    logger.info(f"\n  SUCCESS  RATE: {summary['success_rate']:.2%}")
-    logger.info(f"  COLLISION RATE: {summary['collision_rate']:.2%}")
-    logger.info(f"  TIMEOUT  RATE: {summary['timeout_rate']:.2%}")
+    logger.info("\n" + "=" * 70)
+    logger.info("EPISODE-LEVEL RESULTS (Success if ANY Trial Succeeds)")
+    logger.info("=" * 70)
+    logger.info(f"  Success episodes (at least 1 trial succeeded): "
+                f"{summary['episode_success_count']}/{summary['num_episodes']}")
+    logger.info(f"\n  EPISODE SUCCESS RATE: {summary['episode_success_rate']:.2%}")
 
-    logger.info(f"\n  Avg reward (success episodes):   {summary['avg_success_reward']:.2f}")
-    logger.info(f"  Avg reward (collision episodes):  {summary['avg_collision_reward']:.2f}")
-    logger.info(f"  Avg reward (timeout episodes):    {summary['avg_timeout_reward']:.2f}")
-    logger.info(f"  Avg steps  (success episodes):    {summary['avg_success_steps']:.1f}")
+    logger.info("\n--- Average Rewards by Outcome ---")
+    logger.info(f"  Avg reward (success trials):   {summary['avg_success_reward']:.2f}")
+    logger.info(f"  Avg reward (collision trials): {summary['avg_collision_reward']:.2f}")
+    logger.info(f"  Avg reward (timeout trials):   {summary['avg_timeout_reward']:.2f}")
+    logger.info(f"  Avg steps  (success trials):   {summary['avg_success_steps']:.1f}")
 
-    logger.info("\n--- Path Length Statistics (Success Episodes Only) ---")
+    logger.info("\n--- Path Length Statistics (Success Trials Only) ---")
     if summary["num_success_episodes_for_path"] > 0:
-        logger.info(f"  Based on {summary['num_success_episodes_for_path']} successful episodes")
+        logger.info(f"  Based on {summary['num_success_episodes_for_path']} successful trials")
         logger.info(f"\n  Per-robot average path length:")
         for i, (avg_pl, std_pl) in enumerate(
             zip(summary["per_robot_avg_path_length"], summary["per_robot_std_path_length"])
@@ -1027,7 +1390,7 @@ def main():
             f"{summary['total_avg_path_length']:.3f} ± {summary['total_std_path_length']:.3f}"
         )
     else:
-        logger.info("  No successful episodes — path length unavailable.")
+        logger.info("  No successful trials — path length unavailable.")
 
     logger.info("\n--- Group Execution Statistics ---")
     logger.info(f"Total group executions: {summary['total_executions']}")
@@ -1081,6 +1444,8 @@ def main():
     size_1_groups = {g: d for g, d in detailed.items() if len(g) == 1}
     size_2_groups = {g: d for g, d in detailed.items() if len(g) == 2}
     size_3_groups = {g: d for g, d in detailed.items() if len(g) == 3}
+    size_4_groups = {g: d for g, d in detailed.items() if len(g) == 4}
+    size_7_groups = {g: d for g, d in detailed.items() if len(g) == 7}
 
     if size_1_groups:
         logger.info("\n--- Detailed Collision Breakdown for Size-1 Groups ---")
@@ -1112,6 +1477,30 @@ def main():
             size_3_groups.items(), key=lambda x: x[1]["total_collisions"], reverse=True
         )
         for group, data in sorted_size_3[:10]:
+            if data["total_collisions"] > 0:
+                logger.info(
+                    f"  {list(group)}: {data['total_collisions']} collisions "
+                    f"(intra:{data['intra']}, extra:{data['extra_robot']}, obs:{data['obstacle']})"
+                )
+
+    if size_4_groups:
+        logger.info("\n--- Detailed Collision Breakdown for Size-4 Groups (Rotation-Coupled) ---")
+        sorted_size_4 = sorted(
+            size_4_groups.items(), key=lambda x: x[1]["total_collisions"], reverse=True
+        )
+        for group, data in sorted_size_4[:10]:
+            if data["total_collisions"] > 0:
+                logger.info(
+                    f"  {list(group)}: {data['total_collisions']} collisions "
+                    f"(intra:{data['intra']}, extra:{data['extra_robot']}, obs:{data['obstacle']})"
+                )
+
+    if size_7_groups:
+        logger.info("\n--- Detailed Collision Breakdown for Size-7 Groups (Rotation-Coupled) ---")
+        sorted_size_7 = sorted(
+            size_7_groups.items(), key=lambda x: x[1]["total_collisions"], reverse=True
+        )
+        for group, data in sorted_size_7[:10]:
             if data["total_collisions"] > 0:
                 logger.info(
                     f"  {list(group)}: {data['total_collisions']} collisions "

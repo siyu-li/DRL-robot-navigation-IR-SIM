@@ -88,7 +88,7 @@ CONFIG = {
 
     # Simulation settings
     "world_file": "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
-    "disable_plotting": False,
+    "disable_plotting": True,
     "obstacle_proximity_threshold": 1.5,
     "max_steps_per_episode": 1500,   # Reset episode after this many steps
     
@@ -112,7 +112,7 @@ CONFIG = {
     
     # Debug mode: enables plotting, prints per-group score breakdowns,
     # and pauses after each sample for manual inspection.
-    "debug_mode": True,
+    "debug_mode": False,
     
     # Phase 2 group selection strategy:
     #   "random"  — uniformly random group (original behavior)
