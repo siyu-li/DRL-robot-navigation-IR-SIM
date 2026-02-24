@@ -65,7 +65,7 @@ from robot_nav.models.MARL.groups.action_coupling import (
 # =============================================================================
 CONFIG = {
     # Output configuration
-    "output_path": "robot_nav/models/MARL/switcher/data/new/oracle_data_14robots_decouple_couple_group_len1200_urgency_success.pt",
+    "output_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_couple_group_len1200_success.pt",
 
     # Data collection settings
     "n_samples": 15000,              # Number of samples to collect
@@ -115,7 +115,6 @@ CONFIG = {
     "k_progress": 3.0,             # Progress reward weight (translational)
     "k_rotation_progress": 2.0,    # Rotation progress reward weight
     "k_sync": 3.0,                 # Synchronization reward weight (only active when ≥1 robot reached)
-    "use_urgency": True,             # Enable/disable urgency tracking and bonus for stuck robots
     "k_urgency": 15.0,             # Urgency bonus weight for moving stuck robots (only if use_urgency=True)
     
     # Stuckness detection thresholds
@@ -123,6 +122,7 @@ CONFIG = {
     "min_rotation_threshold": 0.1,          # Minimum average rotation (rad) to avoid stuckness penalty
     
     # Urgency tracking (for stuck robot detection, only if use_urgency=True)
+    "use_urgency": False,             # Enable/disable urgency tracking and bonus for stuck robots
     "urgency_lookback_window": 20,          # Number of recent oracle selections to track per robot
     "urgency_stuck_threshold": 0.3,         # If robot moved < this distance over lookback window, it's stuck
     

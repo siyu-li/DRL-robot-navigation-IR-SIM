@@ -43,7 +43,7 @@ from robot_nav.models.MARL.switcher.supervised import (
 # =============================================================================
 CONFIG = {
     # Data configuration
-    "data_path": "robot_nav/models/MARL/switcher/data/new/oracle_data_14robots_decouple_couple_group_len1200_urgency_success.pt",
+    "data_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_couple_group_len1200_success.pt",
     "embed_dim": 512,              # Dimension of per-robot embeddings: Will be adjust based on data if None
     
     # GroupFeatureBuilder config
@@ -78,7 +78,6 @@ CONFIG = {
     "scalar_hidden": 64,            # Tower 2 output dimension
     "fusion_hidden": 256,           # Fusion layer hidden dimension
     "dropout": 0.1,
-    "use_baseline": False,          # Use GroupSwitcherWithBaseline for RL training
     
     # Training configuration
     "epochs": 100,
@@ -385,9 +384,7 @@ class TrainingConfig:
     embed_hidden: int = 256
     scalar_hidden: int = 32
     fusion_hidden: int = 256
-    dropout: float = 0.1
-    use_baseline: bool = False
-    
+    dropout: float = 0.1    
     # Training
     epochs: int = 100
     batch_size: int = 32
@@ -503,24 +500,14 @@ class SwitcherTrainer:
         """Setup model."""
         config = self.config
         
-        if config.use_baseline:
-            self.model = GroupSwitcherWithBaseline(
-                embed_dim=self.embed_dim,
-                scalar_dim=self.scalar_dim,
-                embed_hidden=config.embed_hidden,
-                scalar_hidden=config.scalar_hidden,
-                fusion_hidden=config.fusion_hidden,
-                dropout=config.dropout,
-            )
-        else:
-            self.model = GroupSwitcher(
-                embed_dim=self.embed_dim,
-                scalar_dim=self.scalar_dim,
-                embed_hidden=config.embed_hidden,
-                scalar_hidden=config.scalar_hidden,
-                fusion_hidden=config.fusion_hidden,
-                dropout=config.dropout,
-            )
+        self.model = GroupSwitcher(
+            embed_dim=self.embed_dim,
+            scalar_dim=self.scalar_dim,
+            embed_hidden=config.embed_hidden,
+            scalar_hidden=config.scalar_hidden,
+            fusion_hidden=config.fusion_hidden,
+            dropout=config.dropout,
+        )
         
         self.model = self.model.to(self.device)
         
@@ -560,13 +547,9 @@ class SwitcherTrainer:
                 X = sample["X"].to(self.device)
                 pairs = sample["pairs"].to(self.device)
                 best_idx = sample["best_idx"]
-                
-                # Forward
-                if self.config.use_baseline:
-                    logits, value = self.model(X)
-                else:
-                    logits = self.model(X)
-                
+
+                logits = self.model(X)
+
                 # Loss
                 loss = self.compute_loss(logits, pairs)
                 batch_loss += loss
@@ -623,13 +606,9 @@ class SwitcherTrainer:
                 X = sample["X"].to(self.device)
                 pairs = sample["pairs"].to(self.device)
                 best_idx = sample["best_idx"]
-                
-                # Forward
-                if self.config.use_baseline:
-                    logits, value = self.model(X)
-                else:
-                    logits = self.model(X)
-                
+
+                logits = self.model(X)
+
                 # Loss
                 loss = self.compute_loss(logits, pairs)
                 
@@ -775,7 +754,6 @@ def main():
         scalar_hidden=cfg["scalar_hidden"],
         fusion_hidden=cfg["fusion_hidden"],
         dropout=cfg["dropout"],
-        use_baseline=cfg["use_baseline"],
         epochs=cfg["epochs"],
         batch_size=cfg["batch_size"],
         lr=cfg["lr"],
