@@ -68,7 +68,7 @@ CONFIG = {
     "output_path": "robot_nav/models/MARL/switcher/data/new/oracle_data_14robots_decouple_couple_group_len1200_urgency_success.pt",
 
     # Data collection settings
-    "n_samples": 10000,              # Number of samples to collect
+    "n_samples": 15000,              # Number of samples to collect
     "n_robots": 14,                  # Number of robots
     "n_obstacles": 7,               # Number of obstacles
     "embed_dim": 512,               # Per-robot embedding dimension from GAT backbone output (2*embedding_dim=2*256)
@@ -115,13 +115,14 @@ CONFIG = {
     "k_progress": 3.0,             # Progress reward weight (translational)
     "k_rotation_progress": 2.0,    # Rotation progress reward weight
     "k_sync": 3.0,                 # Synchronization reward weight (only active when ≥1 robot reached)
-    "k_urgency": 15.0,             # Urgency bonus weight for moving stuck robots
+    "use_urgency": True,             # Enable/disable urgency tracking and bonus for stuck robots
+    "k_urgency": 15.0,             # Urgency bonus weight for moving stuck robots (only if use_urgency=True)
     
     # Stuckness detection thresholds
     "min_displacement_threshold": 0.2,      # Minimum translational displacement to avoid stuckness penalty
     "min_rotation_threshold": 0.1,          # Minimum average rotation (rad) to avoid stuckness penalty
     
-    # Urgency tracking (for stuck robot detection)
+    # Urgency tracking (for stuck robot detection, only if use_urgency=True)
     "urgency_lookback_window": 20,          # Number of recent oracle selections to track per robot
     "urgency_stuck_threshold": 0.3,         # If robot moved < this distance over lookback window, it's stuck
     
@@ -776,9 +777,9 @@ class OracleDataCollector:
         
         # 4. Urgency bonus: reward SINGLE-ROBOT groups that move stuck robots
         # Only size-1 groups get this bonus - they're specifically helping that robot.
-        # If urgency tracking is needed, it must be added to the data collection loop
+        # Disabled when use_urgency=False in CONFIG.
         urgency_bonus = 0.0
-        if urgency_flags is not None and len(group) == 1:
+        if CONFIG.get("use_urgency", True) and urgency_flags is not None and len(group) == 1:
             robot_idx = group[0]
             if not reached_before_rollout[robot_idx] and urgency_flags[robot_idx]:
                 # This single-robot group is moving a stuck robot
@@ -1298,7 +1299,8 @@ class OracleDataCollector:
         heading_error = torch.tensor(heading_errors, dtype=torch.float32)
         
         # Urgency flags (per-robot binary indicator for stuck robots)
-        if urgency_flags is None:
+        # Always zeros when use_urgency=False in CONFIG
+        if urgency_flags is None or not CONFIG.get("use_urgency", True):
             urgency_flags = [False] * N
         urgency_float = torch.tensor(
             [1.0 if u else 0.0 for u in urgency_flags], dtype=torch.float32
@@ -1475,6 +1477,7 @@ class OracleDataCollector:
         reached = [False] * N
         
         # Urgency tracking: maintain a sliding window of recent distances per robot
+        use_urgency = CONFIG.get("use_urgency", True)
         urgency_lookback = CONFIG.get("urgency_lookback_window", 20)
         urgency_stuck_threshold = CONFIG.get("urgency_stuck_threshold", 0.3)
         robot_distance_history = [[] for _ in range(N)]  # List of lists: per-robot distance history
@@ -1500,8 +1503,10 @@ class OracleDataCollector:
         
         for i in pbar:
             # Update urgency tracking: check if robots have been stuck
-            # Add current distances to history for unreached robots ONLY
-            for robot_idx in range(N):
+            # Skip entirely when urgency is disabled
+            if not use_urgency:
+                urgency_flags = [False] * N
+            for robot_idx in range(N) if use_urgency else []:
                 if not reached[robot_idx]:
                     robot_distance_history[robot_idx].append(distance[robot_idx])
                     # Keep only recent lookback_window samples

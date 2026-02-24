@@ -71,7 +71,7 @@ CONFIG = {
     # Urgency flag: Binary indicator for single-robot groups with urgent robots
     #   1.0 if group size == 1 AND that robot is urgent
     #   0.0 otherwise (all multi-robot groups OR non-urgent single robots)
-    "use_urgency_flag": True,
+    "use_urgency_flag": False,
     
     # Model architecture
     "embed_hidden": 256,            # Tower 1 output dimension

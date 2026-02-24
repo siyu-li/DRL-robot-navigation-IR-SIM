@@ -401,6 +401,11 @@ class SwitcherPPO:
         gae_lambda: GAE lambda for advantage estimation.
         eps_clip: PPO clipping range.
         entropy_coeff: Entropy bonus coefficient (encourages exploration).
+            Used as starting value when entropy annealing is enabled.
+        entropy_coeff_end: Final entropy coefficient after annealing.
+            If None, no annealing (constant entropy_coeff).
+        entropy_anneal_updates: Number of updates over which to linearly
+            anneal entropy_coeff from start to end value.  0 = no annealing.
         value_coeff: Value loss coefficient.
         max_grad_norm: Maximum gradient norm for clipping.
         device: Torch device string.
@@ -424,6 +429,8 @@ class SwitcherPPO:
         gae_lambda: float = 0.95,
         eps_clip: float = 0.2,
         entropy_coeff: float = 0.01,
+        entropy_coeff_end: Optional[float] = None,
+        entropy_anneal_updates: int = 0,
         value_coeff: float = 0.5,
         max_grad_norm: float = 1.0,
         device: str = "cpu",
@@ -438,6 +445,11 @@ class SwitcherPPO:
         self.gae_lambda = gae_lambda
         self.eps_clip = eps_clip
         self.entropy_coeff = entropy_coeff
+        self.entropy_coeff_start = entropy_coeff
+        self.entropy_coeff_end = (
+            entropy_coeff_end if entropy_coeff_end is not None else entropy_coeff
+        )
+        self.entropy_anneal_updates = entropy_anneal_updates
         self.value_coeff = value_coeff
         self.max_grad_norm = max_grad_norm
         self.device = device
@@ -586,6 +598,14 @@ class SwitcherPPO:
         if T > 1:
             advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
 
+        # ----- Entropy coefficient annealing -----
+        if self.entropy_anneal_updates > 0:
+            progress = min(self.iter_count / self.entropy_anneal_updates, 1.0)
+            self.entropy_coeff = (
+                self.entropy_coeff_start
+                + (self.entropy_coeff_end - self.entropy_coeff_start) * progress
+            )
+
         # ----- PPO update for K epochs -----
         av_loss = 0.0
         av_policy_loss = 0.0
@@ -643,6 +663,7 @@ class SwitcherPPO:
         self.writer.add_scalar("train/policy_loss", av_policy_loss / iterations, self.iter_count)
         self.writer.add_scalar("train/value_loss", av_value_loss / iterations, self.iter_count)
         self.writer.add_scalar("train/entropy", av_entropy / iterations, self.iter_count)
+        self.writer.add_scalar("train/entropy_coeff", self.entropy_coeff, self.iter_count)
         self.writer.add_scalar("train/buffer_size", T, self.iter_count)
 
         if self.save_every > 0 and self.iter_count % self.save_every == 0:
@@ -674,3 +695,103 @@ class SwitcherPPO:
         if "iter_count" in checkpoint:
             self.iter_count = checkpoint["iter_count"]
         print(f"Loaded SwitcherPPO weights from: {directory}/{filename}.pt")
+
+    def load_supervised_weights(self, checkpoint_path: str):
+        """
+        Load pre-trained supervised GroupSwitcher weights into the actor.
+
+        Remaps supervised layer names to RL actor names:
+            embed_tower  → actor_embed_tower
+            scalar_tower → actor_scalar_tower
+            fusion       → actor_fusion
+
+        Critic weights remain randomly initialized.
+
+        Args:
+            checkpoint_path: Path to supervised training checkpoint (.pt).
+                Expected format (from train_switcher.py):
+                    {"model_state_dict": ..., "config": ..., ...}
+        """
+        checkpoint = torch.load(
+            checkpoint_path, map_location=lambda storage, loc: storage
+        )
+
+        # Handle both training checkpoint and raw state_dict
+        if "model_state_dict" in checkpoint:
+            sup_sd = checkpoint["model_state_dict"]
+        elif "policy_state_dict" in checkpoint:
+            sup_sd = checkpoint["policy_state_dict"]
+        else:
+            sup_sd = checkpoint
+
+        # Remap supervised keys → actor keys
+        name_map = {
+            "embed_tower": "actor_embed_tower",
+            "scalar_tower": "actor_scalar_tower",
+            "fusion": "actor_fusion",
+        }
+
+        actor_sd = {}
+        for key, value in sup_sd.items():
+            prefix = key.split(".")[0]
+            if prefix in name_map:
+                new_key = key.replace(prefix, name_map[prefix], 1)
+                actor_sd[new_key] = value
+
+        if not actor_sd:
+            print("WARNING: No matching weights found in supervised checkpoint!")
+            return
+
+        # Verify shape compatibility before loading
+        current_sd = self.policy.state_dict()
+        for key, value in actor_sd.items():
+            if key in current_sd and current_sd[key].shape != value.shape:
+                raise ValueError(
+                    f"Shape mismatch for '{key}': "
+                    f"supervised={value.shape} vs RL={current_sd[key].shape}. "
+                    f"Ensure scalar_dim matches (supervised: no urgency flag, "
+                    f"scalar_dim=13)."
+                )
+
+        # Load into current policy (strict=False skips critic keys)
+        missing, unexpected = self.policy.load_state_dict(actor_sd, strict=False)
+
+        # Sync to old policy
+        self.policy_old.load_state_dict(self.policy.state_dict())
+
+        # Report
+        critic_missing = [k for k in missing if "critic" in k]
+        other_missing = [k for k in missing if "critic" not in k]
+        print(f"\nLoaded {len(actor_sd)} supervised weights into actor:")
+        for k in sorted(actor_sd.keys()):
+            print(f"  ✓ {k}  {actor_sd[k].shape}")
+        if other_missing:
+            print(f"  ⚠ Non-critic missing keys: {other_missing}")
+        print(f"  ℹ Critic keys (randomly initialized): {len(critic_missing)}")
+
+        if "config" in checkpoint:
+            sup_cfg = checkpoint["config"]
+            print(f"  ℹ Supervised config: embed_dim={sup_cfg.get('embed_dim')}, "
+                  f"scalar_dim={sup_cfg.get('scalar_dim', 'N/A')}, "
+                  f"epochs={sup_cfg.get('epochs')}")
+        print()
+
+    def freeze_actor(self):
+        """Freeze actor parameters (for critic warm-up phase)."""
+        for name, param in self.policy.named_parameters():
+            if name.startswith("actor_"):
+                param.requires_grad = False
+        for name, param in self.policy_old.named_parameters():
+            if name.startswith("actor_"):
+                param.requires_grad = False
+        print("Actor parameters frozen")
+
+    def unfreeze_actor(self):
+        """Unfreeze actor parameters (after critic warm-up)."""
+        for name, param in self.policy.named_parameters():
+            if name.startswith("actor_"):
+                param.requires_grad = True
+        for name, param in self.policy_old.named_parameters():
+            if name.startswith("actor_"):
+                param.requires_grad = True
+        print("Actor parameters unfrozen")

@@ -68,15 +68,17 @@ CONFIG = {
 
     # ---- PPO hyperparameters ----
     "embed_dim": 512,                   # per-robot embedding dim (H from GAT)
-    "lr_actor": 2e-4,                   # lower LR for more frequent updates
+    "lr_actor": 5e-5,                   # slow actor LR to preserve pre-trained features
     "lr_critic": 1e-3,
     "gamma": 0.99,
     "gae_lambda": 0.95,
-    "eps_clip": 0.2,
-    "entropy_coeff": 0.03,             # higher → more exploration (smaller batch needs more)
+    "eps_clip": 0.15,                   # tighter clipping for stable fine-tuning
+    "entropy_coeff": 0.08,             # high initial entropy (annealed down)
+    "entropy_coeff_end": 0.01,         # final entropy coefficient
+    "entropy_anneal_frac": 0.6,        # anneal over first 60% of max_updates
     "value_coeff": 0.5,
     "max_grad_norm": 1.0,
-    "ppo_epochs": 6,                    # fewer epochs for smaller batch (avoid overfitting)
+    "ppo_epochs": 4,                    # fewer epochs to avoid overfitting small buffer
     "embed_hidden": 256,                # hidden dim for embedding tower
     "group_scalar_hidden": 64,
     "fusion_hidden": 256,
@@ -90,6 +92,10 @@ CONFIG = {
     "seed": 42,
     "log_window": 30,                   # wider window for smoother stats
 
+    # ---- Transfer learning (supervised → RL) ----
+    "supervised_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/best.pt",      # path to supervised GroupSwitcher .pt checkpoint
+    "warmup_updates": 200,              # critic warm-up updates with actor frozen
+    
     # ---- Reward coefficients (SwitcherEnv) ----
     "k_progress": 3.0,
     "k_reach": 50.0,
@@ -219,6 +225,8 @@ def main():
         gae_lambda=cfg["gae_lambda"],
         eps_clip=cfg["eps_clip"],
         entropy_coeff=cfg["entropy_coeff"],
+        entropy_coeff_end=cfg.get("entropy_coeff_end"),
+        entropy_anneal_updates=int(cfg.get("entropy_anneal_frac", 0) * cfg["max_updates"]),
         value_coeff=cfg["value_coeff"],
         max_grad_norm=cfg["max_grad_norm"],
         device=device_str,
@@ -243,7 +251,53 @@ def main():
     print(f"Max updates: {cfg['max_updates']}")
     max_decisions = cfg["max_episode_steps"] // cfg["selection_interval"]
     print(f"Max decisions per episode: {max_decisions}")
+    if cfg.get("supervised_checkpoint"):
+        print(f"Supervised checkpoint: {cfg['supervised_checkpoint']}")
+    if cfg.get("warmup_updates", 0) > 0:
+        print(f"Critic warm-up updates: {cfg['warmup_updates']}")
+    if cfg.get("entropy_coeff_end") is not None:
+        anneal_updates = int(cfg.get("entropy_anneal_frac", 0) * cfg["max_updates"])
+        print(f"Entropy annealing: {cfg['entropy_coeff']} → {cfg['entropy_coeff_end']} "
+              f"over {anneal_updates} updates")
     print()
+
+    # ---- 6b. Transfer learning: supervised warm-start ----
+    if cfg.get("supervised_checkpoint"):
+        ppo.load_supervised_weights(cfg["supervised_checkpoint"])
+
+    if cfg.get("warmup_updates", 0) > 0:
+        warmup_updates = cfg["warmup_updates"]
+        print(f"{'=' * 60}")
+        print(f"Critic Warm-up: {warmup_updates} updates (actor frozen)")
+        print(f"{'=' * 60}")
+        ppo.freeze_actor()
+
+        wu_gf, wu_sf = env.reset()
+        wu_episodes = 0
+
+        for wu_update in range(1, warmup_updates + 1):
+            for _ in range(cfg["rollout_steps"]):
+                group_idx = ppo.get_action(wu_gf, wu_sf, explore=True)
+                wu_gf, wu_sf, reward, done, info = env.step(group_idx)
+                ppo.store_reward(reward, done)
+
+                if done:
+                    wu_episodes += 1
+                    wu_gf, wu_sf = env.reset()
+
+            ppo.train(iterations=cfg["ppo_epochs"])
+
+            if wu_update % 20 == 0 or wu_update == warmup_updates:
+                print(f"  Warm-up {wu_update:4d}/{warmup_updates}  "
+                      f"episodes={wu_episodes}")
+
+        ppo.unfreeze_actor()
+        ppo.iter_count = 0  # reset so entropy annealing starts fresh
+        ppo.save(
+            filename=f"{cfg['model_name']}_warmup",
+            directory=Path(cfg["save_directory"]),
+        )
+        print(f"Critic warm-up complete — actor unfrozen\n")
 
     # ---- 7. Training loop ----
     # Rolling statistics
