@@ -308,9 +308,6 @@ class SwitcherActorCritic(nn.Module):
         """
         Re-evaluate stored transitions for PPO update.
 
-        Uses batched computation when all timesteps have the same number of
-        groups M (typical case), falling back to per-sample processing otherwise.
-
         Args:
             group_features_list: List of T tensors, each (M_t, D).
             state_features_batch: (T, S) state features.
@@ -323,56 +320,36 @@ class SwitcherActorCritic(nn.Module):
         """
         T = len(group_features_list)
 
-        # Check if all group feature tensors have the same M (typical case)
-        M0 = group_features_list[0].shape[0]
-        all_same_M = all(x.shape[0] == M0 for x in group_features_list)
+        # ---- Batched path: stack into (T, M, D) and process together ----
+        # Actor: batch all group features
+        X_batch = torch.stack(group_features_list)  # (T, M, D)
+        T_b, M_b, D_b = X_batch.shape
+        X_flat = X_batch.view(T_b * M_b, D_b)      # (T*M, D)
 
-        if all_same_M:
-            # ---- Batched path: stack into (T, M, D) and process together ----
-            # Actor: batch all group features
-            X_batch = torch.stack(group_features_list)  # (T, M, D)
-            T_b, M_b, D_b = X_batch.shape
-            X_flat = X_batch.view(T_b * M_b, D_b)      # (T*M, D)
+        embed_features = X_flat[:, : 2 * self.embed_dim]
+        scalar_features = X_flat[:, 2 * self.embed_dim :]
 
-            embed_features = X_flat[:, : 2 * self.embed_dim]
-            scalar_features = X_flat[:, 2 * self.embed_dim :]
+        e = self.actor_embed_tower(embed_features)    # (T*M, embed_hidden)
+        s = self.actor_scalar_tower(scalar_features)  # (T*M, group_scalar_hidden)
+        fused = torch.cat([e, s], dim=-1)
+        logits_flat = self.actor_fusion(fused).squeeze(-1)  # (T*M,)
+        logits = logits_flat.view(T_b, M_b)           # (T, M)
 
-            e = self.actor_embed_tower(embed_features)    # (T*M, embed_hidden)
-            s = self.actor_scalar_tower(scalar_features)  # (T*M, group_scalar_hidden)
-            fused = torch.cat([e, s], dim=-1)
-            logits_flat = self.actor_fusion(fused).squeeze(-1)  # (T*M,)
-            logits = logits_flat.view(T_b, M_b)           # (T, M)
+        dist = Categorical(logits=logits)
+        log_probs = dist.log_prob(actions)             # (T,)
+        entropies = dist.entropy()                     # (T,)
 
-            dist = Categorical(logits=logits)
-            log_probs = dist.log_prob(actions)             # (T,)
-            entropies = dist.entropy()                     # (T,)
+        # Critic: already batched via state_features_batch (T, S)
+        h_glob_batch = state_features_batch[:, : self.embed_dim]      # (T, embed_dim)
+        scalars_batch = state_features_batch[:, self.embed_dim :]      # (T, state_scalar_dim)
 
-            # Critic: already batched via state_features_batch (T, S)
-            h_glob_batch = state_features_batch[:, : self.embed_dim]      # (T, embed_dim)
-            scalars_batch = state_features_batch[:, self.embed_dim :]      # (T, state_scalar_dim)
+        e_v = self.critic_embed_tower(h_glob_batch)    # (T, value_embed_hidden)
+        s_v = self.critic_scalar_tower(scalars_batch)  # (T, value_scalar_hidden)
+        fused_v = torch.cat([e_v, s_v], dim=-1)
+        values = self.critic_fusion(fused_v).squeeze(-1)  # (T,)
 
-            e_v = self.critic_embed_tower(h_glob_batch)    # (T, value_embed_hidden)
-            s_v = self.critic_scalar_tower(scalars_batch)  # (T, value_scalar_hidden)
-            fused_v = torch.cat([e_v, s_v], dim=-1)
-            values = self.critic_fusion(fused_v).squeeze(-1)  # (T,)
-
-            return log_probs, values, entropies
-        else:
-            # ---- Fallback: per-sample processing ----
-            log_probs = []
-            values = []
-            entropies = []
-
-            for t in range(T):
-                logits = self._actor_logits(group_features_list[t])
-                dist = Categorical(logits=logits)
-
-                log_probs.append(dist.log_prob(actions[t]))
-                entropies.append(dist.entropy())
-                values.append(self._critic_value(state_features_batch[t]))
-
-            return torch.stack(log_probs), torch.stack(values), torch.stack(entropies)
-
+        return log_probs, values, entropies
+        
 
 # =============================================================================
 # PPO Trainer
@@ -410,10 +387,8 @@ class SwitcherPPO:
         max_grad_norm: Maximum gradient norm for clipping.
         device: Torch device string.
         save_every: Save checkpoint every N training updates.
-        load_model: If True, load weights on init.
         save_directory: Directory for saving checkpoints.
         model_name: Base filename for checkpoints.
-        load_directory: Directory to load checkpoints from.
         **net_kwargs: Additional keyword arguments passed to SwitcherActorCritic
             (embed_hidden, group_scalar_hidden, fusion_hidden, etc.).
     """
@@ -435,10 +410,8 @@ class SwitcherPPO:
         max_grad_norm: float = 1.0,
         device: str = "cpu",
         save_every: int = 10,
-        load_model: bool = False,
         save_directory: Path = Path("robot_nav/models/MARL/switcher/checkpoint"),
         model_name: str = "SwitcherPPO",
-        load_directory: Path = Path("robot_nav/models/MARL/switcher/checkpoint"),
         **net_kwargs,
     ):
         self.gamma = gamma
@@ -494,9 +467,6 @@ class SwitcherPPO:
             **net_kwargs,
         ).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
-
-        if load_model:
-            self.load(filename=model_name, directory=load_directory)
 
         self.writer = SummaryWriter(comment=model_name)
 
@@ -695,6 +665,28 @@ class SwitcherPPO:
         if "iter_count" in checkpoint:
             self.iter_count = checkpoint["iter_count"]
         print(f"Loaded SwitcherPPO weights from: {directory}/{filename}.pt")
+
+    def load_weights_only(self, filename: str, directory: Path):
+        """
+        Load network weights only — does NOT restore ``iter_count`` or optimizer state.
+
+        Use this to warm-start from a previously trained checkpoint while
+        restarting entropy annealing and update counting from zero.  For full
+        training resumption (iter_count + optimizer), use :meth:`load` instead.
+
+        Args:
+            filename: Checkpoint filename (without .pt).
+            directory: Directory containing the checkpoint.
+        """
+        checkpoint = torch.load(
+            Path(directory) / f"{filename}.pt",
+            map_location=lambda storage, loc: storage,
+        )
+        state_dict = checkpoint.get("policy_state_dict", checkpoint)
+        self.policy.load_state_dict(state_dict)
+        self.policy_old.load_state_dict(state_dict)
+        print(f"Loaded SwitcherPPO weights (weights only) from: {directory}/{filename}.pt")
+        print(f"  iter_count reset to 0, optimizer state reset")
 
     def load_supervised_weights(self, checkpoint_path: str):
         """

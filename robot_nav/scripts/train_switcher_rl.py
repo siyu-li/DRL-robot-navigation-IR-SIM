@@ -92,23 +92,43 @@ CONFIG = {
     "seed": 42,
     "log_window": 30,                   # wider window for smoother stats
 
-    # ---- Transfer learning (supervised → RL) ----
-    "supervised_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_50.pt",      # path to supervised GroupSwitcher .pt checkpoint
-    "warmup_updates": 200,              # critic warm-up updates with actor frozen
-    
+    # =========================================================================
+    # Loading Mode
+    # =========================================================================
+    # 0 = fresh start (no loading)
+    # 1 = supervised warm-start: load actor from supervised checkpoint,
+    #     freeze actor and warm-up critic for `warmup_updates` updates,
+    #     then unfreeze. iter_count=0, optimizer=fresh.
+    # 2 = resume training: restore weights + optimizer + iter_count,
+    #     entropy annealing continues from where it left off.
+    # 3 = warm-start from RL checkpoint: load weights only,
+    #     iter_count=0, optimizer=reset, annealing restarts.
+    "load_mode": 1,
+    "load_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_50.pt",              # path or name depending on mode:
+    #   mode 1 → full path to supervised .pt file
+    #             e.g. "robot_nav/models/MARL/switcher/runs/switcher/epoch_50.pt"
+    #   mode 2/3 → checkpoint filename without .pt (empty → use model_name)
+    #             e.g. "SwitcherPPO-14robots_update400"
+    # "load_directory": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots",
+    "load_directory": "robot_nav/models/MARL/switcher/runs/switcher",  # for mode 2/3
+    "warmup_updates": 200,              # mode 1 only: critic warm-up updates
+
     # ---- Reward coefficients (SwitcherEnv) ----
-    "k_progress": 2.0,
-    "k_reach": 100.0,
-    "k_all_reached": 500.0,            # large bonus when ALL robots reach goals
-    "k_sync": 8.0,
-    "k_evasion": 1.0,
-    "collision_penalty": -200.0,
-    "time_penalty": -2.0,
+    # Scaled ~20× down so typical per-step reward ∈ [-0.5, +0.5]
+    # and episode returns ∈ [-50, +50].  Keeps value_loss manageable.
+    "k_progress": 0.1,                  # dense: ≈0.05-0.4/step for a group
+    "k_reach": 5.0,                     # sparse: 5/n_remaining per reach
+    "k_all_reached": 25.0,              # sparse: big bonus when ALL reach
+    "k_sync": 0.1,                      # dense: variance reduction
+    "k_evasion": 0.0,                   # disabled for now (set >0 to enable)
+    "collision_penalty": -10.0,
+    "time_penalty": -0.1,
     "robot_proximity_threshold": 1.25,
     "obstacle_proximity_threshold": 1.25,
 
     # ---- Checkpointing ----
     "save_every": 40,                   # save every N PPO updates
+    "checkpoint_every": 200,            # save numbered checkpoint every N updates (0 = off)
     "model_name": "SwitcherPPO-14robots",
     "save_directory": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots",
 }
@@ -241,63 +261,72 @@ def main():
         value_scalar_hidden=cfg["value_scalar_hidden"],
     )
 
+    # ---- Apply loading mode ----
+    load_mode = cfg.get("load_mode", 0)
+    load_checkpoint = cfg.get("load_checkpoint", "") or cfg["model_name"]
+    load_dir = Path(cfg["load_directory"])
+
+    if load_mode not in (0, 1, 2, 3):
+        raise ValueError(f"load_mode must be 0, 1, 2, or 3 (got {load_mode})")
+
+    if load_mode == 1:
+        # Supervised warm-start: load actor weights, warm-up critic, then unfreeze
+        ppo.load_supervised_weights(cfg["load_checkpoint"])
+        warmup_updates = cfg.get("warmup_updates", 0)
+        if warmup_updates > 0:
+            print(f"{'=' * 60}")
+            print(f"[Mode 1] Critic warm-up: {warmup_updates} updates (actor frozen)")
+            print(f"{'=' * 60}")
+            ppo.freeze_actor()
+            wu_gf, wu_sf = env.reset()
+            wu_episodes = 0
+            for wu_update in range(1, warmup_updates + 1):
+                for _ in range(cfg["rollout_steps"]):
+                    group_idx = ppo.get_action(wu_gf, wu_sf, explore=True)
+                    wu_gf, wu_sf, reward, done, info = env.step(group_idx)
+                    ppo.store_reward(reward, done)
+                    if done:
+                        wu_episodes += 1
+                        wu_gf, wu_sf = env.reset()
+                ppo.train(iterations=cfg["ppo_epochs"])
+                if wu_update % 20 == 0 or wu_update == warmup_updates:
+                    print(f"  Warm-up {wu_update:4d}/{warmup_updates}  episodes={wu_episodes}")
+            ppo.unfreeze_actor()
+            ppo.iter_count = 0
+            ppo.save(filename=f"{cfg['model_name']}_warmup", directory=Path(cfg["save_directory"]))
+            print(f"Critic warm-up complete — actor unfrozen\n")
+
+    elif load_mode == 2:
+        # Resume: restore weights + optimizer + iter_count
+        ppo.load(filename=load_checkpoint, directory=load_dir)
+        print(f"[Mode 2] Resumed from: {load_dir}/{load_checkpoint}.pt  "
+              f"(iter_count={ppo.iter_count})")
+
+    elif load_mode == 3:
+        # Warm-start from RL checkpoint: weights only, fresh optimizer & iter_count
+        ppo.load_weights_only(filename=load_checkpoint, directory=load_dir)
+        print(f"[Mode 3] Warm-started from: {load_dir}/{load_checkpoint}.pt")
+
     # ---- Print summary ----
     n_params = sum(p.numel() for p in ppo.policy.parameters())
+    mode_labels = {
+        0: "fresh start",
+        1: "supervised warm-start",
+        2: "resume training",
+        3: "RL warm-start",
+    }
     print(f"\nSwitcherPPO parameters: {n_params:,}")
+    print(f"Load mode: {load_mode} ({mode_labels[load_mode]})")
     print(f"Group feature dim (actor input per group): {fb.group_feature_dim}")
     print(f"State feature dim (critic input): {fb.state_feature_dim}")
     print(f"Rollout steps per update: {cfg['rollout_steps']}")
     print(f"PPO epochs per update: {cfg['ppo_epochs']}")
     print(f"Max updates: {cfg['max_updates']}")
-    max_decisions = cfg["max_episode_steps"] // cfg["selection_interval"]
-    print(f"Max decisions per episode: {max_decisions}")
-    if cfg.get("supervised_checkpoint"):
-        print(f"Supervised checkpoint: {cfg['supervised_checkpoint']}")
-    if cfg.get("warmup_updates", 0) > 0:
-        print(f"Critic warm-up updates: {cfg['warmup_updates']}")
     if cfg.get("entropy_coeff_end") is not None:
         anneal_updates = int(cfg.get("entropy_anneal_frac", 0) * cfg["max_updates"])
         print(f"Entropy annealing: {cfg['entropy_coeff']} → {cfg['entropy_coeff_end']} "
               f"over {anneal_updates} updates")
     print()
-
-    # ---- 6b. Transfer learning: supervised warm-start ----
-    if cfg.get("supervised_checkpoint"):
-        ppo.load_supervised_weights(cfg["supervised_checkpoint"])
-
-    if cfg.get("warmup_updates", 0) > 0:
-        warmup_updates = cfg["warmup_updates"]
-        print(f"{'=' * 60}")
-        print(f"Critic Warm-up: {warmup_updates} updates (actor frozen)")
-        print(f"{'=' * 60}")
-        ppo.freeze_actor()
-
-        wu_gf, wu_sf = env.reset()
-        wu_episodes = 0
-
-        for wu_update in range(1, warmup_updates + 1):
-            for _ in range(cfg["rollout_steps"]):
-                group_idx = ppo.get_action(wu_gf, wu_sf, explore=True)
-                wu_gf, wu_sf, reward, done, info = env.step(group_idx)
-                ppo.store_reward(reward, done)
-
-                if done:
-                    wu_episodes += 1
-                    wu_gf, wu_sf = env.reset()
-
-            ppo.train(iterations=cfg["ppo_epochs"])
-
-            if wu_update % 20 == 0 or wu_update == warmup_updates:
-                print(f"  Warm-up {wu_update:4d}/{warmup_updates}  "
-                      f"episodes={wu_episodes}")
-
-        ppo.unfreeze_actor()
-        ppo.iter_count = 0  # reset so entropy annealing starts fresh
-        ppo.save(
-            filename=f"{cfg['model_name']}_warmup",
-            directory=Path(cfg["save_directory"]),
-        )
-        print(f"Critic warm-up complete — actor unfrozen\n")
 
     # ---- 7. Training loop ----
     # Rolling statistics
@@ -351,6 +380,13 @@ def main():
         # ---- PPO update ----
         ppo.train(iterations=cfg["ppo_epochs"])
         update_count += 1
+
+        # ---- Numbered checkpoint ----
+        checkpoint_every = cfg.get("checkpoint_every", 0)
+        if checkpoint_every > 0 and update_count % checkpoint_every == 0:
+            ckpt_name = f"{cfg['model_name']}_update{update_count}"
+            ppo.save(filename=ckpt_name, directory=Path(cfg["save_directory"]))
+            print(f"✅ Checkpoint saved: {ckpt_name}")
 
         # ---- Logging ----
         if update_count % 1 == 0 and len(ep_rewards) > 0:

@@ -107,13 +107,14 @@ class SwitcherEnv:
     """
 
     # Default reward coefficients (tunable)
-    k_progress: float = 3.0
-    k_reach: float = 100.0
-    k_all_reached: float = 500.0        # large bonus when ALL robots reach goals
-    k_sync: float = 8.0
-    k_evasion: float = 1.0
-    collision_penalty: float = -200.0
-    time_penalty: float = - 2.0
+    # Scaled so per-step ∈ [-0.5, +0.5], episode returns ∈ [-50, +50]
+    k_progress: float = 0.1
+    k_reach: float = 5.0
+    k_all_reached: float = 25.0
+    k_sync: float = 0.4
+    k_evasion: float = 0.0              # set >0 to enable evasion reward
+    collision_penalty: float = -10.0
+    time_penalty: float = -0.1
 
     # Evasion geometry constants
     robot_radius: float = 0.2
@@ -315,11 +316,11 @@ class SwitcherEnv:
 
         # Give a final bonus / penalty on episode end
         if done and all_reached:
-            # Large bonus for finishing — scaled inversely with time used
+            # Bonus for finishing — scaled inversely with time used
             frac_time_left = 1.0 - self._step_count / self.max_episode_steps
             reward += self.k_all_reached * (1.0 + frac_time_left)
         if done and timeout and not all_reached:
-            reward -= 20.0  # timeout penalty
+            reward -= 1.0  # timeout penalty
 
         # ── Observation ──
         group_features, state_features = self._build_obs()
@@ -356,7 +357,7 @@ class SwitcherEnv:
         N = self.num_robots
 
         # Extra reward for large group size
-        group_size_bonus = (len(group) - 1.0) / 3.0  # 0 for size 1, ~1.0 for size 4, >1.0 for size 7
+        group_size_bonus = (len(group) - 1.0) / 3.0  if len(group) > 3 else 0.0
 
         # 1. Collision → big negative, nothing else matters
         if had_collision:
@@ -389,7 +390,7 @@ class SwitcherEnv:
             progress_reward += self.k_progress * progress
         reward += progress_reward
 
-        # 4. Synchronisation: variance reduction across ALL robots (disabled for debugging)
+        # 4. Synchronisation: variance reduction across ALL robots
         # if N >= 2:
         #     var_before = float(np.var(dist_before))
         #     var_after = float(np.var(dist_after))
