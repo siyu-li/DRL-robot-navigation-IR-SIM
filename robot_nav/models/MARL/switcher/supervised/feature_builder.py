@@ -334,34 +334,29 @@ class GroupFeatureBuilder(nn.Module):
         if attn_rr is None:
             return (0.0, 0.0, 0.0)
 
-        group_set = set(group)
-        outside_indices = [j for j in range(n_robots) if j not in group_set]
+        device = attn_rr.device
+        g = torch.tensor(group, dtype=torch.long, device=device)
+        n_g = len(group)
 
-        # A_in
-        if len(group) > 1:
-            a_in_sum = sum(
-                attn_rr[i, j].item() for i in group for j in group if i != j
-            )
-            A_in = a_in_sum / (len(group) * (len(group) - 1))
+        # A_in: mean intra-group attention excluding self-connections
+        if n_g > 1:
+            attn_gg = attn_rr[g][:, g]  # (n_g, n_g)
+            off_diag = ~torch.eye(n_g, dtype=torch.bool, device=device)
+            A_in = attn_gg[off_diag].mean().item()
         else:
             A_in = 0.0
 
-        # A_out
-        if outside_indices:
-            a_out_sum = sum(
-                attn_rr[i, j].item() for i in group for j in outside_indices
-            )
-            A_out = a_out_sum / (len(group) * len(outside_indices))
+        # A_out: mean attention from group to outside robots
+        outside_mask = torch.ones(n_robots, dtype=torch.bool, device=device)
+        outside_mask[g] = False
+        if outside_mask.any():
+            A_out = attn_rr[g][:, outside_mask].mean().item()  # (n_g, n_out)
         else:
             A_out = 0.0
 
-        # A_obs
+        # A_obs: mean attention from group to obstacles
         if attn_ro is not None:
-            n_obs = attn_ro.shape[1]
-            a_obs_sum = sum(
-                attn_ro[i, o].item() for i in group for o in range(n_obs)
-            )
-            A_obs = a_obs_sum / max(len(group) * n_obs, 1)
+            A_obs = attn_ro[g].mean().item()  # (n_g, n_obs)
         else:
             A_obs = 0.0
 

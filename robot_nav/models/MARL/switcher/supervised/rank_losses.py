@@ -127,29 +127,23 @@ def build_pairs_from_scores(
 ) -> torch.LongTensor:
     """
     Build all valid ranking pairs from ground-truth scores.
-    
+
     Creates pairs (i, j) where scores[i] > scores[j] + margin.
-    
+
     Args:
         scores: Ground-truth scores for each group, shape (M,).
         margin: Minimum score difference to create a pair.
-        
+
     Returns:
         Pairs tensor of shape (K, 2), where K is number of valid pairs.
     """
     device = scores.device
-    n = len(scores)
-    
-    pairs = []
-    for i in range(n):
-        for j in range(n):
-            if scores[i] > scores[j] + margin:
-                pairs.append([i, j])
-    
-    if len(pairs) == 0:
+    # Broadcasting: diff[i, j] = scores[i] - scores[j]  →  shape (M, M)
+    diff = scores.unsqueeze(1) - scores.unsqueeze(0)
+    pairs = (diff > margin).nonzero(as_tuple=False).to(dtype=torch.long)
+    if pairs.numel() == 0:
         return torch.zeros(0, 2, device=device, dtype=torch.long)
-    
-    return torch.tensor(pairs, device=device, dtype=torch.long)
+    return pairs
 
 
 def build_pairs_from_ranking(

@@ -221,6 +221,44 @@ class SwitcherDataset(Dataset):
         
         # Validate and preprocess
         self._validate_data()
+        
+        # Pre-compute all features once so __getitem__ is O(1)
+        print("Pre-computing features for all samples (runs once)...")
+        self._precomputed = self._precompute_all()
+        print("Pre-computation done.")
+    
+    def _precompute_all(self) -> List[Dict[str, torch.Tensor]]:
+        """Build and cache features + pairs for every sample up front."""
+        cache = []
+        for sample in self.samples:
+            h            = sample["h"]
+            groups       = sample["groups"]
+            group_scores = sample["group_scores"]
+            h_glob  = sample.get("h_glob",  None)
+            attn_rr = sample.get("attn_rr", None)
+            attn_ro = sample.get("attn_ro", None)
+            extra   = sample.get("extra",   None)
+
+            X = self.feature_builder(
+                h=h, groups=groups, h_glob=h_glob,
+                attn_rr=attn_rr, attn_ro=attn_ro, extra=extra,
+            )  # (M, D_base)
+
+            if self.use_urgency_flag:
+                urgency_flags = self._compute_urgency_flags(groups, extra)
+                X = torch.cat([X, urgency_flags.unsqueeze(1)], dim=1)
+
+            pairs    = build_pairs_from_scores(group_scores)
+            best_idx = int(group_scores.argmax().item())
+
+            cache.append({
+                "X":           X,
+                "group_scores": group_scores,
+                "pairs":        pairs,
+                "best_idx":     best_idx,
+                "n_groups":     len(groups),
+            })
+        return cache
     
     def _validate_data(self):
         """Validate data format."""
@@ -254,6 +292,10 @@ class SwitcherDataset(Dataset):
         return len(self.samples)
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        return self._precomputed[idx]
+
+    def _getitem_slow(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Original (uncached) item getter — kept for reference."""
         sample = self.samples[idx]
         
         # Extract data
@@ -538,58 +580,57 @@ class SwitcherTrainer:
         n_samples = 0
         
         for batch in self.train_loader:
-            # Process each sample in batch individually
-            batch_loss = 0.0
+            batch_size = len(batch)
+            n_groups_list = [s["n_groups"] for s in batch]
+
+            # ── Batched forward pass (when all samples share the same M) ──
+            if len(set(n_groups_list)) == 1:
+                X_batch = torch.stack([s["X"] for s in batch]).to(self.device)  # (B, M, D)
+                B, M, D = X_batch.shape
+                logits_batch = self.model(X_batch.view(B * M, D)).view(B, M)   # (B, M)
+            else:
+                logits_batch = None  # fall back to per-sample forward
+
+            # ── Per-sample loss & metrics ──
+            losses = []
             batch_acc = 0.0
             batch_top1 = 0.0
-            
-            for sample in batch:
-                X = sample["X"].to(self.device)
-                pairs = sample["pairs"].to(self.device)
+
+            for i, sample in enumerate(batch):
+                if logits_batch is not None:
+                    logits = logits_batch[i]
+                else:
+                    X = sample["X"].to(self.device)
+                    logits = self.model(X)
+
+                pairs    = sample["pairs"].to(self.device)
                 best_idx = sample["best_idx"]
 
-                logits = self.model(X)
+                losses.append(self.compute_loss(logits, pairs))
 
-                # Loss
-                loss = self.compute_loss(logits, pairs)
-                batch_loss += loss
-                
-                # Metrics
                 with torch.no_grad():
-                    acc = compute_ranking_accuracy(logits, pairs)
-                    top1 = float(compute_top1_accuracy(logits, best_idx))
-                    batch_acc += acc
-                    batch_top1 += top1
-            
-            # Average over batch
-            batch_size = len(batch)
-            batch_loss = batch_loss / batch_size
-            
-            # Backward
+                    batch_acc  += compute_ranking_accuracy(logits, pairs)
+                    batch_top1 += float(compute_top1_accuracy(logits, best_idx))
+
+            # Average loss over batch, then backward
+            batch_loss = sum(losses) / batch_size
+
             self.optimizer.zero_grad()
             batch_loss.backward()
-            
-            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
             self.optimizer.step()
-            
-            # Accumulate
-            total_loss += batch_loss.item() * batch_size
-            total_acc += batch_acc
-            total_top1 += batch_top1
-            n_samples += batch_size
-            
+
+            total_loss  += batch_loss.item() * batch_size
+            total_acc   += batch_acc
+            total_top1  += batch_top1
+            n_samples   += batch_size
             self.global_step += 1
         
-        # Epoch metrics
-        metrics = {
-            "train/loss": total_loss / n_samples,
-            "train/pair_acc": total_acc / n_samples,
-            "train/top1_acc": total_top1 / n_samples,
+        return {
+            "train/loss":     total_loss  / n_samples,
+            "train/pair_acc": total_acc   / n_samples,
+            "train/top1_acc": total_top1  / n_samples,
         }
-        
-        return metrics
     
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
@@ -602,32 +643,37 @@ class SwitcherTrainer:
         n_samples = 0
         
         for batch in self.val_loader:
-            for sample in batch:
-                X = sample["X"].to(self.device)
-                pairs = sample["pairs"].to(self.device)
+            batch_size = len(batch)
+            n_groups_list = [s["n_groups"] for s in batch]
+
+            # ── Batched forward pass ──
+            if len(set(n_groups_list)) == 1:
+                X_batch = torch.stack([s["X"] for s in batch]).to(self.device)
+                B, M, D = X_batch.shape
+                logits_batch = self.model(X_batch.view(B * M, D)).view(B, M)
+            else:
+                logits_batch = None
+
+            for i, sample in enumerate(batch):
+                if logits_batch is not None:
+                    logits = logits_batch[i]
+                else:
+                    X = sample["X"].to(self.device)
+                    logits = self.model(X)
+
+                pairs    = sample["pairs"].to(self.device)
                 best_idx = sample["best_idx"]
 
-                logits = self.model(X)
-
-                # Loss
-                loss = self.compute_loss(logits, pairs)
-                
-                # Metrics
-                acc = compute_ranking_accuracy(logits, pairs)
-                top1 = float(compute_top1_accuracy(logits, best_idx))
-                
-                total_loss += loss.item()
-                total_acc += acc
-                total_top1 += top1
-                n_samples += 1
+                total_loss  += self.compute_loss(logits, pairs).item()
+                total_acc   += compute_ranking_accuracy(logits, pairs)
+                total_top1  += float(compute_top1_accuracy(logits, best_idx))
+                n_samples   += 1
         
-        metrics = {
-            "val/loss": total_loss / n_samples,
-            "val/pair_acc": total_acc / n_samples,
-            "val/top1_acc": total_top1 / n_samples,
+        return {
+            "val/loss":     total_loss  / n_samples,
+            "val/pair_acc": total_acc   / n_samples,
+            "val/top1_acc": total_top1  / n_samples,
         }
-        
-        return metrics
     
     def save_checkpoint(self, name: str = "checkpoint"):
         """Save model checkpoint."""
