@@ -108,12 +108,12 @@ class SwitcherEnv:
 
     # Default reward coefficients (tunable)
     k_progress: float = 3.0
-    k_reach: float = 50.0
+    k_reach: float = 100.0
     k_all_reached: float = 500.0        # large bonus when ALL robots reach goals
     k_sync: float = 8.0
     k_evasion: float = 1.0
     collision_penalty: float = -200.0
-    time_penalty: float = -0.1
+    time_penalty: float = - 2.0
 
     # Evasion geometry constants
     robot_radius: float = 0.2
@@ -356,7 +356,7 @@ class SwitcherEnv:
         N = self.num_robots
 
         # Extra reward for large group size
-        group_size_bonus = 5.0 if len(group) > 3 else 0.0
+        group_size_bonus = (len(group) - 1.0) / 3.0  # 0 for size 1, ~1.0 for size 4, >1.0 for size 7
 
         # 1. Collision → big negative, nothing else matters
         if had_collision:
