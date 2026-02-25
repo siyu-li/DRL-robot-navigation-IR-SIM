@@ -357,7 +357,7 @@ class SwitcherEnv:
         N = self.num_robots
 
         # Extra reward for large group size
-        group_size_bonus = (len(group) - 1.0) / 3.0  if len(group) > 3 else 0.0
+        group_size_bonus = len(group) / 20.0  if len(group) > 3 else 0.0
 
         # 1. Collision → big negative, nothing else matters
         if had_collision:

@@ -130,7 +130,7 @@ CONFIG = {
     "save_every": 40,                   # save every N PPO updates
     "checkpoint_every": 200,            # save numbered checkpoint every N updates (0 = off)
     "model_name": "SwitcherPPO-14robots",
-    "save_directory": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots",
+    "save_directory": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots/Feb.25",
 }
 
 
