@@ -221,8 +221,8 @@ class SwitcherEnv:
         dist_before = list(self._distance)
         reached_before = list(self._reached)
         n_reached_before = sum(reached_before)
-        poses_before = [list(p) for p in self._poses]  # [[x, y, theta], ...]
-        obstacle_states_before = np.array(self._obstacle_states, dtype=np.float32)
+        poses_before = np.asarray(self._poses, dtype=np.float32)      # (N, 3)
+        obstacle_states_before = np.asarray(self._obstacle_states, dtype=np.float32)
 
         interval_collision = False
         interval_oob = False
@@ -291,8 +291,8 @@ class SwitcherEnv:
                     break
 
         # ── Compute swarm-level reward ──
-        poses_after = [list(p) for p in self._poses]
-        obstacle_states_after = np.array(self._obstacle_states, dtype=np.float32)
+        poses_after = np.asarray(self._poses, dtype=np.float32)         # (N, 3)
+        obstacle_states_after = np.asarray(self._obstacle_states, dtype=np.float32)
 
         reward = self._compute_reward(
             group=group,
@@ -382,12 +382,12 @@ class SwitcherEnv:
         reward += reach_bonus
 
         # 3. Progress reward — summed over *group members* that are unreached
-        for i in group:
-            if reached_before[i]:
-                continue
-            progress = dist_before[i] - dist_after[i]
-            progress_reward += self.k_progress * progress
-        reward += progress_reward
+        # for i in group:
+        #     if reached_before[i]:
+        #         continue
+        #     progress = dist_before[i] - dist_after[i]
+        #     progress_reward += self.k_progress * progress
+        # reward += progress_reward
 
         # 4. Synchronisation: variance reduction across ALL robots (disabled for debugging)
         # if N >= 2:
@@ -395,20 +395,19 @@ class SwitcherEnv:
         #     var_after = float(np.var(dist_after))
         #     sync_reward = self.k_sync * (var_before - var_after)
         #     reward += sync_reward
-        sync_reward = 0.0  # keep variable for debug print
 
         # 5. Evasion reward: encourage clearance improvement & turning away
-        if (
-            self.k_evasion > 0
-            and poses_before is not None
-            and poses_after is not None
-        ):
-            evasion = self._compute_evasion(
-                group, poses_before, poses_after,
-                obstacle_states_before, obstacle_states_after,
-            )
-            evasion_reward = self.k_evasion * evasion
-            reward += evasion_reward
+        # if (
+        #     self.k_evasion > 0
+        #     and poses_before is not None
+        #     and poses_after is not None
+        # ):
+        #     evasion = self._compute_evasion(
+        #         group, poses_before, poses_after,
+        #         obstacle_states_before, obstacle_states_after,
+        #     )
+        #     evasion_reward = self.k_evasion * evasion
+        #     reward += evasion_reward
 
         # 6. Time penalty
         reward += time_penalty
@@ -423,8 +422,8 @@ class SwitcherEnv:
     def _compute_evasion(
         self,
         group: List[int],
-        poses_before: List[List[float]],
-        poses_after: List[List[float]],
+        poses_before,
+        poses_after,
         obstacle_states_before: np.ndarray,
         obstacle_states_after: np.ndarray,
     ) -> float:
@@ -432,100 +431,91 @@ class SwitcherEnv:
         Compute evasion reward — rewards group robots for increasing clearance
         and turning away from nearby robots/obstacles.
 
-        Adapted from the oracle data collector's compute_evasion_reward.
-        Uses proper clearance (center distance minus collision radii).
+        Fully vectorized with numpy broadcasting: replaces the original
+        O(g × N × N_obs) nested Python loops with O(1) numpy operations.
 
         Returns:
             evasion_score: Positive = good evasive maneuver, negative = got closer.
         """
-        robot_collision_dist = 2 * self.robot_radius      # 0.4
-        obstacle_collision_dist = self.obstacle_radius + self.robot_radius  # 0.9
+        if not group:
+            return 0.0
 
-        k_align = 5.0   # Weight for alignment improvement
-        k_dist = 3.0    # Weight for clearance improvement
+        robot_coll_d = 2.0 * self.robot_radius            # 0.4
+        obs_coll_d   = self.obstacle_radius + self.robot_radius  # 0.9
+        k_align      = 5.0
+        k_dist       = 3.0
+        align_thresh = 0.7
+
+        pb = np.asarray(poses_before, dtype=np.float32)   # (N, 3)
+        pa = np.asarray(poses_after,  dtype=np.float32)   # (N, 3)
+        g  = np.asarray(group, dtype=np.int64)            # (Ng,)
+        Ng = len(g)
+
+        xyi0 = pb[g, :2]    # (Ng, 2)  group positions before
+        xyi1 = pa[g, :2]    # (Ng, 2)  group positions after
+        thi0 = pb[g, 2:3]   # (Ng, 1)  group headings before
+        thi1 = pa[g, 2:3]   # (Ng, 1)  group headings after
 
         evasion_score = 0.0
 
-        for i in group:
-            xi0, yi0, th0 = poses_before[i]
-            xi1, yi1, th1 = poses_after[i]
+        # ── Robot-Robot evasion ─────────────────────────────────────────────
+        # d0/d1: direction vectors from group robot i toward every robot j
+        d0_rr = pb[:, :2][np.newaxis] - xyi0[:, np.newaxis]   # (Ng, N, 2)
+        d1_rr = pa[:, :2][np.newaxis] - xyi1[:, np.newaxis]   # (Ng, N, 2)
 
-            # ── Robot-Robot evasion ──
-            for j in range(self.num_robots):
-                if i == j:
-                    continue
+        dist0_rr = np.sqrt((d0_rr ** 2).sum(-1))               # (Ng, N)
+        dist1_rr = np.sqrt((d1_rr ** 2).sum(-1))
+        cl0_rr   = dist0_rr - robot_coll_d                     # (Ng, N)
+        cl1_rr   = dist1_rr - robot_coll_d
 
-                xj0, yj0, _ = poses_before[j]
-                dx0 = xj0 - xi0
-                dy0 = yj0 - yi0
-                center_d0 = math.sqrt(dx0**2 + dy0**2)
-                clearance0 = center_d0 - robot_collision_dist
+        # Exclude self-pairs
+        self_mask = np.zeros((Ng, self.num_robots), dtype=bool)
+        self_mask[np.arange(Ng), g] = True
+        nearby_rr = (cl0_rr < self.robot_proximity_threshold) & ~self_mask  # (Ng, N)
 
-                if clearance0 > self.robot_proximity_threshold:
-                    continue
+        if nearby_rr.any():
+            urgency_rr  = np.clip(self.robot_proximity_threshold - cl0_rr, 0.0, None) / self.robot_proximity_threshold
+            improve_rr  = np.minimum(cl1_rr, self.robot_proximity_threshold) - cl0_rr
+            evasion_score += float((urgency_rr * k_dist * improve_rr * nearby_rr).sum())
 
-                xj1, yj1, _ = poses_after[j]
-                dx1 = xj1 - xi1
-                dy1 = yj1 - yi1
-                center_d1 = math.sqrt(dx1**2 + dy1**2)
-                clearance1 = center_d1 - robot_collision_dist
+            close_rr = nearby_rr & (cl0_rr <= align_thresh)
+            if close_rr.any():
+                ang0_rr   = np.arctan2(d0_rr[..., 1], d0_rr[..., 0])   # (Ng, N)
+                ang1_rr   = np.arctan2(d1_rr[..., 1], d1_rr[..., 0])
+                align0_rr = np.cos(thi0 - ang0_rr)                      # (Ng, N)
+                align1_rr = np.cos(thi1 - ang1_rr)
+                urg_a_rr  = np.clip(align_thresh - cl0_rr, 0.0, None) / align_thresh
+                evasion_score += float((urg_a_rr * k_align * (align0_rr - align1_rr) * close_rr).sum())
 
-                # Clearance improvement (clipped at threshold)
-                clearance1_clip = min(clearance1, self.robot_proximity_threshold)
-                improvement = clearance1_clip - clearance0
-                urgency = max(0.0, self.robot_proximity_threshold - clearance0) / self.robot_proximity_threshold
-                evasion_score += urgency * k_dist * improvement
+        # ── Robot-Obstacle evasion ───────────────────────────────────────────
+        if obstacle_states_before is not None and len(obstacle_states_before) > 0:
+            oxy0 = obstacle_states_before[:, :2]                        # (Nobs, 2)
+            oxy1 = obstacle_states_after[:, :2]
 
-                # Alignment improvement (only when very close)
-                align_thresh = 0.7
-                if clearance0 <= align_thresh:
-                    angle0 = math.atan2(dy0, dx0)
-                    align0 = math.cos(th0 - angle0)
-                    angle1 = math.atan2(dy1, dx1)
-                    align1 = math.cos(th1 - angle1)
-                    align_improv = align0 - align1  # positive = turned away
-                    urgency_a = max(0.0, align_thresh - clearance0) / align_thresh
-                    evasion_score += urgency_a * k_align * align_improv
+            d0_ro  = oxy0[np.newaxis] - xyi0[:, np.newaxis]             # (Ng, Nobs, 2)
+            d1_ro  = oxy1[np.newaxis] - xyi1[:, np.newaxis]
+            dist0_ro = np.sqrt((d0_ro ** 2).sum(-1))                    # (Ng, Nobs)
+            dist1_ro = np.sqrt((d1_ro ** 2).sum(-1))
+            cl0_ro   = dist0_ro - obs_coll_d
+            cl1_ro   = dist1_ro - obs_coll_d
+            nearby_ro = cl0_ro < self.obstacle_proximity_threshold      # (Ng, Nobs)
 
-            # ── Robot-Obstacle evasion ──
-            if obstacle_states_before is not None:
-                n_obs = len(obstacle_states_before)
-                for oidx in range(n_obs):
-                    ox0 = obstacle_states_before[oidx, 0]
-                    oy0 = obstacle_states_before[oidx, 1]
-                    dx0 = ox0 - xi0
-                    dy0 = oy0 - yi0
-                    center_d0 = math.sqrt(dx0**2 + dy0**2)
-                    clearance0 = center_d0 - obstacle_collision_dist
+            if nearby_ro.any():
+                urgency_ro  = np.clip(self.obstacle_proximity_threshold - cl0_ro, 0.0, None) / self.obstacle_proximity_threshold
+                improve_ro  = np.minimum(cl1_ro, self.obstacle_proximity_threshold) - cl0_ro
+                evasion_score += float((urgency_ro * k_dist * improve_ro * nearby_ro).sum())
 
-                    if clearance0 > self.obstacle_proximity_threshold:
-                        continue
-
-                    ox1 = obstacle_states_after[oidx, 0]
-                    oy1 = obstacle_states_after[oidx, 1]
-                    dx1 = ox1 - xi1
-                    dy1 = oy1 - yi1
-                    center_d1 = math.sqrt(dx1**2 + dy1**2)
-                    clearance1 = center_d1 - obstacle_collision_dist
-
-                    # Clearance improvement
-                    clearance1_clip = min(clearance1, self.obstacle_proximity_threshold)
-                    improvement = clearance1_clip - clearance0
-                    urgency = max(0.0, self.obstacle_proximity_threshold - clearance0) / self.obstacle_proximity_threshold
-                    evasion_score += urgency * k_dist * improvement
-
-                    # Alignment improvement
-                    align_thresh = 0.7
-                    if clearance0 <= align_thresh:
-                        angle0 = math.atan2(dy0, dx0)
-                        align0 = math.cos(th0 - angle0)
-                        angle1 = math.atan2(dy1, dx1)
-                        align1 = math.cos(th1 - angle1)
-                        align_improv = align0 - align1
-                        urgency_a = max(0.0, align_thresh - clearance0) / align_thresh
-                        evasion_score += urgency_a * k_align * align_improv
+                close_ro = nearby_ro & (cl0_ro <= align_thresh)
+                if close_ro.any():
+                    ang0_ro   = np.arctan2(d0_ro[..., 1], d0_ro[..., 0])   # (Ng, Nobs)
+                    ang1_ro   = np.arctan2(d1_ro[..., 1], d1_ro[..., 0])
+                    align0_ro = np.cos(thi0 - ang0_ro)                      # (Ng, Nobs)
+                    align1_ro = np.cos(thi1 - ang1_ro)
+                    urg_a_ro  = np.clip(align_thresh - cl0_ro, 0.0, None) / align_thresh
+                    evasion_score += float((urg_a_ro * k_align * (align0_ro - align1_ro) * close_ro).sum())
 
         return evasion_score
+
 
     # ──────────────────── observation ─────────────────────
     def _build_obs(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -591,9 +581,9 @@ class SwitcherEnv:
         reached = torch.as_tensor(reached_np, dtype=torch.float32, device=dev)
 
         # Heading error: |atan2(sin, cos)| per robot — vectorized
-        sin_arr = np.asarray(self._sin, dtype=np.float64)
-        cos_arr = np.asarray(self._cos, dtype=np.float64)
-        heading_np = np.abs(np.arctan2(sin_arr, cos_arr)).astype(np.float32)
+        sin_arr = np.asarray(self._sin, dtype=np.float32)
+        cos_arr = np.asarray(self._cos, dtype=np.float32)
+        heading_np = np.abs(np.arctan2(sin_arr, cos_arr))
         heading_error = torch.as_tensor(heading_np, dtype=torch.float32, device=dev)
 
         frac_reached = float(reached_np.sum()) / N
