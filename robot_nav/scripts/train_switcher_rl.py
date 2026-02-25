@@ -93,17 +93,17 @@ CONFIG = {
     "log_window": 30,                   # wider window for smoother stats
 
     # ---- Transfer learning (supervised → RL) ----
-    "supervised_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/best.pt",      # path to supervised GroupSwitcher .pt checkpoint
+    "supervised_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_50.pt",      # path to supervised GroupSwitcher .pt checkpoint
     "warmup_updates": 200,              # critic warm-up updates with actor frozen
     
     # ---- Reward coefficients (SwitcherEnv) ----
-    "k_progress": 3.0,
-    "k_reach": 50.0,
+    "k_progress": 2.0,
+    "k_reach": 100.0,
     "k_all_reached": 500.0,            # large bonus when ALL robots reach goals
     "k_sync": 8.0,
     "k_evasion": 1.0,
     "collision_penalty": -200.0,
-    "time_penalty": -0.1,
+    "time_penalty": -2.0,
     "robot_proximity_threshold": 1.25,
     "obstacle_proximity_threshold": 1.25,
 

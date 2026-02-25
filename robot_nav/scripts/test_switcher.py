@@ -36,6 +36,12 @@ from robot_nav.models.MARL.switcher.supervised import (
     GroupFeatureBuilder,
     GroupSwitcher,
 )
+from robot_nav.models.MARL.switcher.rl import (
+    RLFeatureBuilder,
+    GROUP_SCALAR_DIM,
+    STATE_SCALAR_DIM,
+    SwitcherActorCritic,
+)
 from robot_nav.models.MARL.groups.group_generator import (
     generate_all_groups,
     filter_groups_by_size,
@@ -50,15 +56,16 @@ logger.disable("irsim")
 # Configuration Dictionary - Edit these values directly
 # =============================================================================
 CONFIG = {
-    # Selection mode: "switcher" or "random"
-    "selection_mode": "switcher",  # Change to "random" for baseline comparison
+    # Selection mode: "switcher", "rl_switcher", or "random"
+    "selection_mode": "rl_switcher",  # Change to "random" for baseline, "rl_switcher" for RL-trained
 
     # Group selection strategy for switcher mode:
     #   "argmax"  — always select the highest-scoring group (deterministic)
     #   "top_k"   — uniformly random from top k groups (original behavior)
     #   "softmax" — sample from all groups weighted by softmax of scores
-    "selection_strategy": "softmax",  # Options: "argmax", "top_k", "softmax"
-    
+    #   "sample"  — RL stochastic policy
+    "selection_strategy": "sample",  # Options: "argmax", "top_k", "softmax"
+
     # Top-k selection: randomly select from top k groups (only used if selection_strategy="top_k")
     # Set to 1 for deterministic (always best), >1 for stochastic selection
     "top_k_selection": 60,
@@ -74,8 +81,11 @@ CONFIG = {
     # Number of trials per episode (same obstacles/start/goal configuration)
     "trials_per_episode": 3,
 
-    # Switcher model configuration
-    "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_60.pt",
+    # Switcher model configuration (supervised)
+    "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_50.pt",
+
+    # RL switcher model configuration (PPO-trained)
+    "rl_switcher_checkpoint": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots/SwitcherPPO-14robots.pt",
 
     # Decentralized model configuration (used for all action generation)
     # "decentralized_model_name": "TD3-MARL-obstacle-14robots",
@@ -135,7 +145,7 @@ CONFIG = {
     ],
     
     # Urgency tracking (for stuck robot detection)
-    "use_urgency_flag": True,       # Enable urgency flag as additional scalar feature
+    "use_urgency_flag": False,       # Enable urgency flag as additional scalar feature
     "urgency_lookback_window": 20,  # Number of steps to track per robot
     "urgency_stuck_threshold": 0.3, # If robot moved < this distance over lookback, it's stuck
 
@@ -807,6 +817,213 @@ class SwitcherGroupSelector:
 
 
 # =============================================================================
+# RL Switcher-Based Group Selector
+# =============================================================================
+class RLSwitcherGroupSelector:
+    """
+    Selects groups using the RL-trained SwitcherActorCritic network (PPO).
+
+    Uses the policy's attention module to get embeddings and attention,
+    then builds group features via RLFeatureBuilder and scores them
+    using the trained actor (``_actor_logits``).
+
+    Key differences from supervised SwitcherGroupSelector:
+    - Uses ``RLFeatureBuilder`` (fixed 13-dim group scalars, separate state features)
+      instead of ``GroupFeatureBuilder`` (configurable extra_group/extra_global).
+    - Uses ``SwitcherActorCritic._actor_logits(X)`` instead of ``GroupSwitcher(X)``.
+    - Extra dict uses ``"var_dist_to_goal"`` key (broadcast N-dim tensor)
+      instead of ``"var_dist_goal_global"`` (scalar).
+    - No urgency flag (RL feature builder doesn't include it).
+    """
+
+    def __init__(
+        self,
+        actor_critic: SwitcherActorCritic,
+        feature_builder: RLFeatureBuilder,
+        policy: TD3Obstacle,
+        groups: List[List[int]],
+        device: torch.device,
+        selection_strategy: str = "argmax",
+        softmax_temperature: float = 1.0,
+    ):
+        self.actor_critic = actor_critic.to(device)
+        self.actor_critic.eval()
+        self.feature_builder = feature_builder
+        self.policy = policy
+        self.groups = groups
+        self.device = device
+
+        if selection_strategy not in ["argmax", "sample", "softmax"]:
+            raise ValueError(
+                f"Invalid selection_strategy for RL switcher: {selection_strategy}. "
+                f"Must be 'argmax', 'sample', or 'softmax'."
+            )
+        self.selection_strategy = selection_strategy
+        self.softmax_temperature = max(0.01, softmax_temperature)
+
+    def _get_embeddings_and_attention(
+        self,
+        robot_obs: np.ndarray,
+        obstacle_obs: np.ndarray,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get robot embeddings and attention weights from the frozen policy."""
+        robot_tensor = torch.tensor(robot_obs, dtype=torch.float32, device=self.device)
+        obstacle_tensor = torch.tensor(obstacle_obs, dtype=torch.float32, device=self.device)
+
+        if robot_tensor.dim() == 2:
+            robot_tensor = robot_tensor.unsqueeze(0)
+            obstacle_tensor = obstacle_tensor.unsqueeze(0)
+
+        with torch.no_grad():
+            (
+                H,
+                hard_logits_rr, hard_logits_ro,
+                dist_rr, dist_ro,
+                mean_entropy,
+                hard_weights_rr,
+                hard_weights_ro,
+                combined_weights,
+            ) = self.policy.actor.attention(robot_tensor, obstacle_tensor)
+
+        batch_size = robot_tensor.shape[0]
+        n_robots = robot_tensor.shape[1]
+        embed_dim = H.shape[-1]
+
+        h = H.view(batch_size, n_robots, embed_dim).squeeze(0)
+        attn_rr = hard_weights_rr.squeeze(0)
+        attn_ro = hard_weights_ro.squeeze(0)
+
+        return h, attn_rr, attn_ro
+
+    def _build_extra(
+        self,
+        distance: List[float],
+        reached_goal: List[bool],
+        poses: List[List[float]],
+        goals: List[List[float]],
+        sim: MARL_SIM_OBSTACLE,
+        current_step: int,
+        max_steps: int,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Build extra features dict matching RLFeatureBuilder's expected keys.
+
+        RLFeatureBuilder expects broadcast tensors (shape (N,)) for global scalars,
+        and uses key ``"var_dist_to_goal"`` (not ``"var_dist_goal_global"``).
+        """
+        num_robots = sim.num_robots
+
+        dist_to_goal = torch.tensor(distance, dtype=torch.float32, device=self.device)
+
+        clearances = []
+        for i in range(num_robots):
+            clearances.append(sim.get_min_obstacle_clearance(i))
+        clearance = torch.tensor(clearances, dtype=torch.float32, device=self.device)
+
+        reached = torch.tensor(
+            [1.0 if r else 0.0 for r in reached_goal],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        heading_errors = []
+        for i in range(num_robots):
+            dx = goals[i][0] - poses[i][0]
+            dy = goals[i][1] - poses[i][1]
+            goal_angle = np.arctan2(dy, dx)
+            current_angle = poses[i][2]
+            angle_diff = abs(goal_angle - current_angle)
+            angle_diff = min(angle_diff, 2 * np.pi - angle_diff)
+            heading_errors.append(angle_diff)
+        heading_error = torch.tensor(heading_errors, dtype=torch.float32, device=self.device)
+
+        # Global scalars — RLFeatureBuilder expects broadcast (N,) tensors,
+        # accessed via extra["key"][0]
+        var_dist_val = torch.var(dist_to_goal).item()
+        frac_reached_val = sum(reached_goal) / max(num_robots, 1)
+        steps_frac_val = current_step / max(max_steps, 1)
+
+        var_dist_to_goal = torch.full(
+            (num_robots,), var_dist_val, dtype=torch.float32, device=self.device
+        )
+        frac_reached_global = torch.full(
+            (num_robots,), frac_reached_val, dtype=torch.float32, device=self.device
+        )
+        steps_elapsed_frac = torch.full(
+            (num_robots,), steps_frac_val, dtype=torch.float32, device=self.device
+        )
+
+        return {
+            "dist_to_goal": dist_to_goal,
+            "clearance": clearance,
+            "reached": reached,
+            "heading_error": heading_error,
+            "var_dist_to_goal": var_dist_to_goal,
+            "frac_reached_global": frac_reached_global,
+            "steps_elapsed_frac": steps_elapsed_frac,
+        }
+
+    @torch.no_grad()
+    def select_group(
+        self,
+        robot_obs: np.ndarray,
+        obstacle_obs: np.ndarray,
+        distance: List[float],
+        reached_goal: List[bool],
+        poses: List[List[float]],
+        goals: List[List[float]],
+        sim: MARL_SIM_OBSTACLE,
+        current_step: int,
+        max_steps: int,
+        urgency_flags: Optional[List[bool]] = None,
+    ) -> List[int]:
+        """
+        Select a group using the RL-trained actor-critic.
+
+        Selection strategies:
+        - "argmax": Always select the group with highest logit (greedy).
+        - "sample": Sample from the Categorical distribution (as during training).
+        - "softmax": Temperature-scaled softmax sampling.
+        """
+        h, attn_rr, attn_ro = self._get_embeddings_and_attention(robot_obs, obstacle_obs)
+        extra = self._build_extra(
+            distance, reached_goal, poses, goals, sim, current_step, max_steps
+        )
+
+        # Build group features via RLFeatureBuilder.forward() → (M, D)
+        group_features = self.feature_builder(
+            h=h,
+            groups=self.groups,
+            h_glob=None,
+            attn_rr=attn_rr,
+            attn_ro=attn_ro,
+            extra=extra,
+        )
+
+        group_features = group_features.to(self.device)
+
+        # Get actor logits → (M,)
+        logits = self.actor_critic._actor_logits(group_features)
+
+        if self.selection_strategy == "argmax":
+            selected_idx = logits.argmax().item()
+
+        elif self.selection_strategy == "sample":
+            dist = torch.distributions.Categorical(logits=logits)
+            selected_idx = dist.sample().item()
+
+        elif self.selection_strategy == "softmax":
+            scaled_logits = logits / self.softmax_temperature
+            probs = torch.softmax(scaled_logits, dim=0)
+            selected_idx = torch.multinomial(probs, num_samples=1).item()
+
+        else:
+            raise ValueError(f"Unknown selection strategy: {self.selection_strategy}")
+
+        return self.groups[selected_idx]
+
+
+# =============================================================================
 # Collision Detection Helper (unchanged from v1)
 # =============================================================================
 def classify_collisions(
@@ -901,6 +1118,7 @@ def run_test_evaluation(
     trials_per_episode: int = 1,
     seed: int = 42,
     verbose: bool = True,
+    rl_switcher_selector: Optional[RLSwitcherGroupSelector] = None,
 ) -> TestStatistics:
     """
     Run test evaluation with either switcher or random group selection.
@@ -1014,6 +1232,19 @@ def run_test_evaluation(
 
                     if selection_mode == "switcher" and switcher_selector is not None:
                         current_group = switcher_selector.select_group(
+                            robot_obs=robot_obs,
+                            obstacle_obs=obstacle_states,
+                            distance=distance,
+                            reached_goal=reached_goal,
+                            poses=poses,
+                            goals=goal_positions,
+                            sim=sim,
+                            current_step=steps,
+                            max_steps=max_steps,
+                            urgency_flags=urgency_flags,
+                        )
+                    elif selection_mode == "rl_switcher" and rl_switcher_selector is not None:
+                        current_group = rl_switcher_selector.select_group(
                             robot_obs=robot_obs,
                             obstacle_obs=obstacle_states,
                             distance=distance,
@@ -1205,6 +1436,7 @@ def main():
     # Setup switcher selector if needed
     # ------------------------------------------------------------------
     switcher_selector = None
+    rl_switcher_selector = None
     if config["selection_mode"] == "switcher":
         logger.info("Loading trained switcher...")
 
@@ -1272,6 +1504,92 @@ def main():
         elif strategy == "softmax":
             logger.info(f"Switcher selector: softmax sampling (temperature={config.get('softmax_temperature', 1.0)})")
 
+    elif config["selection_mode"] == "rl_switcher":
+        logger.info("Loading RL-trained switcher (PPO)...")
+
+        rl_checkpoint_path = Path(config["rl_switcher_checkpoint"])
+        if not rl_checkpoint_path.exists():
+            logger.error(f"RL switcher checkpoint not found: {rl_checkpoint_path}")
+            logger.info("Please train the RL switcher first or use 'random'/'switcher' mode.")
+            return
+
+        rl_checkpoint = torch.load(rl_checkpoint_path, map_location=device)
+
+        # Checkpoint saved by SwitcherPPO.save() contains:
+        #   "policy_state_dict" — SwitcherActorCritic state dict
+        #   "optimizer_state_dict" — Adam optimizer state
+        #   "iter_count" — training iteration counter
+        if "policy_state_dict" not in rl_checkpoint:
+            logger.error(
+                f"RL checkpoint missing 'policy_state_dict' key. "
+                f"Available keys: {list(rl_checkpoint.keys())}"
+            )
+            return
+
+        # Determine embed_dim from the checkpoint weights
+        # actor_embed_tower.0.weight has shape (embed_hidden, 2*embed_dim)
+        embed_tower_weight = rl_checkpoint["policy_state_dict"]["actor_embed_tower.0.weight"]
+        embed_dim = embed_tower_weight.shape[1] // 2  # 2*embed_dim → embed_dim
+
+        # Build RLFeatureBuilder
+        rl_feature_builder = RLFeatureBuilder(
+            embed_dim=embed_dim,
+            pooling="mean",
+            max_group_size=config.get("max_group_size", 7),
+            rotation_coupling_threshold=config.get("rotation_coupling_threshold", 3),
+        )
+
+        # Build SwitcherActorCritic with matching architecture
+        # Infer hidden dims from checkpoint weight shapes
+        sd = rl_checkpoint["policy_state_dict"]
+        embed_hidden = sd["actor_embed_tower.0.weight"].shape[0]
+        group_scalar_hidden = sd["actor_scalar_tower.0.weight"].shape[0]
+        group_scalar_dim = sd["actor_scalar_tower.0.weight"].shape[1]
+        fusion_hidden = sd["actor_fusion.0.weight"].shape[0]
+        value_embed_hidden = sd["critic_embed_tower.0.weight"].shape[0]
+        value_scalar_hidden = sd["critic_scalar_tower.0.weight"].shape[0]
+        state_scalar_dim = sd["critic_scalar_tower.0.weight"].shape[1]
+
+        actor_critic = SwitcherActorCritic(
+            embed_dim=embed_dim,
+            group_scalar_dim=group_scalar_dim,
+            state_scalar_dim=state_scalar_dim,
+            embed_hidden=embed_hidden,
+            group_scalar_hidden=group_scalar_hidden,
+            fusion_hidden=fusion_hidden,
+            value_embed_hidden=value_embed_hidden,
+            value_scalar_hidden=value_scalar_hidden,
+        )
+
+        actor_critic.load_state_dict(rl_checkpoint["policy_state_dict"])
+        logger.info(f"Loaded RL switcher from {rl_checkpoint_path}")
+        logger.info(f"  Embed dim: {embed_dim}")
+        logger.info(f"  Group scalar dim: {group_scalar_dim} (expected {GROUP_SCALAR_DIM})")
+        logger.info(f"  State scalar dim: {state_scalar_dim} (expected {STATE_SCALAR_DIM})")
+        logger.info(f"  Architecture: embed_hidden={embed_hidden}, "
+                     f"group_scalar_hidden={group_scalar_hidden}, "
+                     f"fusion_hidden={fusion_hidden}")
+        if "iter_count" in rl_checkpoint:
+            logger.info(f"  Training iterations: {rl_checkpoint['iter_count']}")
+
+        # Map supervised strategies to RL equivalents
+        rl_strategy = config.get("selection_strategy", "argmax")
+        if rl_strategy == "top_k":
+            rl_strategy = "sample"  # top_k doesn't apply to RL; use Categorical sampling
+            logger.info("Note: 'top_k' strategy not supported for RL switcher, using 'sample'.")
+
+        rl_switcher_selector = RLSwitcherGroupSelector(
+            actor_critic=actor_critic,
+            feature_builder=rl_feature_builder,
+            policy=policy,
+            groups=groups,
+            device=device,
+            selection_strategy=rl_strategy,
+            softmax_temperature=config.get("softmax_temperature", 1.0),
+        )
+
+        logger.info(f"RL switcher selector strategy: {rl_strategy}")
+
     # ------------------------------------------------------------------
     # Run evaluation
     # ------------------------------------------------------------------
@@ -1293,6 +1611,7 @@ def main():
         trials_per_episode=config.get("trials_per_episode", 1),
         seed=config["seed"],
         verbose=True,
+        rl_switcher_selector=rl_switcher_selector,
     )
 
     # ------------------------------------------------------------------
