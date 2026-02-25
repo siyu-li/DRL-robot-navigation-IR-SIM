@@ -382,12 +382,12 @@ class SwitcherEnv:
         reward += reach_bonus
 
         # 3. Progress reward — summed over *group members* that are unreached
-        # for i in group:
-        #     if reached_before[i]:
-        #         continue
-        #     progress = dist_before[i] - dist_after[i]
-        #     progress_reward += self.k_progress * progress
-        # reward += progress_reward
+        for i in group:
+            if reached_before[i]:
+                continue
+            progress = dist_before[i] - dist_after[i]
+            progress_reward += self.k_progress * progress
+        reward += progress_reward
 
         # 4. Synchronisation: variance reduction across ALL robots (disabled for debugging)
         # if N >= 2:
