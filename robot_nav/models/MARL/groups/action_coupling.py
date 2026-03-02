@@ -2,13 +2,17 @@
 Action Coupling for Group-Based Robot Control.
 
 Applies velocity coupling rules to robot groups:
-  - All groups (size ≥ 2): coupled linear velocity = min of scaled linear vels.
+  - All groups (size ≥ 2): coupled linear velocity = mean of scaled linear vels.
   - Groups with size > rotation_coupling_threshold: also couple angular velocity
     (average of group members).
   - Size-1 groups: just scale the individual robot's action.
   - Robots NOT in the active group get [0, 0].
 
 Linear velocity scaling: raw ∈ [-1, 1] → scaled ∈ [0, 0.5] via (v + 1) / 4.
+
+Using mean (instead of min) allows groups containing both reached and unreached
+robots to still move, since a reached robot's near-zero velocity no longer
+drags the entire group to a halt.
 
 Two entry points:
   - ``actions_for_group``:          runs the policy forward pass, then couples.
@@ -34,8 +38,8 @@ def actions_for_group_from_raw(
 
     Coupling rules:
       - Size 1: individual action, no coupling.
-      - Size 2–3: coupled linear velocity (min), individual angular velocity.
-      - Size > threshold (if ``use_rotation_coupling``): coupled linear (min)
+      - Size 2–3: coupled linear velocity (mean), individual angular velocity.
+      - Size > threshold (if ``use_rotation_coupling``): coupled linear (mean)
         AND coupled angular (mean).
       - Inactive robots get ``[0.0, 0.0]``.
 
@@ -69,8 +73,8 @@ def actions_for_group_from_raw(
                 a_out.append([0.0, 0.0])
         return a_out
 
-    # Size >= 2: coupled linear velocity = minimum
-    v_coupled = min(scaled_lin_vels)
+    # Size >= 2: coupled linear velocity = mean
+    v_coupled = sum(scaled_lin_vels) / len(scaled_lin_vels)
 
     # Angular velocity coupling for large groups
     if group_size > rotation_coupling_threshold and use_rotation_coupling:

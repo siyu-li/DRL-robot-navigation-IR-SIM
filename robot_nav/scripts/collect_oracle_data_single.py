@@ -78,7 +78,7 @@ CONFIG = {
     # When True, groups with size > 3 use coupled rotation in addition to
     # coupled linear velocity. All robots in the group rotate at the same
     # angular velocity (average of individual angular velocities) and move
-    # at the same linear velocity (minimum of individual linear velocities).
+    # at the same linear velocity (average of individual linear velocities).
     # Groups with size <= 3 always keep individual angular velocities.
     "use_rotation_coupling": True,
     
@@ -92,7 +92,7 @@ CONFIG = {
 
     # Simulation settings
     "world_file": "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
-    "disable_plotting": True,
+    "disable_plotting": False,
     "obstacle_proximity_threshold": 1.5,
     "max_steps_per_episode": 1500,   # Reset episode after this many steps
     
@@ -104,20 +104,21 @@ CONFIG = {
     "k_progress": 3.0,             # Progress reward weight (translational)
     "k_rotation_progress": 2.0,    # Rotation progress reward weight
     "k_sync": 3.0,                 # Synchronization reward weight (only active when ≥1 robot reached)
-    "k_urgency": 15.0,             # Urgency bonus weight for moving stuck robots
+    "k_urgency": 15.0,             # Urgency bonus weight for moving stuck robots (only if use_urgency=True)
     
     # Stuckness detection thresholds
     "min_displacement_threshold": 0.2,      # Minimum translational displacement to avoid stuckness penalty
     "min_rotation_threshold": 0.1,          # Minimum average rotation (rad) to avoid stuckness penalty
     
-    # Urgency tracking (for stuck robot detection)
+    # Urgency tracking (for stuck robot detection, only if use_urgency=True)
+    "use_urgency": False,             # Enable/disable urgency tracking and bonus for stuck robots
     "urgency_lookback_window": 20,          # Number of recent oracle selections to track per robot
     "urgency_stuck_threshold": 0.3,         # If robot moved < this distance over lookback window, it's stuck
     
     # Debug mode: enables plotting, prints per-group score breakdowns,
     # and pauses after each sample for manual inspection.
-    "debug_mode": False,
-    
+    "debug_mode": True,
+
     # Phase 2 group selection strategy:
     #   "random"  — uniformly random group (original behavior)
     #   "softmax" — sample from all groups weighted by softmax of oracle scores
@@ -245,10 +246,10 @@ class OracleDataCollector:
     For each candidate group, simulates forward H steps and accumulates rewards.
     Uses only the decentralized TD3Obstacle policy:
     - For size-1 groups: use individual robot's action directly
-    - For size-2/3 groups: min linear velocities of robots in the group
+    - For size-2/3 groups: average linear velocities of robots in the group
       to get coupled linear velocity, keep individual angular velocities
     - For size-4/7 groups (rotation-coupled, if use_rotation_coupling=True):
-      min linear velocity AND average angular velocity — all robots in the
+      average linear velocity AND average angular velocity — all robots in the
       group move and rotate at the same speed
     - For size-4/7 groups (if use_rotation_coupling=False):
       same as size-2/3 (coupled linear only, individual angular)
@@ -644,10 +645,9 @@ class OracleDataCollector:
             return -50.0
         
         # Extra score for coupled group (size > 3)
-        # Only give bonus if NO robots in the group have already reached
-        # (coupling doesn't make sense if some robots are already at goal)
-        any_in_group_reached = any(reached_before_rollout[i] for i in group)
-        coupled_group_score = 5.0 if (len(group) > 3 and not any_in_group_reached) else 0.0
+        # With mean-based linear coupling, mixed reached/unreached groups are
+        # viable, so we no longer exclude groups containing reached robots.
+        coupled_group_score = len(group) / 2 if len(group) > 3 else 0.0
         score = coupled_group_score
         breakdown["coupled_group_score"] = coupled_group_score
         
@@ -722,8 +722,9 @@ class OracleDataCollector:
         # 4. Urgency bonus: reward SINGLE-ROBOT groups that move stuck robots
         # Only size-1 groups get this bonus - they're specifically helping that robot.
         # Multi-robot groups dilute the help and shouldn't get urgency bonus.
+        # Gated by use_urgency config flag.
         urgency_bonus = 0.0
-        if urgency_flags is not None and len(group) == 1:
+        if CONFIG.get("use_urgency", False) and urgency_flags is not None and len(group) == 1:
             robot_idx = group[0]
             if not reached_before_rollout[robot_idx] and urgency_flags[robot_idx]:
                 # This single-robot group is moving a stuck robot
@@ -1680,7 +1681,7 @@ def main():
     if config.get("include_size_7", False): sizes_included.append("7")
     print(f"Group sizes included: {', '.join(sizes_included)}")
     if config.get("use_rotation_coupling", True):
-        print(f"Rotation coupling: ON for groups with size > 3 (avg angular vel, min linear vel)")
+        print(f"Rotation coupling: ON for groups with size > 3 (avg angular vel, avg linear vel)")
     else:
         print(f"Rotation coupling: OFF (all groups use individual angular vel)")
     phase2_mode = config.get("phase2_selection", "random")

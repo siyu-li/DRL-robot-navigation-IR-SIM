@@ -104,7 +104,7 @@ CONFIG = {
     # 3 = warm-start from RL checkpoint: load weights only,
     #     iter_count=0, optimizer=reset, annealing restarts.
     "load_mode": 1,
-    "load_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_50.pt",              # path or name depending on mode:
+    "load_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_100.pt",              # path or name depending on mode:
     #   mode 1 → full path to supervised .pt file
     #             e.g. "robot_nav/models/MARL/switcher/runs/switcher/epoch_50.pt"
     #   mode 2/3 → checkpoint filename without .pt (empty → use model_name)
@@ -130,7 +130,7 @@ CONFIG = {
     "save_every": 40,                   # save every N PPO updates
     "checkpoint_every": 200,            # save numbered checkpoint every N updates (0 = off)
     "model_name": "SwitcherPPO-14robots",
-    "save_directory": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots/Feb.25",
+    "save_directory": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots/Mar.01",
 }
 
 

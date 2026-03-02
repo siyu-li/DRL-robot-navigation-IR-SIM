@@ -286,8 +286,7 @@ class OracleEvaluator:
             return -50.0
 
         # coupled group bonus
-        any_in_group_reached = any(reached_before[i] for i in group)
-        score = 5.0 if (len(group) > 3 and not any_in_group_reached) else 0.0
+        score = len(group) / 2 if len(group) > 3 else 0.0
 
         # reach bonus
         if n_new_reached > 0:

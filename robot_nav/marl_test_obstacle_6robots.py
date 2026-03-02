@@ -17,8 +17,9 @@ from shapely.geometry import Point
 from robot_nav.models.MARL.marlTD3.marlTD3_obstacle import TD3Obstacle
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 
-# Suppress IRSim warnings
-logging.getLogger('irsim').setLevel(logging.ERROR)
+# Suppress IRSim warnings - irsim uses loguru, not standard logging
+from loguru import logger
+logger.disable("irsim")
 
 
 def outside_of_bounds(poses, sim):

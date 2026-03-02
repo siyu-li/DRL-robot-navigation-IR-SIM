@@ -65,7 +65,7 @@ from robot_nav.models.MARL.groups.action_coupling import (
 # =============================================================================
 CONFIG = {
     # Output configuration
-    "output_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_couple_group_len1200_success.pt",
+    "output_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_couple_group_len1200_avev_success.pt",
 
     # Data collection settings
     "n_samples": 15000,              # Number of samples to collect
@@ -89,7 +89,7 @@ CONFIG = {
     # When True, groups with size > 3 use coupled rotation in addition to
     # coupled linear velocity. All robots in the group rotate at the same
     # angular velocity (average of individual angular velocities) and move
-    # at the same linear velocity (minimum of individual linear velocities).
+    # at the same linear velocity (average of individual linear velocities).
     # Groups with size <= 3 always keep individual angular velocities.
     "use_rotation_coupling": True,
     
@@ -253,10 +253,10 @@ class OracleDataCollector:
     For each candidate group, simulates forward H steps and accumulates rewards.
     Uses only the decentralized TD3Obstacle policy:
     - For size-1 groups: use individual robot's action directly
-    - For size-2/3 groups: min linear velocities of robots in the group
+    - For size-2/3 groups: average linear velocities of robots in the group
       to get coupled linear velocity, keep individual angular velocities
     - For size-4/7 groups (rotation-coupled, if use_rotation_coupling=True):
-      min linear velocity AND average angular velocity — all robots in the
+      average linear velocity AND average angular velocity — all robots in the
       group move and rotate at the same speed
     - For size-4/7 groups (if use_rotation_coupling=False):
       same as size-2/3 (coupled linear only, individual angular)
@@ -703,10 +703,9 @@ class OracleDataCollector:
             return -50.0
 
         # Extra score for coupled group (size > 3)
-        # Only give bonus if NO robots in the group have already reached
-        # (coupling doesn't make sense if some robots are already at goal)
-        any_in_group_reached = any(reached_before_rollout[i] for i in group)
-        coupled_group_score = 5.0 if (len(group) > 3 and not any_in_group_reached) else 0.0
+        # With mean-based linear coupling, mixed reached/unreached groups are
+        # viable, so we no longer exclude groups containing reached robots.
+        coupled_group_score = len(group) / 2 if len(group) > 3 else 0.0
         score = coupled_group_score
         
         # 2. New-reach bonus: k_reach / n_remaining per newly reached robot
@@ -779,7 +778,7 @@ class OracleDataCollector:
         # Only size-1 groups get this bonus - they're specifically helping that robot.
         # Disabled when use_urgency=False in CONFIG.
         urgency_bonus = 0.0
-        if CONFIG.get("use_urgency", True) and urgency_flags is not None and len(group) == 1:
+        if CONFIG.get("use_urgency", False) and urgency_flags is not None and len(group) == 1:
             robot_idx = group[0]
             if not reached_before_rollout[robot_idx] and urgency_flags[robot_idx]:
                 # This single-robot group is moving a stuck robot
@@ -1811,7 +1810,7 @@ def main():
     if config.get("include_size_7", False): sizes_included.append("7")
     print(f"Group sizes included: {', '.join(sizes_included)}")
     if config.get("use_rotation_coupling", True):
-        print(f"Rotation coupling: ON for groups with size > 3 (avg angular vel, min linear vel)")
+        print(f"Rotation coupling: ON for groups with size > 3 (avg angular vel, avg linear vel)")
     else:
         print(f"Rotation coupling: OFF (all groups use individual angular vel)")
     phase2_mode = config.get("phase2_selection", "random")

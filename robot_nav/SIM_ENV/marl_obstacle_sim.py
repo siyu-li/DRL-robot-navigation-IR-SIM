@@ -51,6 +51,9 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         per_robot_goal_reset: bool = True,
         obstacle_proximity_threshold: float = 1.5,
         num_inactive_robots: int = 0,
+        goal_dwell_min: int = 0,
+        goal_respawn_prob: float = 1.0,
+        station_keeping_reward: float = 1.0,
     ):
         """
         Initialize the MARL_SIM_OBSTACLE environment.
@@ -63,6 +66,12 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
             obstacle_proximity_threshold (float): Distance threshold for obstacle penalty in reward.
             num_inactive_robots (int): Number of robots to randomly select as inactive each episode.
                 If 0 (default), all robots are active (original behavior).
+            goal_dwell_min (int): Minimum number of steps a robot must stay at its goal
+                before it becomes eligible for respawn. 0 = immediate respawn (legacy).
+            goal_respawn_prob (float): Per-step probability of respawning after the
+                dwell period expires. 1.0 = immediate respawn after dwell (legacy).
+            station_keeping_reward (float): Small positive reward given each step a
+                robot successfully holds at its goal without collision.
         """
         display = False if disable_plotting else True
         self.env = irsim.make(
@@ -85,6 +94,13 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         self.num_inactive_robots = num_inactive_robots
         self.inactive_ids = []  # List of inactive robot indices
         self.active_mask = np.ones(self.num_robots, dtype=bool)  # True for active robots
+
+        # Goal-dwell parameters: robots stay at goal for a dwell period before respawn
+        self.goal_dwell_min = goal_dwell_min
+        self.goal_respawn_prob = goal_respawn_prob
+        self.station_keeping_reward = station_keeping_reward
+        # Per-robot dwell counter: -1 = not dwelling, >=0 = steps spent dwelling
+        self.dwell_counters = [-1] * self.num_robots
 
     def get_obstacle_states(self) -> np.ndarray:
         """
@@ -287,19 +303,45 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                             refresh=True, linewidth=w * 2, color='red', alpha=0.6
                         )
 
-        # === Per-robot goal reset (only for robots that arrived — usually 0-1) ===
+        # === Per-robot goal dwell + respawn ===
         if self.per_robot_goal_reset:
             for i in range(self.num_robots):
-                if all_arrives[i]:
-                    self.env.robot_list[i].set_random_goal(
-                        obstacle_list=self.env.obstacle_list,
-                        init=True,
-                        range_limits=[
-                            [self.x_range[0] + 1, self.y_range[0] + 1, -np.pi],
-                            [self.x_range[1] - 1, self.y_range[1] - 1, np.pi],
-                        ],
-                    )
-                    self.prev_distances[i] = None
+                is_at_goal = all_arrives[i]  # True while within goal_threshold
+
+                # --- Transition: navigating → arrived (first entry) ---
+                if is_at_goal and self.dwell_counters[i] < 0:
+                    self.dwell_counters[i] = 0
+                    # Keep the +100 goal reward from _compute_rewards_vectorized.
+                    continue
+
+                # --- Already in dwell phase ---
+                if self.dwell_counters[i] >= 0:
+                    self.dwell_counters[i] += 1
+
+                    if all_collisions[i]:
+                        # Collision during dwell: keep the collision penalty
+                        # from _compute_rewards_vectorized.
+                        rewards_list[i] = -50.0
+                    elif is_at_goal:
+                        # Holding position at goal → station-keeping reward
+                        rewards_list[i] = self.station_keeping_reward
+                    else:
+                        rewards_list[i] = -10.0
+
+                    # Respawn after dwell period ends (regardless of position —
+                    # set_random_goal only changes the goal, not the robot's pose)
+                    if self.dwell_counters[i] >= self.goal_dwell_min:
+                        if random.random() < self.goal_respawn_prob:
+                            self.env.robot_list[i].set_random_goal(
+                                obstacle_list=self.env.obstacle_list,
+                                init=True,
+                                range_limits=[
+                                    [self.x_range[0] + 1, self.y_range[0] + 1, -np.pi],
+                                    [self.x_range[1] - 1, self.y_range[1] - 1, np.pi],
+                                ],
+                            )
+                            self.prev_distances[i] = None
+                            self.dwell_counters[i] = -1
 
         # Get obstacle states
         obstacle_states = self.get_obstacle_states()
@@ -424,6 +466,9 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         
         # Reset previous distances for progress-based reward
         self.prev_distances = [None] * self.num_robots
+        
+        # Reset dwell counters
+        self.dwell_counters = [-1] * self.num_robots
         
         # Randomly select inactive robots based on configured num_inactive_robots
         if self.num_inactive_robots > 0:

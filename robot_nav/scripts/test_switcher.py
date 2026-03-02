@@ -82,10 +82,10 @@ CONFIG = {
     "trials_per_episode": 3,
 
     # Switcher model configuration (supervised)
-    "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_50.pt",
+    "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_100.pt",
 
     # RL switcher model configuration (PPO-trained)
-    "rl_switcher_checkpoint": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots/SwitcherPPO-14robots.pt",
+    "rl_switcher_checkpoint": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots/Mar.01/SwitcherPPO-14robots_update2000.pt",
 
     # Decentralized model configuration (used for all action generation)
     # "decentralized_model_name": "TD3-MARL-obstacle-14robots",
@@ -95,11 +95,13 @@ CONFIG = {
     # Pretrained model paths (decentralized TD3Obstacle policy)
     "decentralized_model_name": "TD3-MARL-obstacle-14robots-gpu_epoch800",
     "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu",
+    # "decentralized_model_name": "TD3-MARL-obstacle-14robots_epoch2400",
+    # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.27_obstacle_14robot",
 
     # Test configuration
     "test_episodes": 50,
     "max_steps_per_episode": 1500,
-    "disable_plotting": True,
+    "disable_plotting": False,
 
     # Group selection interval (re-select group every N steps)
     "selection_interval": 10,

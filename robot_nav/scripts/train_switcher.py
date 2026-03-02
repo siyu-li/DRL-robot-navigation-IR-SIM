@@ -43,7 +43,7 @@ from robot_nav.models.MARL.switcher.supervised import (
 # =============================================================================
 CONFIG = {
     # Data configuration
-    "data_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_couple_group_len1200_success.pt",
+    "data_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_couple_group_len1200_avev_success.pt",
     "embed_dim": 512,              # Dimension of per-robot embeddings: Will be adjust based on data if None
     
     # GroupFeatureBuilder config

@@ -21,10 +21,11 @@ import logging
 
 from robot_nav.models.MARL.marlTD3.marlTD3_obstacle import TD3Obstacle
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
-from robot_nav.replay_buffer_obstacle import ReplayBufferObstacle
+from robot_nav.models.MARL.marlTD3.replay_buffer_obstacle import ReplayBufferObstacle
 
-# Suppress IRSim warnings
-logging.getLogger('irsim').setLevel(logging.ERROR)
+# Suppress IRSim warnings - irsim uses loguru, not standard logging
+from loguru import logger
+logger.disable("irsim")
 
 
 def outside_of_bounds(poses, sim):
@@ -59,7 +60,7 @@ def main(args=None):
     print(f"Using device: {device}")
 
     # Training hyperparameters (adjusted for 14 robots)
-    max_epochs = 600  # More epochs needed for 14 robots
+    max_epochs = 3000  # More epochs needed for 14 robots
     epoch = 1
     episode = 0
     train_every_n = 10  # 15
@@ -68,11 +69,15 @@ def main(args=None):
     max_steps = 300  # 400
     steps = 0
     save_every = 5
-    buffer_size = 50000  # 100000
+    buffer_size = 100000  # 100000
 
     # Environment hyperparameters
     per_robot_goal_reset = True
     obstacle_proximity_threshold = 1.5  # For reward penalty
+    num_inactive_robots = 0  # Number of robots to be inactive each episode (treated as obstacles)
+    goal_dwell_min = 30  # Robot stays at goal for at least 30 steps
+    goal_respawn_prob = 1.0  # Respawn immediately after dwell period ends
+    station_keeping_reward = 5.0  # Small reward for holding position at goal
 
     # ---- Instantiate environment ----
     sim = MARL_SIM_OBSTACLE(
@@ -81,6 +86,10 @@ def main(args=None):
         reward_phase=6,
         per_robot_goal_reset=per_robot_goal_reset,
         obstacle_proximity_threshold=obstacle_proximity_threshold,
+        num_inactive_robots=num_inactive_robots,
+        goal_dwell_min=goal_dwell_min,
+        goal_respawn_prob=goal_respawn_prob,
+        station_keeping_reward=station_keeping_reward,
     )
 
     print(f"\n{'='*60}")
@@ -105,11 +114,13 @@ def main(args=None):
         obstacle_state_dim=obstacle_state_dim,
         device=device,
         save_every=save_every,
-        load_model=True,  
-        load_model_name="TD3-MARL-obstacle-6robots_epoch2400",
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2"),
-        model_name="TD3-MARL-obstacle-14robots-vectorenv",
-        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.11_obstacle_14robot_transfer_vectorenv"),
+        load_model=True,
+        # load_model_name="TD3-MARL-obstacle-6robots_epoch2400",
+        # load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2"),
+        load_model_name="TD3-MARL-obstacle-14robots",
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.27_obstacle_14robot"),
+        model_name="TD3-MARL-obstacle-14robots",
+        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Mar.02_obstacle_14robot_finetune"),
     )
 
 
@@ -127,7 +138,7 @@ def main(args=None):
     running_timesteps = 0
     
     # Checkpoint saving parameters
-    checkpoint_every = 100  # Save checkpoint every N epochs
+    checkpoint_every = 200  # Save checkpoint every N epochs
 
     print(f"Starting training...")
     print(f"Initial obstacle states shape: {obstacle_states.shape}\n")
@@ -171,6 +182,7 @@ def main(args=None):
             terminal,
             next_robot_state,
             next_obstacle_states,
+            active_mask=sim.active_mask,
         )
 
         # Update obstacle states for next iteration
@@ -180,9 +192,10 @@ def main(args=None):
         episode += 1
 
         # Check termination conditions
+        # Note: `all(goal)` is removed — with dwell-then-respawn, robots stay at
+        # their goals and handle their own respawn lifecycle individually.
         if (
             any(collision)
-            or all(goal)
             or steps >= max_steps
             or outside_of_bounds(poses, sim)
         ):
@@ -208,6 +221,11 @@ def main(args=None):
                 model.writer.add_scalar(
                     "run/buffer_size", replay_buffer.size(), model.iter_count
                 )
+                # Log dwell statistics
+                num_dwelling = sum(1 for c in sim.dwell_counters if c >= 0)
+                model.writer.add_scalar(
+                    "run/num_dwelling", num_dwelling, model.iter_count
+                )
                 running_goals = 0
                 running_collisions = 0
                 running_timesteps = 0
@@ -227,12 +245,12 @@ def main(args=None):
                     model.save(filename=checkpoint_name, directory=model.save_directory)
                     print(f"✅ Checkpoint saved: {checkpoint_name}")
 
-                # Save replay buffer every 1000 epochs
-                if epoch % 1000 == 0:
-                    buffer_path = model.save_directory / f"replay_buffer_epoch{epoch}.pkl"
-                    with open(buffer_path, "wb") as f:
-                        pickle.dump(replay_buffer, f)
-                    print(f"💾 Replay buffer saved: {buffer_path}")
+                # # Save replay buffer every 1000 epochs
+                # if epoch % 1000 == 0:
+                #     buffer_path = model.save_directory / f"replay_buffer_epoch{epoch}.pkl"
+                #     with open(buffer_path, "wb") as f:
+                #         pickle.dump(replay_buffer, f)
+                #     print(f"💾 Replay buffer saved: {buffer_path}")
 
                 # Console logging
                 if epoch % 10 == 0:

@@ -17,8 +17,9 @@ from shapely.geometry import Point
 from robot_nav.models.MARL.marlTD3.marlTD3_obstacle import TD3Obstacle
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 
-# Suppress IRSim warnings
-logging.getLogger('irsim').setLevel(logging.ERROR)
+# Suppress IRSim warnings - irsim uses loguru, not standard logging
+from loguru import logger
+logger.disable("irsim")
 
 
 def outside_of_bounds(poses, sim):
@@ -121,13 +122,21 @@ def main(args=None):
     max_steps = 500  # Steps per episode
     render_delay = 0.05  # Delay between steps for visualization
 
+    # Dwell parameters (match training)
+    goal_dwell_min = 30  # Robot stays at goal for at least 30 steps
+    goal_respawn_prob = 1.0  # Respawn immediately after dwell period ends
+    station_keeping_reward = 5.0  # Reward for holding position at goal
+
     # ---- Instantiate environment ----
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
         disable_plotting=False,  # Enable plotting for visualization
         reward_phase=6,
-        per_robot_goal_reset=False,  # We handle resets manually
+        per_robot_goal_reset=True,  # Let sim handle goal dwell + respawn
         obstacle_proximity_threshold=1.5,
+        goal_dwell_min=goal_dwell_min,
+        goal_respawn_prob=goal_respawn_prob,
+        station_keeping_reward=station_keeping_reward,
     )
 
     print(f"Environment initialized:")
@@ -144,12 +153,11 @@ def main(args=None):
         obstacle_state_dim=obstacle_state_dim,
         device=device,
         load_model=True,
-        model_name="TD3-MARL-obstacle-14robots-gpu",
-        load_model_name="TD3-MARL-obstacle-14robots-gpu_epoch800",
+        model_name="TD3-MARL-obstacle-14robots",
+        load_model_name="TD3-MARL-obstacle-14robots",
         # load_model_name="TD3-MARL-obstacle-14robots",
-        # load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2"),
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu"),
-        # load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_14robots"),
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Mar.02_obstacle_14robot_v2"),
+        # load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu"),
 
     )
 
@@ -182,6 +190,9 @@ def main(args=None):
         
         # Reset trajectory rewards for new episode
         trajectory_rewards = [0.0] * sim.num_robots
+        
+        # Track previous dwell counters to detect transitions
+        prev_dwell_counters = list(sim.dwell_counters)
 
         while steps < max_steps:
             # Prepare state
@@ -221,29 +232,33 @@ def main(args=None):
             for i in range(sim.num_robots):
                 trajectory_rewards[i] += reward[i]
 
-            # Check for completed trajectories and reset robots
+            # Check for completed trajectories
             robots_to_reset = []
             for i in range(sim.num_robots):
-                if collision[i]:
-                    # Trajectory ended with collision
-                    completed_trajectories.append((i, 'collision', trajectory_rewards[i]))
-                    # print(f"  >> Robot {i} COLLISION - Trajectory reward: {trajectory_rewards[i]:.2f}")
-                    trajectory_rewards[i] = 0.0
-                    robots_to_reset.append(i)
-                elif goal[i]:
-                    # Trajectory ended with goal reach
+                # Detect goal arrival: dwell counter transitioned from -1 to 0
+                if sim.dwell_counters[i] == 0 and prev_dwell_counters[i] < 0:
+                    # Robot just arrived at goal — record successful trajectory
                     completed_trajectories.append((i, 'goal', trajectory_rewards[i]))
-                    # print(f"  >> Robot {i} GOAL REACHED - Trajectory reward: {trajectory_rewards[i]:.2f}")
+                
+                # Detect dwell ended: dwell counter transitioned from >=0 to -1
+                # (sim assigned a new goal — start fresh trajectory)
+                if sim.dwell_counters[i] < 0 and prev_dwell_counters[i] >= 0:
+                    trajectory_rewards[i] = 0.0
+                
+                # Collision while navigating (not during dwell)
+                if collision[i] and sim.dwell_counters[i] < 0:
+                    completed_trajectories.append((i, 'collision', trajectory_rewards[i]))
                     trajectory_rewards[i] = 0.0
                     robots_to_reset.append(i)
-                elif robot_outside_bounds(poses[i], sim):
-                    # Trajectory ended by going out of bounds (treat as collision)
+                elif robot_outside_bounds(poses[i], sim) and sim.dwell_counters[i] < 0:
                     completed_trajectories.append((i, 'collision', trajectory_rewards[i]))
-                    # print(f"  >> Robot {i} OUT OF BOUNDS - Trajectory reward: {trajectory_rewards[i]:.2f}")
                     trajectory_rewards[i] = 0.0
                     robots_to_reset.append(i)
 
-            # Reset robots that completed their trajectories
+            # Update previous dwell counters
+            prev_dwell_counters = list(sim.dwell_counters)
+
+            # Reset robots that had collisions/out-of-bounds (manual reset)
             for robot_idx in robots_to_reset:
                 current_positions = reset_single_robot(sim, robot_idx, current_positions)
 

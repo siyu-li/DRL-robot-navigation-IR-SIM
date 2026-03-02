@@ -15,8 +15,9 @@ import time
 from robot_nav.models.MARL.marlTD3.marlTD3_obstacle import TD3Obstacle
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 
-# Suppress IRSim warnings
-logging.getLogger('irsim').setLevel(logging.ERROR)
+# Suppress IRSim warnings - irsim uses loguru, not standard logging
+from loguru import logger
+logger.disable("irsim")
 
 
 def main(args=None):
@@ -40,8 +41,11 @@ def main(args=None):
         world_file="robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
         disable_plotting=False,  # Enable plotting for visualization
         reward_phase=6,
-        per_robot_goal_reset=False,  # We handle resets manually
+        per_robot_goal_reset=True,  # Enable dwell logic for correct post-goal rewards
         obstacle_proximity_threshold=1.5,
+        goal_dwell_min=999999,        # Never respawn during test — dwell forever
+        goal_respawn_prob=1.0,
+        station_keeping_reward=0.5,
     )
 
     print(f"Environment initialized:")
@@ -58,9 +62,13 @@ def main(args=None):
         obstacle_state_dim=obstacle_state_dim,
         device=device,
         load_model=True,
-        model_name="TD3-MARL-obstacle-14robots-gpu",
-        load_model_name="TD3-MARL-obstacle-14robots-gpu_epoch800",
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu"),
+        model_name="TD3-MARL-obstacle-14robots",
+        load_model_name="TD3-MARL-obstacle-14robots",
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Mar.02_obstacle_14robot_v2"),
+
+        # model_name="TD3-MARL-obstacle-14robots-gpu",
+        # load_model_name="TD3-MARL-obstacle-14robots-gpu_epoch800",
+        # load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu"),
     )
 
     # ---- Statistics tracking ----
@@ -117,7 +125,8 @@ def main(args=None):
             if steps % 50 == 0:
                 reward_str = " | ".join([f"R{i}:{r:+.2f}" for i, r in enumerate(reward)])
                 goals_reached = sum(goal)
-                print(f"[Ep {episode+1} Step {steps}] {reward_str} | Total: {step_total_reward:+.2f} | Goals: {goals_reached}/{sim.num_robots}")
+                num_dwelling = sum(1 for c in sim.dwell_counters if c >= 0)
+                print(f"[Ep {episode+1} Step {steps}] {reward_str} | Total: {step_total_reward:+.2f} | Goals: {goals_reached}/{sim.num_robots} | Dwelling: {num_dwelling}")
 
             # Check episode termination conditions
             if any(collision):
