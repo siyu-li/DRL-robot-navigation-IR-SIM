@@ -123,7 +123,7 @@ def main(args=None):
     render_delay = 0.05  # Delay between steps for visualization
 
     # Dwell parameters (match training)
-    goal_dwell_min = 30  # Robot stays at goal for at least 30 steps
+    goal_dwell_min = 0  # Robot stays at goal for at least 30 steps
     goal_respawn_prob = 1.0  # Respawn immediately after dwell period ends
     station_keeping_reward = 5.0  # Reward for holding position at goal
 
@@ -156,7 +156,7 @@ def main(args=None):
         model_name="TD3-MARL-obstacle-14robots",
         load_model_name="TD3-MARL-obstacle-14robots",
         # load_model_name="TD3-MARL-obstacle-14robots",
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Mar.02_obstacle_14robot_v2"),
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Mar.02_obstacle_14robot_reward7"),
         # load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu"),
 
     )

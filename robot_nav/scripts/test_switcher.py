@@ -57,7 +57,7 @@ logger.disable("irsim")
 # =============================================================================
 CONFIG = {
     # Selection mode: "switcher", "rl_switcher", or "random"
-    "selection_mode": "rl_switcher",  # Change to "random" for baseline, "rl_switcher" for RL-trained
+    "selection_mode": "random",  # Change to "random" for baseline, "rl_switcher" for RL-trained
 
     # Group selection strategy for switcher mode:
     #   "argmax"  — always select the highest-scoring group (deterministic)
@@ -88,15 +88,11 @@ CONFIG = {
     "rl_switcher_checkpoint": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots/Mar.01/SwitcherPPO-14robots_update2000.pt",
 
     # Decentralized model configuration (used for all action generation)
-    # "decentralized_model_name": "TD3-MARL-obstacle-14robots",
-    # "decentralized_model_name": "TD3-MARL-obstacle-6robots_epoch2400",
-    # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.8_obstacle_14robot_transfer",
-    # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2",
     # Pretrained model paths (decentralized TD3Obstacle policy)
-    "decentralized_model_name": "TD3-MARL-obstacle-14robots-gpu_epoch800",
-    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu",
-    # "decentralized_model_name": "TD3-MARL-obstacle-14robots_epoch2400",
-    # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.27_obstacle_14robot",
+    # "decentralized_model_name": "TD3-MARL-obstacle-14robots-gpu_epoch800",
+    # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu",
+    "decentralized_model_name": "TD3-MARL-obstacle-14robots",
+    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Mar.02_obstacle_14robot_finetune",
 
     # Test configuration
     "test_episodes": 50,
@@ -107,11 +103,11 @@ CONFIG = {
     "selection_interval": 10,
     
     # Group generation settings (must match training data)
-    "include_size_1": True,         # Include individual robots
+    "include_size_1": False,         # Include individual robots
     "include_size_2": True,         # Include pairs
     "include_size_3": True,         # Include triplets
     "include_size_4": True,         # Include size-4 groups (rotation-coupled)
-    "include_size_7": True,         # Include size-7 groups (rotation-coupled)
+    "include_size_7": False,         # Include size-7 groups (rotation-coupled)
 
     # Policy configuration
     "num_robots": 14,

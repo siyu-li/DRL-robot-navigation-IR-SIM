@@ -1,9 +1,7 @@
 """
 Training script for MARL TD3 with 14 Robots and Obstacle Graph Nodes (FROM SCRATCH).
 
-This script trains a 14-robot multi-agent TD3 policy.
-Usage:
-    python -m robot_nav.marl_train_obstacle_14robots
+This script trains a 14-robot multi-agent TD3 policy
 
 Key features:
 - 14 robots with 7 obstacles in 25x25 world
@@ -60,7 +58,7 @@ def main(args=None):
     print(f"Using device: {device}")
 
     # Training hyperparameters (adjusted for 14 robots)
-    max_epochs = 3000  # More epochs needed for 14 robots
+    max_epochs = 5000  # More epochs needed for 14 robots
     epoch = 1
     episode = 0
     train_every_n = 10  # 15
@@ -75,7 +73,7 @@ def main(args=None):
     per_robot_goal_reset = True
     obstacle_proximity_threshold = 1.5  # For reward penalty
     num_inactive_robots = 0  # Number of robots to be inactive each episode (treated as obstacles)
-    goal_dwell_min = 30  # Robot stays at goal for at least 30 steps
+    goal_dwell_min = 0  # Robot stays at goal for at least 30 steps
     goal_respawn_prob = 1.0  # Respawn immediately after dwell period ends
     station_keeping_reward = 5.0  # Small reward for holding position at goal
 
@@ -83,7 +81,7 @@ def main(args=None):
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
         disable_plotting=True,
-        reward_phase=6,
+        reward_phase=8,
         per_robot_goal_reset=per_robot_goal_reset,
         obstacle_proximity_threshold=obstacle_proximity_threshold,
         num_inactive_robots=num_inactive_robots,
@@ -114,13 +112,13 @@ def main(args=None):
         obstacle_state_dim=obstacle_state_dim,
         device=device,
         save_every=save_every,
-        load_model=True,
+        load_model=False,
         # load_model_name="TD3-MARL-obstacle-6robots_epoch2400",
         # load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2"),
         load_model_name="TD3-MARL-obstacle-14robots",
         load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Feb.27_obstacle_14robot"),
         model_name="TD3-MARL-obstacle-14robots",
-        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Mar.02_obstacle_14robot_finetune"),
+        save_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Mar.02_obstacle_14robot_reward8"),
     )
 
 

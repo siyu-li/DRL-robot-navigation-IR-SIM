@@ -234,24 +234,14 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         all_coss = np.sum(h_norm * g_norm, axis=1)                               # (N,)
         all_sins = h_norm[:, 0] * g_norm[:, 1] - h_norm[:, 1] * g_norm[:, 0]    # (N,)
 
-        # === Vectorized proximity penalty (robot-robot) ===
-        close_mask = pairwise_dists < 1.25
-        cl_penalties = np.sum(np.where(close_mask, (1.25 - pairwise_dists) ** 2, 0.0), axis=1)  # (N,)
-
-        # === Vectorized obstacle penalty ===
-        obs_threshold = self.obstacle_proximity_threshold
-        obs_close_mask = min_clearances < obs_threshold
-        obs_penalties = np.where(obs_close_mask,
-                                 2.0 * (obs_threshold - min_clearances) ** 2, 0.0)  # (N,)
-
         # === Vectorized reward computation ===
         actions_arr = np.array(action)  # (N, 2)
         prev_dists_arr = np.array([d if d is not None else np.nan for d in self.prev_distances])
 
         rewards = self._compute_rewards_vectorized(
             all_arrives, all_collisions, actions_arr,
-            cl_penalties, goal_dists, min_clearances,
-            obs_threshold, self.reward_phase, prev_dists_arr,
+            pairwise_dists, goal_dists, min_clearances,
+            self.reward_phase, prev_dists_arr,
         )
 
         # === Update prev_distances ===
@@ -503,8 +493,8 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
 
     @staticmethod
     def _compute_rewards_vectorized(
-        goals, collisions, actions, cl_penalties, distances,
-        min_clearances, obstacle_threshold, phase, prev_distances,
+        goals, collisions, actions, pairwise_dists, distances,
+        min_clearances, phase, prev_distances,
     ):
         """
         Compute rewards for ALL robots at once using numpy vectorization.
@@ -513,10 +503,10 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
             goals (list[bool]): Per-robot goal-reached flags.
             collisions (list[bool]): Per-robot collision flags.
             actions (np.ndarray): Actions of shape (N, 2).
-            cl_penalties (np.ndarray): Pre-computed robot proximity penalties (N,).
+            pairwise_dists (np.ndarray): Robot-robot distance matrix (N, N) with
+                inf on the diagonal.
             distances (np.ndarray): Goal distances (N,).
             min_clearances (np.ndarray): Min obstacle clearances (N,).
-            obstacle_threshold (float): Obstacle penalty threshold.
             phase (int): Reward phase.
             prev_distances (np.ndarray): Previous goal distances (N,), NaN if None.
 
@@ -529,17 +519,31 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         lin_vel = actions[:, 0]
         ang_vel = actions[:, 1]
 
-        # Obstacle penalty (shared across phases 1, 3, 5, 6)
-        obs_close = min_clearances < obstacle_threshold
-        obs_pen_base = np.where(obs_close, (obstacle_threshold - min_clearances) ** 2, 0.0)
+        # --- Helper to compute robot-robot proximity penalty ---
+        def _cl_penalty(threshold: float, weight: float = 1.0) -> np.ndarray:
+            """Sum of weighted (threshold - dist)^2 for neighbours closer than threshold."""
+            close_mask = pairwise_dists < threshold
+            return weight * np.sum(
+                np.where(close_mask, (threshold - pairwise_dists) ** 2, 0.0), axis=1
+            )
+
+        # --- Helper to compute obstacle proximity penalty ---
+        def _obs_penalty(threshold: float, weight: float = 1.0) -> np.ndarray:
+            """Weighted (threshold - clearance)^2 for obstacles closer than threshold."""
+            obs_close = min_clearances < threshold
+            return weight * np.where(
+                obs_close, (threshold - min_clearances) ** 2, 0.0
+            )
 
         # Default: all get the "normal" reward, then override goal/collision
         rewards = np.zeros(N)
 
         match phase:
             case 1:
+                cl_penalties = _cl_penalty(threshold=1.25, weight=1.0)
+                obs_pen = _obs_penalty(threshold=1.5, weight=1.0)
                 r_dist = 1.5 / np.maximum(distances, 1e-10)
-                rewards = lin_vel - 0.5 * np.abs(ang_vel) - cl_penalties - obs_pen_base + r_dist
+                rewards = lin_vel - 0.5 * np.abs(ang_vel) - cl_penalties - obs_pen + r_dist
                 rewards = np.where(goals_arr, 100.0, rewards)
                 rewards = np.where(collisions_arr, -100.0 * 3 * lin_vel, rewards)
 
@@ -549,32 +553,55 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                 rewards = np.where(collisions_arr, -100.0, rewards)
 
             case 3:
+                cl_penalties = _cl_penalty(threshold=1.25, weight=1.0)
+                obs_pen = _obs_penalty(threshold=1.5, weight=2.0)
                 r_dist = 10 * np.exp(-distances)
-                obs_pen = 2.0 * obs_pen_base
                 rewards = lin_vel - 0.5 * np.abs(ang_vel) - cl_penalties - obs_pen + r_dist
                 rewards = np.where(goals_arr, 100.0, rewards)
                 rewards = np.where(collisions_arr, -100.0 * 3 * lin_vel, rewards)
 
             case 5:
+                cl_penalties = _cl_penalty(threshold=1.25, weight=1.0)
+                obs_pen = _obs_penalty(threshold=1.5, weight=2.0)
                 k_p = 5.0
                 has_prev = ~np.isnan(prev_distances)
                 progress = np.where(has_prev, prev_distances - distances, 0.0)
                 r_progress = k_p * progress
-                obs_pen = 2.0 * obs_pen_base
                 rewards = lin_vel - 0.5 * np.abs(ang_vel) - cl_penalties - obs_pen + r_progress
                 rewards = np.where(goals_arr, 100.0, rewards)
                 rewards = np.where(collisions_arr, -100.0 * 3 * lin_vel, rewards)
 
             case 6:
+                cl_penalties = _cl_penalty(threshold=1.25, weight=1.0)
+                obs_pen = _obs_penalty(threshold=1.5, weight=2.0)
                 k_p = 5.0
                 has_prev = ~np.isnan(prev_distances)
                 progress = np.where(has_prev, prev_distances - distances, 0.0)
                 r_progress = k_p * progress
-                obs_pen = 2.0 * obs_pen_base
                 rewards = lin_vel - cl_penalties - obs_pen + r_progress
                 rewards = np.where(goals_arr, 100.0, rewards)
                 rewards = np.where(collisions_arr, -100.0 * 3 * lin_vel, rewards)
-
+            case 7:
+                cl_penalties = _cl_penalty(threshold=1.5, weight=1.5)
+                obs_pen = _obs_penalty(threshold=1.5, weight=2.0)
+                k_p = 5.0
+                has_prev = ~np.isnan(prev_distances)
+                progress = np.where(has_prev, prev_distances - distances, 0.0)
+                r_progress = k_p * progress
+                rewards = - cl_penalties - obs_pen + r_progress
+                rewards = np.where(goals_arr, 100.0, rewards)
+                rewards = np.where(collisions_arr, -100.0 * 3 * lin_vel, rewards)
+            case 8:
+                cl_penalties = _cl_penalty(threshold=1.5, weight=1.5)
+                obs_pen = _obs_penalty(threshold=1.5, weight=2.0)
+                k_p = 5.0
+                has_prev = ~np.isnan(prev_distances)
+                progress = np.where(has_prev, prev_distances - distances, 0.0)
+                r_progress = k_p * progress
+                rewards = lin_vel- cl_penalties - obs_pen + r_progress
+                rewards = np.where(goals_arr, 100.0, rewards)
+                rewards = np.where(collisions_arr, -100.0 * 3 * lin_vel, rewards)
+         
             case _:
                 raise ValueError(f"Unknown reward phase: {phase}")
 
