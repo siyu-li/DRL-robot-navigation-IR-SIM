@@ -601,6 +601,17 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                 rewards = lin_vel- cl_penalties - obs_pen + r_progress
                 rewards = np.where(goals_arr, 100.0, rewards)
                 rewards = np.where(collisions_arr, -100.0 * 3 * lin_vel, rewards)
+
+            case 9:
+                # Phase 9: Group mixing training — proximity + collision only.
+                # No progress reward.  Proximity penalty prevents the
+                # zero-velocity degenerate solution (standing still near
+                # robots/obstacles still accumulates penalty).
+                cl_penalties = _cl_penalty(threshold=1.5, weight=1.5)
+                obs_pen = _obs_penalty(threshold=1.5, weight=2.0)
+                rewards = -cl_penalties - obs_pen
+                rewards = np.where(goals_arr, 100.0, rewards)
+                rewards = np.where(collisions_arr, -100.0, rewards)
          
             case _:
                 raise ValueError(f"Unknown reward phase: {phase}")

@@ -47,6 +47,11 @@ from robot_nav.models.MARL.groups.group_generator import (
     filter_groups_by_size,
 )
 from robot_nav.models.MARL.groups.action_coupling import actions_for_group
+from robot_nav.models.MARL.groups.mixing_network import MixingNetwork
+from robot_nav.models.MARL.groups.learned_action_coupling import (
+    compute_mixed_actions,
+    get_embeddings_from_frozen_actor,
+)
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 # Suppress IRSim warnings - irsim uses loguru, not standard logging
 from loguru import logger
@@ -92,12 +97,12 @@ CONFIG = {
     # "decentralized_model_name": "TD3-MARL-obstacle-14robots-gpu_epoch800",
     # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu",
     "decentralized_model_name": "TD3-MARL-obstacle-14robots",
-    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Mar.02_obstacle_14robot_finetune",
+    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Mar.02_obstacle_14robot_reward8",
 
     # Test configuration
     "test_episodes": 50,
     "max_steps_per_episode": 1500,
-    "disable_plotting": False,
+    "disable_plotting": True,
 
     # Group selection interval (re-select group every N steps)
     "selection_interval": 10,
@@ -106,7 +111,7 @@ CONFIG = {
     "include_size_1": False,         # Include individual robots
     "include_size_2": True,         # Include pairs
     "include_size_3": True,         # Include triplets
-    "include_size_4": True,         # Include size-4 groups (rotation-coupled)
+    "include_size_4": False,         # Include size-4 groups (rotation-coupled)
     "include_size_7": False,         # Include size-7 groups (rotation-coupled)
 
     # Policy configuration
@@ -118,6 +123,16 @@ CONFIG = {
     "v_min": 0.0,
     "v_max": 0.5,
     "pooling": "mean",
+
+    # Action coupling mode:
+    #   "mean"    — hand-designed mean coupling (original action_coupling.py)
+    #   "learned" — learned softmax mixing weights via MixingNetwork
+    "action_coupling_mode": "learned",
+
+    # MixingNetwork checkpoint (only used when action_coupling_mode="learned")
+    "mixing_net_checkpoint": "robot_nav/models/MARL/groups/checkpoint/group_mixing_14robots/mixing_net_final.pth",
+    # Whether to scale mixing logits by √|G| (should match training setting)
+    "mixing_net_scale_by_sqrt": True,
 
     # Switcher feature configuration (must match training)
     # GroupFeatureBuilder config
@@ -1084,20 +1099,65 @@ def get_action_for_group(
     group: List[int],
     num_robots: int,
     rotation_coupling_threshold: int = 3,
+    coupling_mode: str = "mean",
+    mixing_net: Optional[MixingNetwork] = None,
+    device: Optional[torch.device] = None,
+    scale_by_sqrt: bool = True,
+    arrived_mask: Optional[List[bool]] = None,
 ) -> List[List[float]]:
     """
     Get action for a specific group using the decentralized policy.
 
-    Delegates to ``robot_nav.models.MARL.groups.action_coupling.actions_for_group``.
+    Two coupling modes:
+      - ``"mean"``   : hand-designed mean coupling (``action_coupling.py``).
+      - ``"learned"`` : learned softmax mixing via ``MixingNetwork``
+                        (``learned_action_coupling.py``).
+
+    Args:
+        policy: Frozen TD3Obstacle policy.
+        robot_obs: Robot observations ``(N, state_dim)``.
+        obstacle_obs: Obstacle observations ``(N_obs, obs_dim)``.
+        group: Robot indices in the active group.
+        num_robots: Total robots.
+        rotation_coupling_threshold: Groups > threshold also couple ω.
+        coupling_mode: ``"mean"`` or ``"learned"``.
+        mixing_net: Trained ``MixingNetwork`` (required if ``"learned"``).
+        device: Torch device (required if ``"learned"``).
+        scale_by_sqrt: Scale logits by √|G| (only for ``"learned"``).
+        arrived_mask: Boolean list marking arrived robots (only for ``"learned"``).
     """
-    return actions_for_group(
-        policy=policy,
-        robot_obs=robot_obs,
-        obstacle_obs=obstacle_obs,
-        group=group,
-        num_robots=num_robots,
-        rotation_coupling_threshold=rotation_coupling_threshold,
-    )
+    if coupling_mode == "learned":
+        if mixing_net is None or device is None:
+            raise ValueError(
+                "coupling_mode='learned' requires mixing_net and device"
+            )
+        # 1. Get raw actions from frozen actor
+        raw_action, _ = policy.get_action(robot_obs, obstacle_obs, add_noise=False)
+        # 2. Get embeddings from frozen actor's attention
+        embeddings = get_embeddings_from_frozen_actor(
+            policy.actor, robot_obs, obstacle_obs, device
+        )
+        # 3. Learned softmax mixing
+        return compute_mixed_actions(
+            mixing_net=mixing_net,
+            embeddings=embeddings,
+            raw_actions=raw_action,
+            group=group,
+            num_robots=num_robots,
+            arrived_mask=arrived_mask,
+            rotation_coupling_threshold=rotation_coupling_threshold,
+            scale_by_sqrt=scale_by_sqrt,
+        )
+    else:
+        # Default: hand-designed mean coupling
+        return actions_for_group(
+            policy=policy,
+            robot_obs=robot_obs,
+            obstacle_obs=obstacle_obs,
+            group=group,
+            num_robots=num_robots,
+            rotation_coupling_threshold=rotation_coupling_threshold,
+        )
 
 
 # =============================================================================
@@ -1117,6 +1177,10 @@ def run_test_evaluation(
     seed: int = 42,
     verbose: bool = True,
     rl_switcher_selector: Optional[RLSwitcherGroupSelector] = None,
+    coupling_mode: str = "mean",
+    mixing_net: Optional[MixingNetwork] = None,
+    device: Optional[torch.device] = None,
+    scale_by_sqrt: bool = True,
 ) -> TestStatistics:
     """
     Run test evaluation with either switcher or random group selection.
@@ -1271,6 +1335,11 @@ def run_test_evaluation(
                     policy, robot_obs, obstacle_states,
                     current_group, num_robots,
                     rotation_coupling_threshold=rotation_coupling_threshold,
+                    coupling_mode=coupling_mode,
+                    mixing_net=mixing_net,
+                    device=device,
+                    scale_by_sqrt=scale_by_sqrt,
+                    arrived_mask=[rg for rg in reached_goal],
                 )
 
                 # ----------------------------------------------------------
@@ -1410,6 +1479,27 @@ def main():
         load_directory=Path(config["decentralized_model_directory"]),
         save_directory=Path(config["decentralized_model_directory"]),
     )
+
+    # ------------------------------------------------------------------
+    # Load mixing network (if using learned action coupling)
+    # ------------------------------------------------------------------
+    coupling_mode = config.get("action_coupling_mode", "mean")
+    mixing_net = None
+    if coupling_mode == "learned":
+        mixing_ckpt_path = Path(config["mixing_net_checkpoint"])
+        if not mixing_ckpt_path.exists():
+            logger.error(f"MixingNetwork checkpoint not found: {mixing_ckpt_path}")
+            logger.info("Please train the mixing network first or set action_coupling_mode='mean'.")
+            return
+        embedding_dim = config["embedding_dim"] * 2  # actor attention output is embed_dim*2
+        mixing_net = MixingNetwork(embedding_dim=embedding_dim, hidden_dim=128).to(device)
+        mixing_net.load_state_dict(torch.load(mixing_ckpt_path, map_location=device))
+        mixing_net.eval()
+        logger.info(f"Loaded MixingNetwork from {mixing_ckpt_path}")
+        logger.info(f"  Parameters: {sum(p.numel() for p in mixing_net.parameters()):,}")
+        logger.info(f"  scale_by_sqrt: {config.get('mixing_net_scale_by_sqrt', True)}")
+    else:
+        logger.info("Using hand-designed mean action coupling")
 
     # ------------------------------------------------------------------
     # Generate candidate groups
@@ -1610,6 +1700,10 @@ def main():
         seed=config["seed"],
         verbose=True,
         rl_switcher_selector=rl_switcher_selector,
+        coupling_mode=coupling_mode,
+        mixing_net=mixing_net,
+        device=device,
+        scale_by_sqrt=config.get("mixing_net_scale_by_sqrt", True),
     )
 
     # ------------------------------------------------------------------
