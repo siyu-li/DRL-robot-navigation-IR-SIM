@@ -610,7 +610,7 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                 cl_penalties = _cl_penalty(threshold=1.5, weight=1.5)
                 obs_pen = _obs_penalty(threshold=1.5, weight=2.0)
                 rewards = -cl_penalties - obs_pen
-                rewards = np.where(goals_arr, 100.0, rewards)
+                rewards = np.where(goals_arr, 10.0, rewards)
                 rewards = np.where(collisions_arr, -100.0, rewards)
          
             case _:

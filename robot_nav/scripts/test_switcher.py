@@ -96,13 +96,14 @@ CONFIG = {
     # Pretrained model paths (decentralized TD3Obstacle policy)
     # "decentralized_model_name": "TD3-MARL-obstacle-14robots-gpu_epoch800",
     # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu",
-    "decentralized_model_name": "TD3-MARL-obstacle-14robots",
-    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Mar.02_obstacle_14robot_reward8",
-
+    "decentralized_model_name": "TD3-MARL-obstacle-14robots-partial-inactive_epoch210",
+    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Mar.04_obstacle_14robots_partial_inactive",
+    # "decentralized_model_name": "TD3-MARL-obstacle-14robots",
+    # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.27_obstacle_14robot",
     # Test configuration
     "test_episodes": 50,
-    "max_steps_per_episode": 1500,
-    "disable_plotting": True,
+    "max_steps_per_episode": 6000,
+    "disable_plotting": False,
 
     # Group selection interval (re-select group every N steps)
     "selection_interval": 10,
@@ -130,9 +131,9 @@ CONFIG = {
     "action_coupling_mode": "learned",
 
     # MixingNetwork checkpoint (only used when action_coupling_mode="learned")
-    "mixing_net_checkpoint": "robot_nav/models/MARL/groups/checkpoint/group_mixing_14robots/mixing_net_final.pth",
+    "mixing_net_checkpoint": "robot_nav/models/MARL/groups/checkpoint/group_mixing_14robots/mixing_net_update1800.pth",
     # Whether to scale mixing logits by √|G| (should match training setting)
-    "mixing_net_scale_by_sqrt": True,
+    "mixing_net_scale_by_sqrt": False,
 
     # Switcher feature configuration (must match training)
     # GroupFeatureBuilder config
