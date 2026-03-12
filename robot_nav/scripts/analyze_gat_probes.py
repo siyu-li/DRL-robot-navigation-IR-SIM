@@ -417,7 +417,7 @@ def run_classification_probe(
     """Cross-validated logistic regression accuracy."""
     pipe = make_pipeline(
         StandardScaler(),
-        LogisticRegression(max_iter=2000, multi_class="auto", C=1.0),
+        LogisticRegression(max_iter=2000, C=1.0),
     )
     scores = cross_val_score(pipe, X, y, cv=cv, scoring="accuracy")
     return float(scores.mean()), float(scores.std())

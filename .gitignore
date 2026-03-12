@@ -20,3 +20,4 @@ robot_nav/.DS_Store
 *.0
 robot_nav/models/MARL/switcher/runs/switcher/config.json
 robot_nav/models/MARL/switcher/runs/switcher/len1200_decouple_couple_urgency_success/config.json
+*.png
