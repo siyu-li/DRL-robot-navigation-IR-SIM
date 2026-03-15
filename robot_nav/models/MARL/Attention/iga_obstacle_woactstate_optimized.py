@@ -146,13 +146,13 @@ class AttentionObstacleOptimized(nn.Module):
         obstacle_node_dim (int): Input dimension for obstacle node features. Default 5.
     """
 
-    def __init__(self, embedding_dim, robot_node_dim=5):
+    def __init__(self, embedding_dim, robot_node_dim=3):
         super(AttentionObstacleOptimized, self).__init__()
         self.embedding_dim = embedding_dim
 
         # Message passing layer
         self.message_graph = GoalAttentionLayerObstacle(
-            node_dim=embedding_dim, edge_dim=10, out_dim=embedding_dim
+            node_dim=embedding_dim, edge_dim=8, out_dim=embedding_dim
         )
 
         # Robot node encoder
@@ -167,7 +167,7 @@ class AttentionObstacleOptimized(nn.Module):
 
         # Hard attention MLP for robot-robot edges
         self.hard_mlp = nn.Sequential(
-            nn.Linear(embedding_dim + 7, embedding_dim),
+            nn.Linear(embedding_dim + 5, embedding_dim),
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim),
         )
@@ -232,11 +232,11 @@ class AttentionObstacleOptimized(nn.Module):
             # Offset by b * n_total for mega-graph
             src_rr = j_rr + b_rr * n_total
             tgt_rr = i_rr + b_rr * n_total
-            edge_attr_rr = soft_feats_rr[b_rr, i_rr, j_rr]  # (num_edges_rr, 10)
+            edge_attr_rr = soft_feats_rr[b_rr, i_rr, j_rr]  # (num_edges_rr, 8)
         else:
             src_rr = torch.zeros(0, dtype=torch.long, device=device)
             tgt_rr = torch.zeros(0, dtype=torch.long, device=device)
-            edge_attr_rr = torch.zeros((0, 10), device=device)
+            edge_attr_rr = torch.zeros((0, 8), device=device)
             b_rr = torch.zeros(0, dtype=torch.long, device=device)
 
         # === Robot-obstacle edges (fully batched) ===
@@ -247,11 +247,11 @@ class AttentionObstacleOptimized(nn.Module):
             # Obstacle source nodes offset: n_robots + j within the graph, plus b * n_total
             src_ro = j_ro + n_robots + b_ro * n_total
             tgt_ro = i_ro + b_ro * n_total
-            edge_attr_ro = soft_feats_ro[b_ro, i_ro, j_ro]  # (num_edges_ro, 10)
+            edge_attr_ro = soft_feats_ro[b_ro, i_ro, j_ro]  # (num_edges_ro, 8)
         else:
             src_ro = torch.zeros(0, dtype=torch.long, device=device)
             tgt_ro = torch.zeros(0, dtype=torch.long, device=device)
-            edge_attr_ro = torch.zeros((0, 10), device=device)
+            edge_attr_ro = torch.zeros((0, 8), device=device)
             b_ro = torch.zeros(0, dtype=torch.long, device=device)
 
         # === Combine all edges ===
@@ -285,10 +285,9 @@ class AttentionObstacleOptimized(nn.Module):
         device = robot_embedding.device
 
         # === Extract robot features ===
-        robot_feat = robot_embedding[:, :, 4:9]
+        robot_feat = robot_embedding[:, :, 4:7]  # [dist, cos, sin] only (no action)
         robot_position = robot_embedding[:, :, :2]
         robot_heading = robot_embedding[:, :, 2:4]
-        robot_action = robot_embedding[:, :, 7:9]
         robot_goal = robot_embedding[:, :, -2:]
 
         # === Extract obstacle features ===
@@ -309,7 +308,6 @@ class AttentionObstacleOptimized(nn.Module):
         pos_j = robot_position.unsqueeze(1)
         heading_i = robot_heading.unsqueeze(2)
         heading_j = robot_heading.unsqueeze(1).expand(-1, n_robots, -1, -1)
-        action_j = robot_action.unsqueeze(1).expand(-1, n_robots, -1, -1)
         goal_j = robot_goal.unsqueeze(1).expand(-1, n_robots, -1, -1)
 
         rel_vec_rr = pos_j - pos_i
@@ -325,8 +323,7 @@ class AttentionObstacleOptimized(nn.Module):
             torch.sin(angle_rr).unsqueeze(-1),
             heading_j[..., 0:1],
             heading_j[..., 1:2],
-            action_j,
-        ], dim=-1)
+        ], dim=-1)  # 5-dim (no action)
 
         # === Compute robot-obstacle edge features (vectorized) ===
         obs_pos_j = obs_position.unsqueeze(1)
@@ -389,10 +386,9 @@ class AttentionObstacleOptimized(nn.Module):
 
         goal_polar_ro = torch.zeros(batch_size, n_robots, n_obs, 3, device=device)
 
-        # === Soft edge features (10-dim) ===
-        soft_edge_rr = torch.cat([edge_features_rr, goal_polar_rr], dim=-1)
-        obs_action_zeros = torch.zeros(batch_size, n_robots, n_obs, 2, device=device)
-        soft_edge_ro = torch.cat([edge_features_ro, obs_action_zeros, goal_polar_ro], dim=-1)
+        # === Soft edge features (8-dim) ===
+        soft_edge_rr = torch.cat([edge_features_rr, goal_polar_rr], dim=-1)  # 5+3=8
+        soft_edge_ro = torch.cat([edge_features_ro, goal_polar_ro], dim=-1)  # 5+3=8
 
         # === PHASE 2: Batched mega-graph message passing ===
         # Build edges for ALL batch samples at once (no Python loop).
