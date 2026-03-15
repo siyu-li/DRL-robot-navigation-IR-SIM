@@ -81,7 +81,7 @@ def main(args=None):
     # ---- Instantiate environment ----
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
-        disable_plotting=True,
+        disable_plotting=False,
         reward_phase=8,
         per_robot_goal_reset=per_robot_goal_reset,
         obstacle_proximity_threshold=obstacle_proximity_threshold,
@@ -113,7 +113,7 @@ def main(args=None):
         obstacle_state_dim=obstacle_state_dim,
         device=device,
         save_every=save_every,
-        load_model=False,
+        load_model=True,
         # load_model_name="TD3-MARL-obstacle-6robots_epoch2400",
         # load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/obstacle_6robots_v2"),
         load_model_name="TD3-MARL-obstacle-14robots-woact",
