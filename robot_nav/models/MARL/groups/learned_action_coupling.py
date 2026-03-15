@@ -241,8 +241,13 @@ def get_embeddings_from_frozen_actor(
     device: torch.device,
 ) -> torch.Tensor:
     """
-    Run the frozen actor's attention + decode layers and return the per-robot
-    embeddings (before the policy head).
+    Run the frozen actor's attention layers and return the **pre-decoder**
+    per-robot embeddings (concat of self-encoding + attention output, before
+    the decode MLP).
+
+    Pre-decoder embeddings preserve relational structure from the GAT
+    message-passing better than the post-decoder output, making them more
+    informative for the downstream MixingNetwork.
 
     The returned tensor has shape ``(num_robots, embedding_dim * 2)`` and is
     **detached** (no gradients flow into the actor).
@@ -254,16 +259,14 @@ def get_embeddings_from_frozen_actor(
         device: Torch device.
 
     Returns:
-        Tensor: Per-robot embeddings, shape ``(num_robots, embedding_dim * 2)``.
+        Tensor: Pre-decoder per-robot embeddings, shape ``(num_robots, embedding_dim * 2)``.
     """
     robot_state = torch.Tensor(robot_obs).to(device)
     obstacle_state = torch.Tensor(obstacle_obs).to(device)
 
     with torch.no_grad():
-        (
-            attn_out,
-            _, _, _, _, _, _, _, _,
-        ) = actor.attention(robot_state, obstacle_state)
-        embeddings = attn_out.detach()
+        # Run full forward to populate _pre_decoder_embedding
+        actor.attention(robot_state, obstacle_state)
+        embeddings = actor.attention._pre_decoder_embedding.detach()
 
     return embeddings

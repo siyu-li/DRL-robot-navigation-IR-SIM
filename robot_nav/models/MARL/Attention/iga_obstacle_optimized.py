@@ -498,6 +498,9 @@ class AttentionObstacleOptimized(nn.Module):
         self_embed = robot_embed.reshape(batch_size * n_robots, -1)
         concat_embed = torch.cat([self_embed, attn_out_flat], dim=-1)
 
+        # Store pre-decoder embedding for downstream consumers (e.g. MixingNetwork)
+        self._pre_decoder_embedding = concat_embed.detach()
+
         x = F.leaky_relu(self.decode_1(concat_embed))
         att_embedding = F.leaky_relu(self.decode_2(x))
 
