@@ -62,7 +62,7 @@ CONFIG = {
                                "Feb.10_obstacle_14robot_transfer_gpu",
 
     # ---- Group generation ----
-    "include_sizes": (1, 2, 3, 4, 7),  # candidate group sizes
+    "include_sizes": (2, 3),  # candidate group sizes
     "use_rotation_coupling": True,
     "rotation_coupling_threshold": 3,
 
@@ -103,7 +103,7 @@ CONFIG = {
     #     entropy annealing continues from where it left off.
     # 3 = warm-start from RL checkpoint: load weights only,
     #     iter_count=0, optimizer=reset, annealing restarts.
-    "load_mode": 1,
+    "load_mode": 0,
     "load_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_100.pt",              # path or name depending on mode:
     #   mode 1 → full path to supervised .pt file
     #             e.g. "robot_nav/models/MARL/switcher/runs/switcher/epoch_50.pt"
