@@ -11,8 +11,6 @@ RL (PPO) group switcher components.
 
 from robot_nav.models.MARL.switcher.rl.rl_feature_builder import (
     RLFeatureBuilder,
-    GROUP_SCALAR_DIM,
-    STATE_SCALAR_DIM,
 )
 from robot_nav.models.MARL.switcher.rl.switcher_ppo import (
     SwitcherActorCritic,
@@ -23,8 +21,6 @@ from robot_nav.models.MARL.switcher.rl.switcher_env import SwitcherEnv
 
 __all__ = [
     "RLFeatureBuilder",
-    "GROUP_SCALAR_DIM",
-    "STATE_SCALAR_DIM",
     "SwitcherActorCritic",
     "SwitcherPPO",
     "SwitcherRolloutBuffer",

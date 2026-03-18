@@ -24,11 +24,8 @@ import torch
 
 from robot_nav.models.MARL.marlTD3.marlTD3_obstacle import TD3Obstacle
 from robot_nav.models.MARL.switcher.group_generator import generate_all_groups
-from robot_nav.models.MARL.switcher.rl_feature_builder import (
-    RLFeatureBuilder,
-    GROUP_SCALAR_DIM,
-    STATE_SCALAR_DIM,
-)
+from robot_nav.models.MARL.switcher.rl_feature_builder import RLFeatureBuilder
+from robot_nav.models.MARL.switcher.config_loader import load_switcher_config
 from robot_nav.models.MARL.switcher.switcher_env import SwitcherEnv
 from robot_nav.models.MARL.switcher.switcher_ppo import SwitcherPPO
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
@@ -92,8 +89,6 @@ CONFIG = {
     "decentralized_model_dir": "robot_nav/models/MARL/marlTD3/checkpoint/"
                                "Feb.10_obstacle_14robot_transfer_gpu",
     "include_sizes": (1, 2, 3, 4, 7),
-    "use_rotation_coupling": True,
-    "rotation_coupling_threshold": 3,
     "embed_dim": 512,
     "lr_actor": 3e-4,
     "lr_critic": 1e-3,
@@ -163,11 +158,12 @@ def main():
     groups = _generate_groups(cfg["n_robots"], cfg["include_sizes"])
     print(f"Groups: {len(groups)}")
 
-    fb = RLFeatureBuilder(
+    sw_cfg = load_switcher_config("robot_nav/models/MARL/switcher/switcher_config.yaml")
+    fb = RLFeatureBuilder.from_config(
+        sw_cfg,
         embed_dim=cfg["embed_dim"],
         pooling="mean",
         max_group_size=max(len(g) for g in groups),
-        rotation_coupling_threshold=cfg["rotation_coupling_threshold"],
     )
 
     env = SwitcherEnv(
@@ -178,15 +174,13 @@ def main():
         selection_interval=cfg["selection_interval"],
         max_episode_steps=cfg["max_episode_steps"],
         goal_threshold=cfg["goal_threshold"],
-        use_rotation_coupling=cfg["use_rotation_coupling"],
-        rotation_coupling_threshold=cfg["rotation_coupling_threshold"],
         device=device_str,
     )
 
     ppo = SwitcherPPO(
         embed_dim=cfg["embed_dim"],
-        group_scalar_dim=GROUP_SCALAR_DIM,
-        state_scalar_dim=STATE_SCALAR_DIM,
+        group_scalar_dim=sw_cfg.group_scalar_dim,
+        state_scalar_dim=sw_cfg.state_scalar_dim,
         lr_actor=cfg["lr_actor"],
         lr_critic=cfg["lr_critic"],
         gamma=cfg["gamma"],

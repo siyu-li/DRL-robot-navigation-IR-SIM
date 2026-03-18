@@ -1,0 +1,43 @@
+# ========================================================================
+# Unified Switcher Scalar Configuration
+# ========================================================================
+# Shared by both Supervised and RL feature builders.
+# Changing this file changes the group_scalar_dim / state_scalar_dim,
+# so re-training is required unless dimensions match a saved checkpoint.
+# ========================================================================
+
+# Action coupling mode for multi-robot groups (size >= 2).
+#   "min"  — conservative: coupled linear velocity = min of members' scaled vels.
+#   "mean" — cooperative:  coupled linear velocity = mean of members' scaled vels.
+coupling_mode: "min"
+
+# Base scalars (always 4 when enabled): size_feat, A_in, A_out, A_obs.
+# Set false to exclude these from the scalar vector entirely.
+base_scalars: true
+
+# Per-group extra features.
+# Each entry: [extra_key, aggregation]
+# aggregation ∈ {mean, min, max, sum}
+extra_group:
+  - ["dist_to_goal",  "mean"]   # mean distance-to-goal of group members
+  - ["dist_to_goal",  "min"]    # min distance-to-goal
+  - ["clearance",     "min"]    # worst clearance in group
+  - ["reached",       "mean"]   # fraction of group already reached
+  - ["heading_error", "mean"]   # mean |heading − goal_direction|
+
+# Global context scalars (broadcast identically to every group).
+# Each entry: extra_key whose tensor has shape (1,) or is broadcast (N,).
+extra_global:
+  - "var_dist_to_goal"           # distance variance across all robots
+  - "frac_reached_global"       # global completion fraction
+  - "steps_elapsed_frac"        # time pressure signal
+
+# State-level scalars for the RL value head (critic).
+# Each entry: [extra_key, aggregation]
+# These are computed globally (across all robots), not per-group.
+state_scalars:
+  - ["dist_to_goal",        "mean"]   # mean distance-to-goal
+  - ["var_dist_to_goal",    "first"]  # variance (broadcast scalar, take [0])
+  - ["clearance",           "min"]    # global worst clearance
+  - ["frac_reached_global", "first"]  # global completion fraction
+  - ["steps_elapsed_frac",  "first"]  # time pressure

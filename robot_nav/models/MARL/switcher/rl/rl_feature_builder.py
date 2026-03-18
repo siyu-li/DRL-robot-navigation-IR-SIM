@@ -5,56 +5,44 @@ Separate feature builder for RL training (PPO) that produces:
   1. Per-group feature matrix X ∈ R^(M, D)  → Actor (policy head)
   2. State feature vector    s ∈ R^(S,)     → Critic (value head)
 
-Differences from the supervised ``GroupFeatureBuilder``:
-  - Fixed, curated 13-dim group scalars (not generic name→agg config).
-  - ``coupling_mode`` is a first-class feature, not a flag.
-  - Produces state-level features for the value head.
-  - ``heading_error`` is a new per-robot feature (|heading - goal_direction|).
+Group scalar features and state scalars are configurable via
+``SwitcherScalarConfig`` (loaded from ``switcher_config.yaml``).
 
-Per-group scalars (13):
+The default configuration produces 12 group scalars and 5 state scalars,
+matching the original hardcoded layout:
+
+Per-group scalars (default 12):
   ┌─────────────────────────────────────────────────────────────┐
-  │  Per-group (differentiate groups):                          │
+  │  Base (when enabled, 4 scalars):                            │
   │  1. size_feat          — group_size / max_group_size        │
-  │  2. coupling_mode      — 1.0 if rotation-coupled, else 0.0 │
-  │  3. A_in               — intra-group attention              │
-  │  4. A_out              — group-to-outside attention         │
-  │  5. A_obs              — group-to-obstacle attention        │
-  │  6. mean_dist_goal_g   — mean distance-to-goal of members  │
-  │  7. min_dist_goal_g    — min distance-to-goal              │
-  │  8. min_clearance_g    — worst clearance in group           │
-  │  9. frac_reached_g     — fraction of group already reached  │
-  │ 10. mean_heading_err_g — mean |heading - goal_direction|    │
+  │  2. A_in               — intra-group attention              │
+  │  3. A_out              — group-to-outside attention         │
+  │  4. A_obs              — group-to-obstacle attention        │
   │                                                             │
-  │ Global broadcast (context for credit assignment):           │
-  │ 11. var_dist_goal      — global distance variance           │
-  │ 12. frac_reached_global— global completion fraction         │
-  │ 13. steps_elapsed_frac — time pressure signal               │
+  │  extra_group (per-group, aggregated over members):          │
+  │  5. mean_dist_goal_g   — mean distance-to-goal of members  │
+  │  6. min_dist_goal_g    — min distance-to-goal              │
+  │  7. min_clearance_g    — worst clearance in group           │
+  │  8. frac_reached_g     — fraction of group already reached  │
+  │  9. mean_heading_err_g — mean |heading - goal_direction|    │
+  │                                                             │
+  │  extra_global (context, broadcast to every group):          │
+  │ 10. var_dist_goal      — global distance variance           │
+  │ 11. frac_reached_global— global completion fraction         │
+  │ 12. steps_elapsed_frac — time pressure signal               │
   └─────────────────────────────────────────────────────────────┘
 
-State scalars for value head (5):
+State scalars for value head (default 5):
   [mean_dist, var_dist, min_clearance, frac_reached, steps_frac]
-  All computed globally (across all robots, not per-group).
 """
 
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 
-# Expected keys in the ``extra`` dict passed to ``forward()``/``build_state_features()``.
-_REQUIRED_EXTRA_KEYS = [
-    "dist_to_goal",         # (N,) per-robot distance to goal
-    "clearance",            # (N,) per-robot min obstacle clearance
-    "reached",              # (N,) per-robot binary reached flag
-    "heading_error",        # (N,) per-robot |heading - goal_direction| in radians
-    "frac_reached_global",  # (N,) broadcast: same scalar for every robot
-    "var_dist_to_goal",     # (N,) broadcast
-    "steps_elapsed_frac",   # (N,) broadcast
-]
-
-GROUP_SCALAR_DIM = 13
-STATE_SCALAR_DIM = 5
+_VALID_AGGS = {"mean", "min", "max", "sum", "first"}
 
 
 class RLFeatureBuilder(nn.Module):
@@ -63,23 +51,24 @@ class RLFeatureBuilder(nn.Module):
 
     Produces two outputs:
       - ``forward(...)`` → group features ``X ∈ R^(M, D)``
-        where ``D = 2 * embed_dim + GROUP_SCALAR_DIM``.
+        where ``D = 2 * embed_dim + group_scalar_dim``.
       - ``build_state_features(...)`` → state features ``s ∈ R^(S,)``
-        where ``S = embed_dim + STATE_SCALAR_DIM``.
+        where ``S = embed_dim + state_scalar_dim``.
+
+    Scalar features are specified explicitly via ``base_scalars``,
+    ``extra_group``, ``extra_global``, and ``state_scalars`` parameters.
+    Use ``from_config()`` to construct from a ``SwitcherScalarConfig``.
 
     Args:
-        embed_dim: Dimension of per-robot embeddings from the GAT backbone
-            output (d).  The attention module produces ``H`` of shape
-            ``(N, 2*embedding_dim)``; with ``embedding_dim=256`` the per-robot
-            vector is 512-dim, so ``embed_dim`` should be **512**.
-            ``h_g`` and ``h_glob`` each have this dim.
+        embed_dim: Dimension of per-robot embeddings from the GAT backbone.
         global_embed_dim: Dimension of global embedding (dg).
             If *None*, defaults to ``embed_dim``.
         pooling: Pooling method for group embedding (``"mean"`` or ``"max"``).
         max_group_size: Normalisation constant for ``size_feat``.
-            Default 7 (largest possible group in 6-robot m=3 binary allocation).
-        rotation_coupling_threshold: Group sizes strictly above this get
-            ``coupling_mode = 1.0``. Default 3.
+        base_scalars: Include size_feat + 3 attention scalars (4 dims).
+        extra_group: Per-group extra features ``[(key, agg), ...]``.
+        extra_global: Global broadcast scalars ``[key, ...]``.
+        state_scalars: State-level scalars for critic ``[(key, agg), ...]``.
     """
 
     def __init__(
@@ -88,14 +77,26 @@ class RLFeatureBuilder(nn.Module):
         global_embed_dim: Optional[int] = None,
         pooling: Literal["mean", "max"] = "mean",
         max_group_size: int = 7,
-        rotation_coupling_threshold: int = 3,
+        base_scalars: bool = True,
+        extra_group: List[Tuple[str, str]] = (),
+        extra_global: List[str] = (),
+        state_scalars: List[Tuple[str, str]] = (),
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.global_embed_dim = global_embed_dim if global_embed_dim is not None else embed_dim
         self.pooling = pooling
         self.max_group_size = max_group_size
-        self.rotation_coupling_threshold = rotation_coupling_threshold
+        self.base_scalars = base_scalars
+
+        self.extra_group: List[Tuple[str, str]] = list(extra_group)
+        self.extra_global: List[str] = list(extra_global)
+        self._state_scalars: List[Tuple[str, str]] = list(state_scalars)
+
+        # Computed scalar dimensions
+        base_dim = 4 if self.base_scalars else 0
+        self._group_scalar_dim = base_dim + len(self.extra_group) + len(self.extra_global)
+        self._state_scalar_dim = len(self._state_scalars)
 
         # Pre-computed group index tensors — populated lazily on first
         # ``forward()`` call via ``_ensure_group_cache()``.  Avoids
@@ -115,23 +116,50 @@ class RLFeatureBuilder(nn.Module):
     # -----------------------------------------------------------------
     @property
     def group_scalar_dim(self) -> int:
-        """Number of per-group scalar features (13)."""
-        return GROUP_SCALAR_DIM
+        """Number of per-group scalar features."""
+        return self._group_scalar_dim
 
     @property
     def state_scalar_dim(self) -> int:
-        """Number of state-level scalar features for the value head (5)."""
-        return STATE_SCALAR_DIM
+        """Number of state-level scalar features for the value head."""
+        return self._state_scalar_dim
 
     @property
     def group_feature_dim(self) -> int:
-        """Total dimension of per-group feature vector ``D = 2*embed_dim + 13``."""
-        return 2 * self.embed_dim + GROUP_SCALAR_DIM
+        """Total dimension of per-group feature vector."""
+        return 2 * self.embed_dim + self._group_scalar_dim
 
     @property
     def state_feature_dim(self) -> int:
-        """Total dimension of state feature vector ``S = embed_dim + 5``."""
-        return self.global_embed_dim + STATE_SCALAR_DIM
+        """Total dimension of state feature vector."""
+        return self.global_embed_dim + self._state_scalar_dim
+
+    @classmethod
+    def from_config(
+        cls,
+        cfg,
+        embed_dim: int = 512,
+        global_embed_dim: Optional[int] = None,
+        pooling: Literal["mean", "max"] = "mean",
+        max_group_size: int = 7,
+    ) -> "RLFeatureBuilder":
+        """Create an ``RLFeatureBuilder`` from a ``SwitcherScalarConfig``.
+
+        Args:
+            cfg: ``SwitcherScalarConfig`` instance.
+            embed_dim, global_embed_dim, pooling, max_group_size: Architecture
+                hyper-parameters (not stored in the YAML).
+        """
+        return cls(
+            embed_dim=embed_dim,
+            global_embed_dim=global_embed_dim,
+            pooling=pooling,
+            max_group_size=max_group_size,
+            base_scalars=cfg.base_scalars,
+            extra_group=cfg.extra_group,
+            extra_global=cfg.extra_global,
+            state_scalars=cfg.state_scalars,
+        )
 
     # -----------------------------------------------------------------
     # Group features  →  Actor
@@ -192,66 +220,56 @@ class RLFeatureBuilder(nn.Module):
         # --- h_glob broadcast: (M, dg) ---
         h_glob_exp = h_glob.unsqueeze(0).expand(M, -1)
 
-        # --- 13 scalar features (all on GPU, no .item()) ---
-        # 1. size_feat
-        size_feat = sizes / self.max_group_size  # (M,)
+        # --- Configurable scalar features (all on GPU, no .item()) ---
+        scalar_parts: List[torch.Tensor] = []
 
-        # 2. coupling_mode
-        coupling_mode = (sizes > self.rotation_coupling_threshold).to(dtype)  # (M,)
+        # Base scalars: size_feat + 3 attention stats
+        if self.base_scalars:
+            size_feat = sizes / self.max_group_size  # (M,)
+            attn_scalars = self._attention_stats_batched(
+                groups, gi_padded, mask, sizes, n_robots, attn_rr, attn_ro, device, dtype,
+            )  # (M, 3)
+            scalar_parts.append(size_feat.unsqueeze(1))  # (M, 1)
+            scalar_parts.append(attn_scalars)            # (M, 3)
 
-        # 3-5. attention stats [A_in, A_out, A_obs]
-        attn_scalars = self._attention_stats_batched(
-            groups, gi_padded, mask, sizes, n_robots, attn_rr, attn_ro, device, dtype,
-        )  # (M, 3)
+        # extra_group scalars (aggregated over group members)
+        if self.extra_group:
+            if extra is not None:
+                eg_cols: List[torch.Tensor] = []
+                for key, agg in self.extra_group:
+                    vals = extra[key]          # (N,)
+                    vals_g = vals[gi_padded]    # (M, max_gs)
+                    if agg == "mean":
+                        col = (vals_g * mask).sum(dim=1) / sizes
+                    elif agg == "min":
+                        col = (vals_g * mask + (1 - mask) * 1e6).min(dim=1)[0]
+                    elif agg == "max":
+                        col = (vals_g * mask + (1 - mask) * (-1e6)).max(dim=1)[0]
+                    elif agg == "sum":
+                        col = (vals_g * mask).sum(dim=1)
+                    else:
+                        col = torch.zeros(M, device=device, dtype=dtype)
+                    eg_cols.append(col)
+                scalar_parts.append(torch.stack(eg_cols, dim=1))  # (M, len(extra_group))
+            else:
+                scalar_parts.append(torch.zeros(M, len(self.extra_group), device=device, dtype=dtype))
 
-        # 6-10. extra per-group stats
-        if extra is not None:
-            dtg = extra["dist_to_goal"]   # (N,)
-            clr = extra["clearance"]      # (N,)
-            rch = extra["reached"]        # (N,)
-            herr = extra["heading_error"] # (N,)
+        # extra_global scalars (broadcast identically to every group)
+        if self.extra_global:
+            if extra is not None:
+                gg_cols: List[torch.Tensor] = []
+                for key in self.extra_global:
+                    val = extra[key][0].unsqueeze(0).expand(M)
+                    gg_cols.append(val)
+                scalar_parts.append(torch.stack(gg_cols, dim=1))  # (M, len(extra_global))
+            else:
+                scalar_parts.append(torch.zeros(M, len(self.extra_global), device=device, dtype=dtype))
 
-            dtg_g = dtg[gi_padded]   # (M, max_gs)
-            clr_g = clr[gi_padded]
-            rch_g = rch[gi_padded]
-            herr_g = herr[gi_padded]
-
-            # Masked mean / min
-            big_val = 1e6
-            dtg_masked = dtg_g * mask + (1 - mask) * big_val
-            clr_masked = clr_g * mask + (1 - mask) * big_val
-            rch_masked = rch_g * mask  # unreachable padded slots → 0
-            herr_masked = herr_g * mask
-
-            mean_dtg = (dtg_g * mask).sum(dim=1) / sizes          # (M,)
-            min_dtg = dtg_masked.min(dim=1)[0]                     # (M,)
-            min_clr = clr_masked.min(dim=1)[0]                     # (M,)
-            frac_rch = (rch_masked).sum(dim=1) / sizes             # (M,)
-            mean_herr = (herr_masked).sum(dim=1) / sizes           # (M,)
-
-            extra_scalars = torch.stack(
-                [mean_dtg, min_dtg, min_clr, frac_rch, mean_herr], dim=1
-            )  # (M, 5)
-
-            # 11-13. global broadcast scalars
-            var_dtg = extra["var_dist_to_goal"][0].unsqueeze(0).expand(M)
-            frac_rch_g = extra["frac_reached_global"][0].unsqueeze(0).expand(M)
-            steps_f = extra["steps_elapsed_frac"][0].unsqueeze(0).expand(M)
-            global_scalars = torch.stack([var_dtg, frac_rch_g, steps_f], dim=1)  # (M, 3)
+        if scalar_parts:
+            all_scalars = torch.cat(scalar_parts, dim=1)  # (M, group_scalar_dim)
+            return torch.cat([h_g, h_glob_exp, all_scalars], dim=1)
         else:
-            extra_scalars = torch.zeros(M, 5, device=device, dtype=dtype)
-            global_scalars = torch.zeros(M, 3, device=device, dtype=dtype)
-
-        # Stack all 13 scalars: (M, 13)
-        all_scalars = torch.cat([
-            size_feat.unsqueeze(1),       # (M, 1)
-            coupling_mode.unsqueeze(1),   # (M, 1)
-            attn_scalars,                 # (M, 3)
-            extra_scalars,                # (M, 5)
-            global_scalars,               # (M, 3)
-        ], dim=1)
-
-        return torch.cat([h_g, h_glob_exp, all_scalars], dim=1)  # (M, 2d + 13)
+            return torch.cat([h_g, h_glob_exp], dim=1)
 
     # -----------------------------------------------------------------
     # State features  →  Critic (value head)
@@ -267,14 +285,9 @@ class RLFeatureBuilder(nn.Module):
 
         Fully vectorized — stays on GPU with no ``.item()`` round-trips.
 
-        Layout: ``[h_glob (embed_dim) || state_scalars (5)]``
+        Layout: ``[h_glob (embed_dim) || state_scalars]``
 
-        State scalars (5):
-          0. mean_dist_to_goal  — ``extra["dist_to_goal"].mean()``
-          1. var_dist_to_goal   — ``extra["var_dist_to_goal"][0]`` (broadcast)
-          2. min_clearance      — ``extra["clearance"].min()``
-          3. frac_reached       — ``extra["frac_reached_global"][0]`` (broadcast)
-          4. steps_elapsed_frac — ``extra["steps_elapsed_frac"][0]`` (broadcast)
+        State scalars are determined by ``self._state_scalars``.
 
         Args:
             h: Per-robot embeddings ``(N, d)`` or ``(1, N, d)``.
@@ -298,19 +311,27 @@ class RLFeatureBuilder(nn.Module):
         device = h.device
         dtype = h.dtype
 
-        # 5 state scalars — all tensor ops, no .item()
-        if extra is None:
-            scalars = torch.zeros(STATE_SCALAR_DIM, device=device, dtype=dtype)
+        if not self._state_scalars or extra is None:
+            scalars = torch.zeros(self._state_scalar_dim, device=device, dtype=dtype)
         else:
-            scalars = torch.stack([
-                extra["dist_to_goal"].mean(),
-                extra["var_dist_to_goal"][0],
-                extra["clearance"].min(),
-                extra["frac_reached_global"][0],
-                extra["steps_elapsed_frac"][0],
-            ])
+            parts: List[torch.Tensor] = []
+            for key, agg in self._state_scalars:
+                vals = extra[key]  # (N,) or broadcast scalar
+                if agg == "mean":
+                    parts.append(vals.mean())
+                elif agg == "min":
+                    parts.append(vals.min())
+                elif agg == "max":
+                    parts.append(vals.max())
+                elif agg == "sum":
+                    parts.append(vals.sum())
+                elif agg == "first":
+                    parts.append(vals[0])
+                else:
+                    parts.append(torch.tensor(0.0, device=device, dtype=dtype))
+            scalars = torch.stack(parts)
 
-        return torch.cat([h_glob, scalars], dim=0)  # (dg + 5,)
+        return torch.cat([h_glob, scalars], dim=0)
 
     # =================================================================
     # Internals
@@ -392,7 +413,7 @@ class RLFeatureBuilder(nn.Module):
         extra: Optional[Dict[str, torch.Tensor]],
         device: torch.device,
     ) -> torch.Tensor:
-        """Build one row of the group feature matrix ``[h_g, h_glob, scalars_13]``.
+        """Build one row of the group feature matrix.
 
         NOTE: This is the legacy per-group path kept for compatibility.
         The vectorized ``forward()`` above is used in the hot path.
@@ -408,45 +429,51 @@ class RLFeatureBuilder(nn.Module):
         else:
             h_g = h_group.max(dim=0)[0]
 
-        # ---- 13 scalar features (vectorized, no .item()) ----
+        # ---- Configurable scalar features ----
         scalars_list: List[torch.Tensor] = []
 
-        # 1. size_feat
-        scalars_list.append(torch.tensor([gs / self.max_group_size], device=device, dtype=dtype))
+        # Base scalars
+        if self.base_scalars:
+            scalars_list.append(torch.tensor([gs / self.max_group_size], device=device, dtype=dtype))
+            a_in, a_out, a_obs = self._attention_stats_vectorized(group, n_robots, attn_rr, attn_ro, device, dtype)
+            scalars_list.append(torch.stack([a_in, a_out, a_obs]))
 
-        # 2. coupling_mode
-        scalars_list.append(torch.tensor([1.0 if gs > self.rotation_coupling_threshold else 0.0], device=device, dtype=dtype))
+        # extra_group scalars
+        if self.extra_group:
+            if extra is not None:
+                eg_parts: List[torch.Tensor] = []
+                for key, agg in self.extra_group:
+                    vals = extra[key][gi]
+                    if agg == "mean":
+                        eg_parts.append(vals.mean())
+                    elif agg == "min":
+                        eg_parts.append(vals.min())
+                    elif agg == "max":
+                        eg_parts.append(vals.max())
+                    elif agg == "sum":
+                        eg_parts.append(vals.sum())
+                    else:
+                        eg_parts.append(torch.tensor(0.0, device=device, dtype=dtype))
+                scalars_list.append(torch.stack(eg_parts))
+            else:
+                scalars_list.append(torch.zeros(len(self.extra_group), device=device, dtype=dtype))
 
-        # 3-5. attention stats [A_in, A_out, A_obs]
-        a_in, a_out, a_obs = self._attention_stats_vectorized(group, n_robots, attn_rr, attn_ro, device, dtype)
-        scalars_list.append(torch.stack([a_in, a_out, a_obs]))
+        # extra_global scalars
+        if self.extra_global:
+            if extra is not None:
+                gg_parts: List[torch.Tensor] = []
+                for key in self.extra_global:
+                    gg_parts.append(extra[key][0])
+                scalars_list.append(torch.stack(gg_parts))
+            else:
+                scalars_list.append(torch.zeros(len(self.extra_global), device=device, dtype=dtype))
 
-        # 6-10. extra per-group stats
-        if extra is not None:
-            dtg_g = extra["dist_to_goal"][gi]
-            scalars_list.append(torch.stack([
-                dtg_g.mean(),
-                dtg_g.min(),
-                extra["clearance"][gi].min(),
-                extra["reached"][gi].mean(),
-                extra["heading_error"][gi].mean(),
-            ]))
+        if scalars_list:
+            scalar_t = torch.cat(scalars_list)
         else:
-            scalars_list.append(torch.zeros(5, device=device, dtype=dtype))
+            scalar_t = torch.zeros(0, device=device, dtype=dtype)
 
-        # 11-13. global broadcast scalars
-        if extra is not None:
-            scalars_list.append(torch.stack([
-                extra["var_dist_to_goal"][0],
-                extra["frac_reached_global"][0],
-                extra["steps_elapsed_frac"][0],
-            ]))
-        else:
-            scalars_list.append(torch.zeros(3, device=device, dtype=dtype))
-
-        scalar_t = torch.cat(scalars_list)  # (13,)
-
-        return torch.cat([h_g, h_glob, scalar_t], dim=0)  # (2d + 13,)
+        return torch.cat([h_g, h_glob, scalar_t], dim=0)
 
     def _attention_stats_batched(
         self,

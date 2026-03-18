@@ -62,7 +62,6 @@ CONFIG = {
     "include_size_3": True,
     "include_size_4": True,
     "include_size_7": True,
-    "use_rotation_coupling": True,
 
     # Model
     "state_dim": 11,
@@ -189,8 +188,6 @@ class OracleEvaluator:
             raw_actions=action,
             group=group,
             num_robots=self.num_robots,
-            use_rotation_coupling=CONFIG.get("use_rotation_coupling", True),
-            rotation_coupling_threshold=3,
         )
         return a_out, action  # also return raw policy action
 

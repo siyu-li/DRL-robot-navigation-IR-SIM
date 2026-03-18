@@ -134,7 +134,7 @@ class SwitcherActorCritic(nn.Module):
             have this dim, so the concatenated embedding input to the actor
             is ``2 * embed_dim = 1024``.
         group_scalar_dim: Number of per-group scalar features
-            (size_feat + coupling_mode + attn_stats + extras).
+            (size_feat + attn_stats + extras).
         state_scalar_dim: Number of state-level scalar features for the value head
             (mean_dist, var_dist, min_clearance, frac_reached, steps_frac).
         embed_hidden: Hidden dim for the actor's embedding tower
@@ -470,6 +470,9 @@ class SwitcherPPO:
 
         self.writer = SummaryWriter(comment=model_name)
 
+        # Optional: set by caller to persist config in checkpoints
+        self.switcher_config_dict = None
+
     def get_action(
         self,
         group_features: torch.Tensor,
@@ -643,14 +646,14 @@ class SwitcherPPO:
         """Save policy checkpoint."""
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "policy_state_dict": self.policy.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "iter_count": self.iter_count,
-            },
-            directory / f"{filename}.pt",
-        )
+        ckpt = {
+            "policy_state_dict": self.policy.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "iter_count": self.iter_count,
+        }
+        if self.switcher_config_dict is not None:
+            ckpt["switcher_config"] = self.switcher_config_dict
+        torch.save(ckpt, directory / f"{filename}.pt")
 
     def load(self, filename: str, directory: Path):
         """Load policy checkpoint."""

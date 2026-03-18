@@ -48,6 +48,8 @@ from robot_nav.models.MARL.groups.action_coupling import (
     actions_for_group_from_raw as _shared_actions_for_group_from_raw,
     actions_for_group as _shared_actions_for_group,
 )
+from robot_nav.models.MARL.switcher.embedding_utils import extract_embeddings
+from robot_nav.models.MARL.switcher.config_loader import load_switcher_config
 
 # =============================================================================
 # Configuration Dictionary - Edit these values directly
@@ -55,6 +57,9 @@ from robot_nav.models.MARL.groups.action_coupling import (
 CONFIG = {
     # Output configuration
     "output_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots.pt",
+    
+    # Switcher scalar config (YAML path or None for defaults)
+    "switcher_config_path": None,  # e.g. "robot_nav/models/MARL/switcher/switcher_config.yaml"
     
     # Data collection settings
     "n_samples": 7000,              # Number of samples to collect
@@ -73,14 +78,6 @@ CONFIG = {
     "include_size_3": True,         # Include triplets
     "include_size_4": True,        # Include size-4 groups (rotation-coupled if enabled)
     "include_size_7": True,        # Include size-7 groups (rotation-coupled if enabled)
-    
-    # Rotation coupling for large groups (size > 3):
-    # When True, groups with size > 3 use coupled rotation in addition to
-    # coupled linear velocity. All robots in the group rotate at the same
-    # angular velocity (average of individual angular velocities) and move
-    # at the same linear velocity (average of individual linear velocities).
-    # Groups with size <= 3 always keep individual angular velocities.
-    "use_rotation_coupling": True,
     
     # Model configuration
     "state_dim": 11,
@@ -248,11 +245,7 @@ class OracleDataCollector:
     - For size-1 groups: use individual robot's action directly
     - For size-2/3 groups: average linear velocities of robots in the group
       to get coupled linear velocity, keep individual angular velocities
-    - For size-4/7 groups (rotation-coupled, if use_rotation_coupling=True):
-      average linear velocity AND average angular velocity — all robots in the
-      group move and rotate at the same speed
-    - For size-4/7 groups (if use_rotation_coupling=False):
-      same as size-2/3 (coupled linear only, individual angular)
+    - For size-4/7 groups: same as size-2/3 (coupled linear only, individual angular)
     
     This follows the same pattern as ShortHorizonOracle in coupled_action_oracle_eval.py.
     """
@@ -265,6 +258,7 @@ class OracleDataCollector:
         horizon: int = 10,            # Number of steps to simulate forward
         n_rollouts_per_group: int = 1,
         device: torch.device = None,
+        coupling_mode: str = "min",
     ):
         """
         Args:
@@ -274,6 +268,7 @@ class OracleDataCollector:
             horizon: Number of simulation steps for oracle evaluation
             n_rollouts_per_group: Number of rollouts to average for each group score
             device: Device for tensors
+            coupling_mode: ``"min"`` or ``"mean"`` for group velocity coupling.
         """
         self.sim = sim
         self.policy = policy
@@ -283,6 +278,7 @@ class OracleDataCollector:
         self.device = device or torch.device("cpu")
         self.num_robots = sim.num_robots
         self.num_obstacles = sim.num_obstacles
+        self.coupling_mode = coupling_mode
     
     def get_action_for_group(
         self,
@@ -300,8 +296,7 @@ class OracleDataCollector:
             obstacle_obs=obstacle_obs,
             group=group,
             num_robots=self.num_robots,
-            use_rotation_coupling=CONFIG.get("use_rotation_coupling", True),
-            rotation_coupling_threshold=3,
+            coupling_mode=self.coupling_mode,
         )
     
     def compute_evasion_reward(
@@ -1010,52 +1005,10 @@ class OracleDataCollector:
         robot_obs: np.ndarray,
         obstacle_obs: np.ndarray,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Get robot embeddings and attention weights from the decentralized policy.
-        
-        Uses the TD3Obstacle actor's attention module to get embeddings and
-        attention weights. The embeddings are the same as used in the policy.
-        
-        Args:
-            robot_obs: Robot observations, shape (num_robots, state_dim)
-            obstacle_obs: Obstacle observations, shape (num_obstacles, obs_dim)
-            
-        Returns:
-            h: Per-robot embeddings, Tensor[N, embed_dim]
-            attn_rr: Robot-robot attention weights, Tensor[N, N]
-            attn_ro: Robot-obstacle attention weights, Tensor[N, N_obs]
-        """
-        robot_tensor = torch.tensor(robot_obs, dtype=torch.float32, device=self.device)
-        obstacle_tensor = torch.tensor(obstacle_obs, dtype=torch.float32, device=self.device)
-        
-        # Add batch dimension
-        robot_tensor = robot_tensor.unsqueeze(0)  # (1, N, state_dim)
-        obstacle_tensor = obstacle_tensor.unsqueeze(0)  # (1, N_obs, obs_dim)
-        
-        with torch.no_grad():
-            # Get embeddings and attention from the actor's attention module
-            (
-                H,  # Per-robot embeddings: (B*N, embed_dim)
-                hard_logits_rr,
-                hard_logits_ro,
-                dist_rr,
-                dist_ro,
-                mean_entropy,
-                hard_weights_rr,  # (B, N, N)
-                hard_weights_ro,  # (B, N, N_obs)
-                combined_weights,
-            ) = self.policy.actor.attention(robot_tensor, obstacle_tensor)
-        
-        # Reshape H from (B*N, embed_dim) to (B, N, embed_dim), then remove batch dim
-        batch_size = robot_tensor.shape[0]
-        n_robots = robot_tensor.shape[1]
-        embed_dim = H.shape[-1]  # embed_dim (= 2 * GAT embedding_dim = 512)
-        
-        h = H.view(batch_size, n_robots, embed_dim).squeeze(0)  # (N, embed_dim)
-        attn_rr = hard_weights_rr.squeeze(0)  # (N, N)
-        attn_ro = hard_weights_ro.squeeze(0)  # (N, N_obs)
-        
-        return h, attn_rr, attn_ro
+        """Get pre-decoder robot embeddings and attention weights."""
+        return extract_embeddings(
+            self.policy.actor.attention, robot_obs, obstacle_obs, self.device,
+        )
     
     def _get_extra_features(
         self,
@@ -1606,7 +1559,6 @@ class OracleDataCollector:
                 "n_rollouts_per_group": self.n_rollouts_per_group,
                 "collection_method": "simulation_rollout_singleprocess_allreach",
                 "scoring": "sync_newreach_laggard_urgency",
-                "use_rotation_coupling": CONFIG.get("use_rotation_coupling", True),
                 "k_reach": CONFIG.get("k_reach", 50.0),
                 "k_progress": CONFIG.get("k_progress", 3.0),
                 "k_rotation_progress": CONFIG.get("k_rotation_progress", 2.0),
@@ -1680,10 +1632,6 @@ def main():
     if config.get("include_size_4", False): sizes_included.append("4")
     if config.get("include_size_7", False): sizes_included.append("7")
     print(f"Group sizes included: {', '.join(sizes_included)}")
-    if config.get("use_rotation_coupling", True):
-        print(f"Rotation coupling: ON for groups with size > 3 (avg angular vel, avg linear vel)")
-    else:
-        print(f"Rotation coupling: OFF (all groups use individual angular vel)")
     phase2_mode = config.get("phase2_selection", "random")
     if phase2_mode == "softmax":
         print(f"Phase 2 selection: softmax (temperature={config.get('phase2_temperature', 1.0)}, higher score → higher sample prob)")
@@ -1743,9 +1691,16 @@ def main():
     logger.info(f"  Size-3: {sum(1 for g in candidate_groups if len(g) == 3)}")
     logger.info(f"  Size-4: {sum(1 for g in candidate_groups if len(g) == 4)}")
     logger.info(f"  Size-7: {sum(1 for g in candidate_groups if len(g) == 7)}")
-    if config.get("use_rotation_coupling", True):
-        logger.info("  Rotation coupling: ON for groups with size > 3")
     
+    # Load coupling_mode from switcher config
+    sw_cfg_path = config.get("switcher_config_path")
+    if sw_cfg_path is not None:
+        sw_cfg = load_switcher_config(sw_cfg_path)
+        coupling_mode = sw_cfg.coupling_mode
+    else:
+        coupling_mode = "min"
+    logger.info(f"Coupling mode: {coupling_mode}")
+
     # Create oracle data collector
     collector = OracleDataCollector(
         sim=sim,
@@ -1754,6 +1709,7 @@ def main():
         horizon=config["oracle_horizon"],
         n_rollouts_per_group=config["n_rollouts_per_group"],
         device=device,
+        coupling_mode=coupling_mode,
     )
     
     # Collect data

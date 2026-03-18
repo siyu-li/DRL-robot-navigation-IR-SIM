@@ -33,8 +33,6 @@ Usage examples:
 # ── Supervised switcher ──
 from robot_nav.models.MARL.switcher.supervised import (
     GroupFeatureBuilder,
-    DEFAULT_EXTRA_GROUP,
-    DEFAULT_EXTRA_GLOBAL,
     _BASE_SCALAR_DIM,
     GroupSwitcher,
     pairwise_logistic_ranking_loss,
@@ -50,12 +48,17 @@ from robot_nav.models.MARL.switcher.supervised import (
 # ── RL switcher ──
 from robot_nav.models.MARL.switcher.rl import (
     RLFeatureBuilder,
-    GROUP_SCALAR_DIM,
-    STATE_SCALAR_DIM,
     SwitcherActorCritic,
     SwitcherPPO,
     SwitcherRolloutBuffer,
     SwitcherEnv,
+)
+
+# ── Config ──
+from robot_nav.models.MARL.switcher.config_loader import (
+    SwitcherScalarConfig,
+    load_switcher_config,
+    config_from_dict,
 )
 
 # ── Groups (re-export for backward compatibility) ──
@@ -72,8 +75,6 @@ from robot_nav.models.MARL.groups import (
 __all__ = [
     # Supervised
     "GroupFeatureBuilder",
-    "DEFAULT_EXTRA_GROUP",
-    "DEFAULT_EXTRA_GLOBAL",
     "_BASE_SCALAR_DIM",
     "GroupSwitcher",
     "pairwise_logistic_ranking_loss",
@@ -86,8 +87,6 @@ __all__ = [
     "RankingLossWithScheduledMargin",
     # RL
     "RLFeatureBuilder",
-    "GROUP_SCALAR_DIM",
-    "STATE_SCALAR_DIM",
     "SwitcherActorCritic",
     "SwitcherPPO",
     "SwitcherRolloutBuffer",
@@ -100,4 +99,8 @@ __all__ = [
     "print_group_statistics",
     "actions_for_group",
     "actions_for_group_from_raw",
+    # Config
+    "SwitcherScalarConfig",
+    "load_switcher_config",
+    "config_from_dict",
 ]

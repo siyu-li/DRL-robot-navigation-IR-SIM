@@ -2,17 +2,12 @@
 Action Coupling for Group-Based Robot Control.
 
 Applies velocity coupling rules to robot groups:
-  - All groups (size ≥ 2): coupled linear velocity = mean of scaled linear vels.
-  - Groups with size > rotation_coupling_threshold: also couple angular velocity
-    (average of group members).
+  - All groups (size >= 2): coupled linear velocity = mean or min of scaled
+    linear vels (configurable via ``coupling_mode``), individual angular velocity.
   - Size-1 groups: just scale the individual robot's action.
   - Robots NOT in the active group get [0, 0].
 
-Linear velocity scaling: raw ∈ [-1, 1] → scaled ∈ [0, 0.5] via (v + 1) / 4.
-
-Using mean (instead of min) allows groups containing both reached and unreached
-robots to still move, since a reached robot's near-zero velocity no longer
-drags the entire group to a halt.
+Linear velocity scaling: raw in [-1, 1] -> scaled in [0, 0.5] via (v + 1) / 4.
 
 Two entry points:
   - ``actions_for_group``:          runs the policy forward pass, then couples.
@@ -28,8 +23,7 @@ def actions_for_group_from_raw(
     raw_actions: np.ndarray,
     group: List[int],
     num_robots: int,
-    use_rotation_coupling: bool = True,
-    rotation_coupling_threshold: int = 3,
+    coupling_mode: str = "min",
 ) -> List[List[float]]:
     """
     Derive coupled actions from pre-computed raw policy output (CPU only).
@@ -38,9 +32,8 @@ def actions_for_group_from_raw(
 
     Coupling rules:
       - Size 1: individual action, no coupling.
-      - Size 2–3: coupled linear velocity (mean), individual angular velocity.
-      - Size > threshold (if ``use_rotation_coupling``): coupled linear (mean)
-        AND coupled angular (mean).
+      - Size >= 2: coupled linear velocity (mean or min), individual angular
+        velocity.
       - Inactive robots get ``[0.0, 0.0]``.
 
     Args:
@@ -48,9 +41,7 @@ def actions_for_group_from_raw(
             values in [-1, 1].
         group: List of robot indices in the active group.
         num_robots: Total number of robots.
-        use_rotation_coupling: Whether to couple angular velocity for large groups.
-        rotation_coupling_threshold: Groups with ``size > threshold`` use
-            coupled angular velocity.  Default: 3.
+        coupling_mode: ``"min"`` (conservative, default) or ``"mean"``.
 
     Returns:
         Actions for all robots, ``List[List[float]]`` of length ``num_robots``.
@@ -73,21 +64,16 @@ def actions_for_group_from_raw(
                 a_out.append([0.0, 0.0])
         return a_out
 
-    # Size >= 2: coupled linear velocity = mean
-    v_coupled = sum(scaled_lin_vels) / len(scaled_lin_vels)
-
-    # Angular velocity coupling for large groups
-    if group_size > rotation_coupling_threshold and use_rotation_coupling:
-        ang_vels = [raw_actions[idx][1] for idx in group]
-        w_coupled = sum(ang_vels) / len(ang_vels)
+    # Size >= 2: coupled linear velocity, individual angular velocity
+    if coupling_mode == "min":
+        v_coupled = min(scaled_lin_vels)
     else:
-        w_coupled = None  # per-robot angular velocity
+        v_coupled = sum(scaled_lin_vels) / len(scaled_lin_vels)
 
     a_out = []
     for i in range(num_robots):
         if i in group_set:
-            w = w_coupled if w_coupled is not None else raw_actions[i][1]
-            a_out.append([v_coupled, w])
+            a_out.append([v_coupled, raw_actions[i][1]])
         else:
             a_out.append([0.0, 0.0])
     return a_out
@@ -99,9 +85,8 @@ def actions_for_group(
     obstacle_obs: np.ndarray,
     group: List[int],
     num_robots: int,
-    use_rotation_coupling: bool = True,
-    rotation_coupling_threshold: int = 3,
     add_noise: bool = False,
+    coupling_mode: str = "min",
 ) -> List[List[float]]:
     """
     Run the decentralized policy forward pass and apply group action coupling.
@@ -116,10 +101,8 @@ def actions_for_group(
         obstacle_obs: Obstacle observations, shape ``(num_obstacles, obs_dim)``.
         group: List of robot indices in the active group.
         num_robots: Total number of robots.
-        use_rotation_coupling: Whether to couple angular velocity for large groups.
-        rotation_coupling_threshold: Groups with ``size > threshold`` use
-            coupled angular velocity.  Default: 3.
         add_noise: Whether to add exploration noise to the policy output.
+        coupling_mode: ``"min"`` (conservative, default) or ``"mean"``.
 
     Returns:
         Actions for all robots, ``List[List[float]]`` of length ``num_robots``.
@@ -129,6 +112,5 @@ def actions_for_group(
         raw_actions=action,
         group=group,
         num_robots=num_robots,
-        use_rotation_coupling=use_rotation_coupling,
-        rotation_coupling_threshold=rotation_coupling_threshold,
+        coupling_mode=coupling_mode,
     )

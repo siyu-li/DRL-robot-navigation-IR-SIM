@@ -27,14 +27,15 @@ from torch.utils.tensorboard import SummaryWriter
 
 from robot_nav.models.MARL.switcher.supervised import (
     GroupFeatureBuilder,
-    DEFAULT_EXTRA_GROUP,
-    DEFAULT_EXTRA_GLOBAL,
     GroupSwitcher,
     pairwise_logistic_ranking_loss,
     hinge_ranking_loss,
     build_pairs_from_scores,
     compute_ranking_accuracy,
     compute_top1_accuracy,
+)
+from robot_nav.models.MARL.switcher.config_loader import (
+    load_switcher_config,
 )
 
 
@@ -46,27 +47,11 @@ CONFIG = {
     "data_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_couple_group_len1200_avev_success.pt",
     "embed_dim": 512,              # Dimension of per-robot embeddings: Will be adjust based on data if None
     
+    # Switcher scalar config (YAML path)
+    "switcher_config_path": "robot_nav/models/MARL/switcher/switcher_config.yaml",
+    
     # GroupFeatureBuilder config
-    #   Features 1-5 are always on (size_feat, coupling_mode, A_in, A_out, A_obs).
-    #   extra_group: list of (extra_key, aggregation) for per-group scalars
-    #                aggregated over group members. Set to [] to disable.
-    #   extra_global: list of extra_key names for global scalars (same for
-    #                 every group). Set to [] to disable.
-    #   scalar_dim = 5 + len(extra_group) + len(extra_global) + 1 (urgency_flag)
     "max_group_size": 7,
-    "rotation_coupling_threshold": 3,
-    "extra_group": [
-        ("dist_to_goal", "mean"),   # mean_dist_goal_g
-        ("dist_to_goal", "min"),    # min_dist_goal_g
-        ("clearance",    "min"),    # min_clearance_g
-        ("reached",      "mean"),   # frac_reached_g
-        ("heading_error","mean"),   # mean_heading_err_g
-    ],
-    "extra_global": [
-        "var_dist_goal_global",     # distance variance (sync signal)
-        "frac_reached_global",      # global completion fraction
-        "steps_elapsed_frac",       # time pressure
-    ],
     
     # Urgency flag: Binary indicator for single-robot groups with urgent robots
     #   1.0 if group size == 1 AND that robot is urgent
@@ -184,22 +169,20 @@ class SwitcherDataset(Dataset):
         data_path: str,
         embed_dim: Optional[int] = None,
         max_group_size: int = 7,
-        rotation_coupling_threshold: int = 3,
-        extra_group: Optional[List[Tuple[str, str]]] = None,
-        extra_global: Optional[List[str]] = None,
+        extra_group: List[Tuple[str, str]] = (),
+        extra_global: List[str] = (),
         use_urgency_flag: bool = True,
+        base_scalars: bool = True,
     ):
         """
         Args:
             data_path: Path to oracle data file (.pt)
             embed_dim: Dimension of robot embeddings. If None, inferred from data.
             max_group_size: Normalisation constant for size_feat.
-            rotation_coupling_threshold: Groups > this size get coupling_mode=1.
             extra_group: Per-group extra features as ``(key, agg)`` pairs.
-                ``None`` → defaults.  ``[]`` → disabled.
             extra_global: Global extra feature key names.
-                ``None`` → defaults.  ``[]`` → disabled.
             use_urgency_flag: If True, append urgency flag to group features.
+            base_scalars: If True, include size_feat + 3 attention scalars.
         """
         self.data = torch.load(data_path)
         self.samples = self.data["samples"]
@@ -214,9 +197,9 @@ class SwitcherDataset(Dataset):
         self.feature_builder = GroupFeatureBuilder(
             embed_dim=embed_dim,
             max_group_size=max_group_size,
-            rotation_coupling_threshold=rotation_coupling_threshold,
             extra_group=extra_group,
             extra_global=extra_global,
+            base_scalars=base_scalars,
         )
         
         # Validate and preprocess
@@ -417,16 +400,14 @@ class TrainingConfig:
     data_path: str = "oracle_data.pt"
     embed_dim: int = 512
     max_group_size: int = 7
-    rotation_coupling_threshold: int = 3
-    extra_group: Optional[List[Tuple[str, str]]] = None   # None → defaults
-    extra_global: Optional[List[str]] = None               # None → defaults
     use_urgency_flag: bool = True  # Append urgency flag as additional scalar
+    switcher_config_path: str = "robot_nav/models/MARL/switcher/switcher_config.yaml"
     
     # Model
     embed_hidden: int = 256
     scalar_hidden: int = 32
     fusion_hidden: int = 256
-    dropout: float = 0.1    
+    dropout: float = 0.1
     # Training
     epochs: int = 100
     batch_size: int = 32
@@ -493,16 +474,24 @@ class SwitcherTrainer:
     def _setup_data(self):
         """Setup datasets and dataloaders."""
         config = self.config
+
+        # Load scalar config from YAML
+        sw_cfg = load_switcher_config(config.switcher_config_path)
+        self._switcher_config = sw_cfg
+        print(f"Switcher config: {config.switcher_config_path}")
+        print(f"  base_scalars={sw_cfg.base_scalars}, "
+              f"extra_group={len(sw_cfg.extra_group)}, "
+              f"extra_global={len(sw_cfg.extra_global)}")
         
         # Load full dataset (embed_dim is inferred from data)
         full_dataset = SwitcherDataset(
             data_path=config.data_path,
             embed_dim=None,  # Infer from data
             max_group_size=config.max_group_size,
-            rotation_coupling_threshold=config.rotation_coupling_threshold,
-            extra_group=config.extra_group,
-            extra_global=config.extra_global,
+            extra_group=sw_cfg.extra_group,
+            extra_global=sw_cfg.extra_global,
             use_urgency_flag=config.use_urgency_flag,
+            base_scalars=sw_cfg.base_scalars,
         )
         
         # Split into train/val
@@ -685,6 +674,7 @@ class SwitcherTrainer:
             "scheduler_state_dict": self.scheduler.state_dict(),
             "best_val_acc": self.best_val_acc,
             "config": vars(self.config),
+            "switcher_config": self._switcher_config.to_dict(),
         }
         
         path = self.save_dir / f"{name}.pt"
@@ -792,10 +782,8 @@ def main():
         data_path=cfg["data_path"],
         embed_dim=cfg["embed_dim"],
         max_group_size=cfg["max_group_size"],
-        rotation_coupling_threshold=cfg["rotation_coupling_threshold"],
-        extra_group=cfg["extra_group"],
-        extra_global=cfg["extra_global"],
         use_urgency_flag=cfg["use_urgency_flag"],
+        switcher_config_path=cfg["switcher_config_path"],
         embed_hidden=cfg["embed_hidden"],
         scalar_hidden=cfg["scalar_hidden"],
         fusion_hidden=cfg["fusion_hidden"],

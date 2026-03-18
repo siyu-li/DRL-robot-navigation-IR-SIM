@@ -66,7 +66,7 @@ Create a technical architecture diagram for a research paper showing a multi-age
      * Scalar features (13-dim vector):
        - Base (5): size_feat, coupling_mode, A_in, A_out, A_obs
        - Extra group (5): mean_dist_goal, min_dist_goal, min_clearance, frac_reached, mean_heading_err
-       - Extra global (3): var_dist_goal_global, frac_reached_global, steps_elapsed_frac
+       - Extra global (3): var_dist_to_goal, frac_reached_global, steps_elapsed_frac
 
 2. **Two-Tower Fusion Network** (center):
    - **Tower 1 - Embedding Tower:**

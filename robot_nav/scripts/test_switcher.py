@@ -38,20 +38,15 @@ from robot_nav.models.MARL.switcher.supervised import (
 )
 from robot_nav.models.MARL.switcher.rl import (
     RLFeatureBuilder,
-    GROUP_SCALAR_DIM,
-    STATE_SCALAR_DIM,
     SwitcherActorCritic,
 )
+from robot_nav.models.MARL.switcher.embedding_utils import extract_embeddings
+from robot_nav.models.MARL.switcher.config_loader import load_switcher_config
 from robot_nav.models.MARL.groups.group_generator import (
     generate_all_groups,
     filter_groups_by_size,
 )
 from robot_nav.models.MARL.groups.action_coupling import actions_for_group
-from robot_nav.models.MARL.groups.mixing_network import MixingNetwork
-from robot_nav.models.MARL.groups.learned_action_coupling import (
-    compute_mixed_actions,
-    get_embeddings_from_frozen_actor,
-)
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 # Suppress IRSim warnings - irsim uses loguru, not standard logging
 from loguru import logger
@@ -112,8 +107,8 @@ CONFIG = {
     "include_size_1": False,         # Include individual robots
     "include_size_2": True,         # Include pairs
     "include_size_3": True,         # Include triplets
-    "include_size_4": False,         # Include size-4 groups (rotation-coupled)
-    "include_size_7": False,         # Include size-7 groups (rotation-coupled)
+    "include_size_4": False,         # Include size-4 groups
+    "include_size_7": False,         # Include size-7 groups
 
     # Policy configuration
     "num_robots": 14,
@@ -125,38 +120,10 @@ CONFIG = {
     "v_max": 0.5,
     "pooling": "mean",
 
-    # Action coupling mode:
-    #   "mean"    — hand-designed mean coupling (original action_coupling.py)
-    #   "learned" — learned softmax mixing weights via MixingNetwork
-    "action_coupling_mode": "learned",
-
-    # MixingNetwork checkpoint (only used when action_coupling_mode="learned")
-    "mixing_net_checkpoint": "robot_nav/models/MARL/groups/checkpoint/group_mixing_14robots/mixing_net_update1800.pth",
-    # Whether to scale mixing logits by √|G| (should match training setting)
-    "mixing_net_scale_by_sqrt": False,
-
     # Switcher feature configuration (must match training)
-    # GroupFeatureBuilder config
-    #   Features 1-5 are always on (size_feat, coupling_mode, A_in, A_out, A_obs).
-    #   extra_group: list of (extra_key, aggregation) for per-group scalars
-    #                aggregated over group members. Set to [] to disable.
-    #   extra_global: list of extra_key names for global scalars (same for
-    #                 every group). Set to [] to disable.
-    #   scalar_dim = 5 + len(extra_group) + len(extra_global) + 1 (urgency_flag)
+    # Loads scalar config from YAML
+    "switcher_config_path": "robot_nav/models/MARL/switcher/switcher_config.yaml",
     "max_group_size": 7,
-    "rotation_coupling_threshold": 3,
-    "extra_group": [
-        ("dist_to_goal", "mean"),   # mean_dist_goal_g
-        ("dist_to_goal", "min"),    # min_dist_goal_g
-        ("clearance",    "min"),    # min_clearance_g
-        ("reached",      "mean"),   # frac_reached_g
-        ("heading_error","mean"),   # mean_heading_err_g
-    ],
-    "extra_global": [
-        "var_dist_goal_global",     # distance variance (sync signal)
-        "frac_reached_global",      # global completion fraction
-        "steps_elapsed_frac",       # time pressure
-    ],
     
     # Urgency tracking (for stuck robot detection)
     "use_urgency_flag": False,       # Enable urgency flag as additional scalar feature
@@ -212,8 +179,8 @@ def generate_candidate_groups(
         include_size_1: Include singletons (individual robots).
         include_size_2: Include pairs.
         include_size_3: Include triplets.
-        include_size_4: Include size-4 groups (rotation-coupled).
-        include_size_7: Include size-7 groups (rotation-coupled).
+        include_size_4: Include size-4 groups.
+        include_size_7: Include size-7 groups.
 
     Returns:
         List of robot index groups filtered by the requested sizes.
@@ -602,34 +569,10 @@ class SwitcherGroupSelector:
         robot_obs: np.ndarray,
         obstacle_obs: np.ndarray,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get robot embeddings and attention weights from the policy."""
-        robot_tensor = torch.tensor(robot_obs, dtype=torch.float32, device=self.device)
-        obstacle_tensor = torch.tensor(obstacle_obs, dtype=torch.float32, device=self.device)
-
-        if robot_tensor.dim() == 2:
-            robot_tensor = robot_tensor.unsqueeze(0)
-            obstacle_tensor = obstacle_tensor.unsqueeze(0)
-
-        with torch.no_grad():
-            (
-                H,
-                hard_logits_rr, hard_logits_ro,
-                dist_rr, dist_ro,
-                mean_entropy,
-                hard_weights_rr,
-                hard_weights_ro,
-                combined_weights,
-            ) = self.policy.actor.attention(robot_tensor, obstacle_tensor)
-
-        batch_size = robot_tensor.shape[0]
-        n_robots = robot_tensor.shape[1]
-        embed_dim = H.shape[-1]
-
-        h = H.view(batch_size, n_robots, embed_dim).squeeze(0)
-        attn_rr = hard_weights_rr.squeeze(0)
-        attn_ro = hard_weights_ro.squeeze(0)
-
-        return h, attn_rr, attn_ro
+        """Get pre-decoder robot embeddings and attention weights from the policy."""
+        return extract_embeddings(
+            self.policy.actor.attention, robot_obs, obstacle_obs, self.device,
+        )
 
     def get_extra_features(
         self,
@@ -653,7 +596,7 @@ class SwitcherGroupSelector:
         - urgency: Whether each robot is stuck (0 or 1)
         
         Global features:
-        - var_dist_goal_global: Variance of distances to goals
+        - var_dist_to_goal: Variance of distances to goals
         - frac_reached_global: Fraction of robots that reached goals
         - steps_elapsed_frac: Fraction of max steps elapsed
         """
@@ -697,7 +640,7 @@ class SwitcherGroupSelector:
         )
         
         # Global features (must be tensors, not scalars)
-        var_dist_goal_global = torch.var(dist_to_goal)
+        var_dist_to_goal = torch.var(dist_to_goal)
         frac_reached_global = torch.tensor(
             sum(reached_goal) / max(num_robots, 1),
             dtype=torch.float32,
@@ -717,7 +660,7 @@ class SwitcherGroupSelector:
             "heading_error": heading_error,
             "urgency": urgency,
             # Global features
-            "var_dist_goal_global": var_dist_goal_global,
+            "var_dist_to_goal": var_dist_to_goal,
             "frac_reached_global": frac_reached_global,
             "steps_elapsed_frac": steps_elapsed_frac,
         }
@@ -842,11 +785,10 @@ class RLSwitcherGroupSelector:
     using the trained actor (``_actor_logits``).
 
     Key differences from supervised SwitcherGroupSelector:
-    - Uses ``RLFeatureBuilder`` (fixed 13-dim group scalars, separate state features)
-      instead of ``GroupFeatureBuilder`` (configurable extra_group/extra_global).
+    - Uses ``RLFeatureBuilder`` (configurable group scalars, separate state features)
+      instead of ``GroupFeatureBuilder``.
     - Uses ``SwitcherActorCritic._actor_logits(X)`` instead of ``GroupSwitcher(X)``.
-    - Extra dict uses ``"var_dist_to_goal"`` key (broadcast N-dim tensor)
-      instead of ``"var_dist_goal_global"`` (scalar).
+    - Extra dict uses ``"var_dist_to_goal"`` key (broadcast N-dim tensor).
     - No urgency flag (RL feature builder doesn't include it).
     """
 
@@ -880,34 +822,10 @@ class RLSwitcherGroupSelector:
         robot_obs: np.ndarray,
         obstacle_obs: np.ndarray,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get robot embeddings and attention weights from the frozen policy."""
-        robot_tensor = torch.tensor(robot_obs, dtype=torch.float32, device=self.device)
-        obstacle_tensor = torch.tensor(obstacle_obs, dtype=torch.float32, device=self.device)
-
-        if robot_tensor.dim() == 2:
-            robot_tensor = robot_tensor.unsqueeze(0)
-            obstacle_tensor = obstacle_tensor.unsqueeze(0)
-
-        with torch.no_grad():
-            (
-                H,
-                hard_logits_rr, hard_logits_ro,
-                dist_rr, dist_ro,
-                mean_entropy,
-                hard_weights_rr,
-                hard_weights_ro,
-                combined_weights,
-            ) = self.policy.actor.attention(robot_tensor, obstacle_tensor)
-
-        batch_size = robot_tensor.shape[0]
-        n_robots = robot_tensor.shape[1]
-        embed_dim = H.shape[-1]
-
-        h = H.view(batch_size, n_robots, embed_dim).squeeze(0)
-        attn_rr = hard_weights_rr.squeeze(0)
-        attn_ro = hard_weights_ro.squeeze(0)
-
-        return h, attn_rr, attn_ro
+        """Get pre-decoder robot embeddings and attention weights from the frozen policy."""
+        return extract_embeddings(
+            self.policy.actor.attention, robot_obs, obstacle_obs, self.device,
+        )
 
     def _build_extra(
         self,
@@ -922,8 +840,7 @@ class RLSwitcherGroupSelector:
         """
         Build extra features dict matching RLFeatureBuilder's expected keys.
 
-        RLFeatureBuilder expects broadcast tensors (shape (N,)) for global scalars,
-        and uses key ``"var_dist_to_goal"`` (not ``"var_dist_goal_global"``).
+        Both supervised and RL feature builders use the same ``"var_dist_to_goal"`` key.
         """
         num_robots = sim.num_robots
 
@@ -1099,20 +1016,9 @@ def get_action_for_group(
     obstacle_obs: np.ndarray,
     group: List[int],
     num_robots: int,
-    rotation_coupling_threshold: int = 3,
-    coupling_mode: str = "mean",
-    mixing_net: Optional[MixingNetwork] = None,
-    device: Optional[torch.device] = None,
-    scale_by_sqrt: bool = True,
-    arrived_mask: Optional[List[bool]] = None,
 ) -> List[List[float]]:
     """
-    Get action for a specific group using the decentralized policy.
-
-    Two coupling modes:
-      - ``"mean"``   : hand-designed mean coupling (``action_coupling.py``).
-      - ``"learned"`` : learned softmax mixing via ``MixingNetwork``
-                        (``learned_action_coupling.py``).
+    Get action for a specific group using mean action coupling.
 
     Args:
         policy: Frozen TD3Obstacle policy.
@@ -1120,45 +1026,14 @@ def get_action_for_group(
         obstacle_obs: Obstacle observations ``(N_obs, obs_dim)``.
         group: Robot indices in the active group.
         num_robots: Total robots.
-        rotation_coupling_threshold: Groups > threshold also couple ω.
-        coupling_mode: ``"mean"`` or ``"learned"``.
-        mixing_net: Trained ``MixingNetwork`` (required if ``"learned"``).
-        device: Torch device (required if ``"learned"``).
-        scale_by_sqrt: Scale logits by √|G| (only for ``"learned"``).
-        arrived_mask: Boolean list marking arrived robots (only for ``"learned"``).
     """
-    if coupling_mode == "learned":
-        if mixing_net is None or device is None:
-            raise ValueError(
-                "coupling_mode='learned' requires mixing_net and device"
-            )
-        # 1. Get raw actions from frozen actor
-        raw_action, _ = policy.get_action(robot_obs, obstacle_obs, add_noise=False)
-        # 2. Get embeddings from frozen actor's attention
-        embeddings = get_embeddings_from_frozen_actor(
-            policy.actor, robot_obs, obstacle_obs, device
-        )
-        # 3. Learned softmax mixing
-        return compute_mixed_actions(
-            mixing_net=mixing_net,
-            embeddings=embeddings,
-            raw_actions=raw_action,
-            group=group,
-            num_robots=num_robots,
-            arrived_mask=arrived_mask,
-            rotation_coupling_threshold=rotation_coupling_threshold,
-            scale_by_sqrt=scale_by_sqrt,
-        )
-    else:
-        # Default: hand-designed mean coupling
-        return actions_for_group(
-            policy=policy,
-            robot_obs=robot_obs,
-            obstacle_obs=obstacle_obs,
-            group=group,
-            num_robots=num_robots,
-            rotation_coupling_threshold=rotation_coupling_threshold,
-        )
+    return actions_for_group(
+        policy=policy,
+        robot_obs=robot_obs,
+        obstacle_obs=obstacle_obs,
+        group=group,
+        num_robots=num_robots,
+    )
 
 
 # =============================================================================
@@ -1173,15 +1048,10 @@ def run_test_evaluation(
     num_episodes: int = 100,
     max_steps: int = 500,
     selection_interval: int = 10,
-    rotation_coupling_threshold: int = 3,
     trials_per_episode: int = 1,
     seed: int = 42,
     verbose: bool = True,
     rl_switcher_selector: Optional[RLSwitcherGroupSelector] = None,
-    coupling_mode: str = "mean",
-    mixing_net: Optional[MixingNetwork] = None,
-    device: Optional[torch.device] = None,
-    scale_by_sqrt: bool = True,
 ) -> TestStatistics:
     """
     Run test evaluation with either switcher or random group selection.
@@ -1335,12 +1205,6 @@ def run_test_evaluation(
                 action_out = get_action_for_group(
                     policy, robot_obs, obstacle_states,
                     current_group, num_robots,
-                    rotation_coupling_threshold=rotation_coupling_threshold,
-                    coupling_mode=coupling_mode,
-                    mixing_net=mixing_net,
-                    device=device,
-                    scale_by_sqrt=scale_by_sqrt,
-                    arrived_mask=[rg for rg in reached_goal],
                 )
 
                 # ----------------------------------------------------------
@@ -1482,27 +1346,6 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # Load mixing network (if using learned action coupling)
-    # ------------------------------------------------------------------
-    coupling_mode = config.get("action_coupling_mode", "mean")
-    mixing_net = None
-    if coupling_mode == "learned":
-        mixing_ckpt_path = Path(config["mixing_net_checkpoint"])
-        if not mixing_ckpt_path.exists():
-            logger.error(f"MixingNetwork checkpoint not found: {mixing_ckpt_path}")
-            logger.info("Please train the mixing network first or set action_coupling_mode='mean'.")
-            return
-        embedding_dim = config["embedding_dim"] * 2  # actor attention output is embed_dim*2
-        mixing_net = MixingNetwork(embedding_dim=embedding_dim, hidden_dim=128).to(device)
-        mixing_net.load_state_dict(torch.load(mixing_ckpt_path, map_location=device))
-        mixing_net.eval()
-        logger.info(f"Loaded MixingNetwork from {mixing_ckpt_path}")
-        logger.info(f"  Parameters: {sum(p.numel() for p in mixing_net.parameters()):,}")
-        logger.info(f"  scale_by_sqrt: {config.get('mixing_net_scale_by_sqrt', True)}")
-    else:
-        logger.info("Using hand-designed mean action coupling")
-
-    # ------------------------------------------------------------------
     # Generate candidate groups
     # ------------------------------------------------------------------
     groups = generate_candidate_groups(
@@ -1539,13 +1382,12 @@ def main():
         model_config = checkpoint.get("config", {})
         embed_dim = model_config.get("embed_dim", config["embedding_dim"] * 2)
 
-        # Build feature_builder with same config as training
-        feature_builder = GroupFeatureBuilder(
+        # Build feature_builder from YAML config (same as training)
+        sw_cfg = load_switcher_config(config["switcher_config_path"])
+        feature_builder = GroupFeatureBuilder.from_config(
+            sw_cfg,
             embed_dim=embed_dim,
             max_group_size=config.get("max_group_size", 7),
-            rotation_coupling_threshold=config.get("rotation_coupling_threshold", 3),
-            extra_group=config.get("extra_group", None),
-            extra_global=config.get("extra_global", None),
         )
         
         # scalar_dim is computed by GroupFeatureBuilder
@@ -1620,12 +1462,13 @@ def main():
         embed_tower_weight = rl_checkpoint["policy_state_dict"]["actor_embed_tower.0.weight"]
         embed_dim = embed_tower_weight.shape[1] // 2  # 2*embed_dim → embed_dim
 
-        # Build RLFeatureBuilder
-        rl_feature_builder = RLFeatureBuilder(
+        # Build RLFeatureBuilder from YAML config
+        sw_cfg = load_switcher_config(config["switcher_config_path"])
+        rl_feature_builder = RLFeatureBuilder.from_config(
+            sw_cfg,
             embed_dim=embed_dim,
             pooling="mean",
             max_group_size=config.get("max_group_size", 7),
-            rotation_coupling_threshold=config.get("rotation_coupling_threshold", 3),
         )
 
         # Build SwitcherActorCritic with matching architecture
@@ -1653,8 +1496,8 @@ def main():
         actor_critic.load_state_dict(rl_checkpoint["policy_state_dict"])
         logger.info(f"Loaded RL switcher from {rl_checkpoint_path}")
         logger.info(f"  Embed dim: {embed_dim}")
-        logger.info(f"  Group scalar dim: {group_scalar_dim} (expected {GROUP_SCALAR_DIM})")
-        logger.info(f"  State scalar dim: {state_scalar_dim} (expected {STATE_SCALAR_DIM})")
+        logger.info(f"  Group scalar dim: {group_scalar_dim}")
+        logger.info(f"  State scalar dim: {state_scalar_dim}")
         logger.info(f"  Architecture: embed_hidden={embed_hidden}, "
                      f"group_scalar_hidden={group_scalar_hidden}, "
                      f"fusion_hidden={fusion_hidden}")
@@ -1696,15 +1539,10 @@ def main():
         num_episodes=config["test_episodes"],
         max_steps=config["max_steps_per_episode"],
         selection_interval=config["selection_interval"],
-        rotation_coupling_threshold=config.get("rotation_coupling_threshold", 3),
         trials_per_episode=config.get("trials_per_episode", 1),
         seed=config["seed"],
         verbose=True,
         rl_switcher_selector=rl_switcher_selector,
-        coupling_mode=coupling_mode,
-        mixing_net=mixing_net,
-        device=device,
-        scale_by_sqrt=config.get("mixing_net_scale_by_sqrt", True),
     )
 
     # ------------------------------------------------------------------
@@ -1853,7 +1691,7 @@ def main():
                 )
 
     if size_4_groups:
-        logger.info("\n--- Detailed Collision Breakdown for Size-4 Groups (Rotation-Coupled) ---")
+        logger.info("\n--- Detailed Collision Breakdown for Size-4 Groups ---")
         sorted_size_4 = sorted(
             size_4_groups.items(), key=lambda x: x[1]["total_collisions"], reverse=True
         )
@@ -1865,7 +1703,7 @@ def main():
                 )
 
     if size_7_groups:
-        logger.info("\n--- Detailed Collision Breakdown for Size-7 Groups (Rotation-Coupled) ---")
+        logger.info("\n--- Detailed Collision Breakdown for Size-7 Groups ---")
         sorted_size_7 = sorted(
             size_7_groups.items(), key=lambda x: x[1]["total_collisions"], reverse=True
         )

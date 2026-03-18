@@ -33,9 +33,6 @@ import torch
 from sklearn.manifold import TSNE
 
 from robot_nav.models.MARL.marlTD3.marlTD3_obstacle import TD3Obstacle
-from robot_nav.models.MARL.groups.learned_action_coupling import (
-    get_embeddings_from_frozen_actor,
-)
 from robot_nav.models.MARL.groups.group_generator import (
     generate_all_groups,
 )
@@ -143,10 +140,15 @@ def collect_embedding_data(
         )
         robot_obs = np.array(robot_state)
 
-        # Extract frozen embeddings — (N, 512)
-        embeddings = get_embeddings_from_frozen_actor(
-            policy.actor, robot_obs, obstacle_states, device
-        ).cpu().numpy()
+        # Extract frozen embeddings — (N, 2*embed_dim)
+        robot_tensor = torch.tensor(robot_obs, dtype=torch.float32, device=device)
+        obstacle_tensor = torch.tensor(obstacle_states, dtype=torch.float32, device=device)
+        if robot_tensor.dim() == 2:
+            robot_tensor = robot_tensor.unsqueeze(0)
+            obstacle_tensor = obstacle_tensor.unsqueeze(0)
+        with torch.no_grad():
+            policy.actor.attention(robot_tensor, obstacle_tensor)
+        embeddings = policy.actor.attention._pre_decoder_embedding.cpu().numpy()
 
         # Get raw actions (for stepping the env)
         raw_action, combined_weights = policy.get_action(

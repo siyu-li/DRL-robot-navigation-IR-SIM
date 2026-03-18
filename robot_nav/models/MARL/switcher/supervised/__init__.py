@@ -8,8 +8,6 @@ Supervised (oracle-based) group switcher components.
 
 from robot_nav.models.MARL.switcher.supervised.feature_builder import (
     GroupFeatureBuilder,
-    DEFAULT_EXTRA_GROUP,
-    DEFAULT_EXTRA_GLOBAL,
     _BASE_SCALAR_DIM,
 )
 from robot_nav.models.MARL.switcher.supervised.switcher_net import (
@@ -28,8 +26,6 @@ from robot_nav.models.MARL.switcher.supervised.rank_losses import (
 
 __all__ = [
     "GroupFeatureBuilder",
-    "DEFAULT_EXTRA_GROUP",
-    "DEFAULT_EXTRA_GLOBAL",
     "_BASE_SCALAR_DIM",
     "GroupSwitcher",
     "pairwise_logistic_ranking_loss",

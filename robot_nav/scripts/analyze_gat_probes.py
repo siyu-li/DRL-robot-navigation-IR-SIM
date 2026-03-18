@@ -32,9 +32,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 
 from robot_nav.models.MARL.marlTD3.marlTD3_obstacle import TD3Obstacle
-from robot_nav.models.MARL.groups.learned_action_coupling import (
-    get_embeddings_from_frozen_actor,
-)
 from robot_nav.models.MARL.groups.group_generator import generate_all_groups
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 

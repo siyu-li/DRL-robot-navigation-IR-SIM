@@ -5,12 +5,11 @@ Constructs a configurable scalar feature vector for each candidate group.
 Features 1–5 are always included; features 6–13 are optional and controlled
 by two config lists:
 
-  **Always-on scalars** (features 1–5, per-group):
+  **Always-on scalars** (features 1–4, per-group):
     1. size_feat          — group_size / max_group_size
-    2. coupling_mode      — 1.0 if rotation-coupled, else 0.0
-    3. A_in               — intra-group attention
-    4. A_out              — group-to-outside attention
-    5. A_obs              — group-to-obstacle attention
+    2. A_in               — intra-group attention
+    3. A_out              — group-to-outside attention
+    4. A_obs              — group-to-obstacle attention
 
   **extra_group** — per-group extras (aggregated over group members):
     Each entry is ``(key, agg)`` where *key* is a per-robot ``extra`` tensor
@@ -24,11 +23,11 @@ by two config lists:
   **extra_global** — global context (same value for every group):
     Each entry is a key name whose ``extra`` tensor has shape ``(1,)``.
     Defaults to:
-      "var_dist_goal_global"     → distance variance across all robots
+      "var_dist_to_goal"          → distance variance across all robots
       "frac_reached_global"      → global completion fraction
       "steps_elapsed_frac"       → time pressure signal
 
-  scalar_dim = 5 + len(extra_group) + len(extra_global)
+  scalar_dim = 4 + len(extra_group) + len(extra_global)
 
 The ``extra`` dict passed to ``forward()`` must contain the per-robot
 ``(N,)`` tensors and global ``(1,)`` scalars referenced by
@@ -41,23 +40,7 @@ import torch
 import torch.nn as nn
 
 # ── Constants ──
-_BASE_SCALAR_DIM = 5  # size_feat, coupling_mode, A_in, A_out, A_obs
-
-# Default extra_group: list of (extra_key, aggregation)
-DEFAULT_EXTRA_GROUP: List[Tuple[str, str]] = [
-    ("dist_to_goal", "mean"),   # mean_dist_goal_g
-    ("dist_to_goal", "min"),    # min_dist_goal_g
-    ("clearance",    "min"),    # min_clearance_g
-    ("reached",      "mean"),   # frac_reached_g
-    ("heading_error","mean"),   # mean_heading_err_g
-]
-
-# Default extra_global: list of extra keys (each stored as shape (1,))
-DEFAULT_EXTRA_GLOBAL: List[str] = [
-    "var_dist_goal_global",     # distance variance (sync signal)
-    "frac_reached_global",      # global completion fraction
-    "steps_elapsed_frac",       # time pressure
-]
+_BASE_SCALAR_DIM = 4  # size_feat, A_in, A_out, A_obs
 
 _VALID_AGGS = {"mean", "min", "max", "sum"}
 
@@ -80,15 +63,12 @@ class GroupFeatureBuilder(nn.Module):
         global_embed_dim: Dimension of global embedding. If None, uses embed_dim.
         pooling: Pooling method for group embedding ("mean" or "max").
         max_group_size: Normalisation constant for size_feat. Default 7.
-        rotation_coupling_threshold: Group sizes strictly above this get
-            coupling_mode = 1.0. Default 3 (sizes 4, 7 get coupling_mode=1).
         extra_group: Per-group extra features, each ``(key, agg)``.
             ``key`` references a per-robot tensor ``(N,)`` in ``extra``; ``agg``
             is one of ``"mean", "min", "max", "sum"``.
-            Pass ``[]`` to disable.  ``None`` → DEFAULT_EXTRA_GROUP.
         extra_global: Global extra features, each a key referencing a ``(1,)``
             tensor in ``extra``.
-            Pass ``[]`` to disable.  ``None`` → DEFAULT_EXTRA_GLOBAL.
+        base_scalars: Include size_feat + 3 attention scalars (4 dims).
     """
 
     def __init__(
@@ -97,24 +77,20 @@ class GroupFeatureBuilder(nn.Module):
         global_embed_dim: Optional[int] = None,
         pooling: Literal["mean", "max"] = "mean",
         max_group_size: int = 7,
-        rotation_coupling_threshold: int = 3,
-        extra_group: Optional[List[Tuple[str, str]]] = None,
-        extra_global: Optional[List[str]] = None,
+        extra_group: List[Tuple[str, str]] = (),
+        extra_global: List[str] = (),
+        base_scalars: bool = True,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.global_embed_dim = global_embed_dim if global_embed_dim is not None else embed_dim
         self.pooling = pooling
         self.max_group_size = max_group_size
-        self.rotation_coupling_threshold = rotation_coupling_threshold
+        self.base_scalars = base_scalars
 
-        # Store configurable feature lists (use defaults when None)
-        self.extra_group: List[Tuple[str, str]] = (
-            list(extra_group) if extra_group is not None else list(DEFAULT_EXTRA_GROUP)
-        )
-        self.extra_global: List[str] = (
-            list(extra_global) if extra_global is not None else list(DEFAULT_EXTRA_GLOBAL)
-        )
+        # Store configurable feature lists
+        self.extra_group: List[Tuple[str, str]] = list(extra_group)
+        self.extra_global: List[str] = list(extra_global)
 
         # Validate aggregations
         for key, agg in self.extra_group:
@@ -125,7 +101,8 @@ class GroupFeatureBuilder(nn.Module):
                 )
 
         # Dynamic scalar dimension
-        self._scalar_dim = _BASE_SCALAR_DIM + len(self.extra_group) + len(self.extra_global)
+        base_dim = _BASE_SCALAR_DIM if self.base_scalars else 0
+        self._scalar_dim = base_dim + len(self.extra_group) + len(self.extra_global)
 
         # Output dimension: h_g + h_glob + scalar_dim
         self._output_dim = self.embed_dim + self.global_embed_dim + self._scalar_dim
@@ -137,8 +114,34 @@ class GroupFeatureBuilder(nn.Module):
 
     @property
     def scalar_dim(self) -> int:
-        """Number of scalar features per group (5 + extra_group + extra_global)."""
+        """Number of scalar features per group (base + extra_group + extra_global)."""
         return self._scalar_dim
+
+    @classmethod
+    def from_config(
+        cls,
+        cfg,
+        embed_dim: int = 512,
+        global_embed_dim: Optional[int] = None,
+        pooling: Literal["mean", "max"] = "mean",
+        max_group_size: int = 7,
+    ) -> "GroupFeatureBuilder":
+        """Create a ``GroupFeatureBuilder`` from a ``SwitcherScalarConfig``.
+
+        Args:
+            cfg: ``SwitcherScalarConfig`` instance.
+            embed_dim, global_embed_dim, pooling, max_group_size: Architecture
+                hyper-parameters (not stored in the YAML).
+        """
+        return cls(
+            embed_dim=embed_dim,
+            global_embed_dim=global_embed_dim,
+            pooling=pooling,
+            max_group_size=max_group_size,
+            extra_group=cfg.extra_group,
+            extra_global=cfg.extra_global,
+            base_scalars=cfg.base_scalars,
+        )
 
     def forward(
         self,
@@ -232,21 +235,19 @@ class GroupFeatureBuilder(nn.Module):
         else:
             raise ValueError(f"Unknown pooling: {self.pooling}")
 
-        # ── Base scalars (always-on, features 1–5) ──
+        # ── Base scalars (features 1–4, optional) ──
         scalars: List[float] = []
 
-        # 1. size_feat
-        scalars.append(group_size / self.max_group_size)
+        if self.base_scalars:
+            # 1. size_feat
+            scalars.append(group_size / self.max_group_size)
 
-        # 2. coupling_mode
-        scalars.append(1.0 if group_size > self.rotation_coupling_threshold else 0.0)
-
-        # 3-5. attention stats [A_in, A_out, A_obs]
-        a_in, a_out, a_obs = self._compute_attention_stats(
-            group=group, n_robots=n_robots,
-            attn_rr=attn_rr, attn_ro=attn_ro,
-        )
-        scalars.extend([a_in, a_out, a_obs])
+            # 2-4. attention stats [A_in, A_out, A_obs]
+            a_in, a_out, a_obs = self._compute_attention_stats(
+                group=group, n_robots=n_robots,
+                attn_rr=attn_rr, attn_ro=attn_ro,
+            )
+            scalars.extend([a_in, a_out, a_obs])
 
         # ── extra_group scalars (aggregated over group members) ──
         group_extras = self._compute_group_extras(extra, group_indices)

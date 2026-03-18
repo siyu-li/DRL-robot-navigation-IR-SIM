@@ -40,6 +40,10 @@ from robot_nav.models.MARL.groups.group_generator import (
     filter_groups_by_size,
 )
 from robot_nav.models.MARL.groups.action_coupling import actions_for_group_from_raw
+from robot_nav.models.MARL.switcher.embedding_utils import (
+    extract_embeddings,
+    extract_embeddings_and_actions,
+)
 from robot_nav.models.MARL.switcher.rl.rl_feature_builder import RLFeatureBuilder
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 
@@ -56,15 +60,15 @@ def _outside_of_bounds(poses, sim) -> bool:
     return False
 
 
-def _generate_groups(
-    num_robots: int,
-    include_sizes: Tuple[int, ...] = (1, 2, 3, 4, 7),
-) -> List[List[int]]:
-    """Generate candidate groups via binary allocation."""
-    m = 3 if num_robots <= 6 else 4
-    all_groups = generate_all_groups(m=m, n=num_robots, use_complement=True)
-    allowed = set(include_sizes)
-    return [g for g in all_groups if len(g) in allowed]
+# def _generate_groups(
+#     num_robots: int,
+#     include_sizes: Tuple[int, ...] = (1, 2, 3, 4, 7),
+# ) -> List[List[int]]:
+#     """Generate candidate groups via binary allocation."""
+#     m = 3 if num_robots <= 6 else 4
+#     all_groups = generate_all_groups(m=m, n=num_robots, use_complement=True)
+#     allowed = set(include_sizes)
+#     return [g for g in all_groups if len(g) in allowed]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -88,10 +92,6 @@ class SwitcherEnv:
         selection_interval: Number of low-level sim steps per switcher decision.
         max_episode_steps: Episode horizon in *sim* steps (not decisions).
         goal_threshold: Distance to consider a robot "reached".
-        use_rotation_coupling: If True, groups of size > 3 get coupled
-            angular velocity (average) in addition to coupled linear.
-        rotation_coupling_threshold: Group sizes strictly above this get
-            rotation coupling. Default 3.
         device: Torch device for feature computation.
 
     Reward coefficients (class attributes — override per-instance if needed):
@@ -131,9 +131,8 @@ class SwitcherEnv:
         selection_interval: int = 10,
         max_episode_steps: int = 1000,
         goal_threshold: float = 0.3,
-        use_rotation_coupling: bool = True,
-        rotation_coupling_threshold: int = 3,
         device: str = "cpu",
+        coupling_mode: str = "min",
     ):
         self.sim = sim
         self.policy = policy
@@ -142,9 +141,8 @@ class SwitcherEnv:
         self.selection_interval = selection_interval
         self.max_episode_steps = max_episode_steps
         self.goal_threshold = goal_threshold
-        self.use_rotation_coupling = use_rotation_coupling
-        self.rotation_coupling_threshold = rotation_coupling_threshold
         self.device = torch.device(device)
+        self.coupling_mode = coupling_mode
 
         self.num_robots: int = sim.num_robots
         self.num_groups: int = len(groups)
@@ -260,8 +258,7 @@ class SwitcherEnv:
 
                 action_out = actions_for_group_from_raw(
                     raw_actions, group, self.num_robots,
-                    use_rotation_coupling=self.use_rotation_coupling,
-                    rotation_coupling_threshold=self.rotation_coupling_threshold,
+                    coupling_mode=self.coupling_mode,
                 )
 
                 # Low-level sim step
@@ -619,68 +616,19 @@ class SwitcherEnv:
     def _get_actions_and_embeddings(
         self, robot_obs: np.ndarray, obstacle_obs: np.ndarray,
     ) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Single forward pass → actions AND attention embeddings.
-
-        Avoids running the attention module twice (once for actions in
-        the inner loop, once for observation building in ``_build_obs``).
-
-        Returns:
-            raw_actions: ``(N, 2)`` numpy array on CPU.
-            h: ``(N, embed_dim)`` tensor on device (detached).
-            attn_rr: ``(N, N)`` tensor on device (detached).
-            attn_ro: ``(N, N_obs)`` tensor on device (detached).
-        """
-        robot_t = torch.as_tensor(
-            robot_obs, dtype=torch.float32, device=self.device,
-        ).unsqueeze(0)
-        # Reuse cached obstacle tensor (static within episode)
-        obstacle_t = self._obstacle_t
-
-        with torch.no_grad():
-            (
-                H, _, _, _, _, _,
-                hard_weights_rr, hard_weights_ro, _,
-            ) = self.policy.actor.attention(robot_t, obstacle_t)
-
-            # Run policy head on the attention output to get actions
-            action = self.policy.actor.policy_head(H)
-
-        N = robot_t.shape[1]
-        embed_dim = H.shape[-1]
-        h = H.view(1, N, embed_dim).squeeze(0)             # (N, embed_dim)
-        attn_rr = hard_weights_rr.squeeze(0)               # (N, N)
-        attn_ro = hard_weights_ro.squeeze(0)                # (N, N_obs)
-
-        raw_actions = action.cpu().data.numpy().reshape(-1, 2)
-        return raw_actions, h, attn_rr, attn_ro
+        """Single forward pass → actions AND pre-decoder embeddings."""
+        # Pass cached obstacle tensor when available (avoids redundant CPU→GPU copy)
+        obs = self._obstacle_t if self._obstacle_t is not None else obstacle_obs
+        return extract_embeddings_and_actions(
+            self.policy.actor, robot_obs, obs, self.device,
+        )
 
     def _get_embeddings(
         self, robot_obs: np.ndarray, obstacle_obs: np.ndarray,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get h, attn_rr, attn_ro from the frozen policy's attention module."""
-        robot_t = torch.as_tensor(
-            robot_obs, dtype=torch.float32, device=self.device,
-        ).unsqueeze(0)
-        # Reuse cached obstacle tensor when available (static within episode)
-        if self._obstacle_t is not None:
-            obstacle_t = self._obstacle_t
-        else:
-            obstacle_t = torch.as_tensor(
-                np.array(obstacle_obs), dtype=torch.float32, device=self.device,
-            ).unsqueeze(0)
+        """Get pre-decoder h, attn_rr, attn_ro from the frozen attention module."""
+        obs = self._obstacle_t if self._obstacle_t is not None else obstacle_obs
+        return extract_embeddings(
+            self.policy.actor.attention, robot_obs, obs, self.device,
+        )
 
-        with torch.no_grad():
-            (
-                H, _, _, _, _, _,
-                hard_weights_rr, hard_weights_ro, _,
-            ) = self.policy.actor.attention(robot_t, obstacle_t)
-
-        N = robot_t.shape[1]
-        embed_dim = H.shape[-1]
-        h = H.view(1, N, embed_dim).squeeze(0)             # (N, embed_dim)
-        attn_rr = hard_weights_rr.squeeze(0)               # (N, N)
-        attn_ro = hard_weights_ro.squeeze(0)                # (N, N_obs)
-        return h, attn_rr, attn_ro
-
-    # Action coupling is now handled by:
-    #   robot_nav.models.MARL.groups.action_coupling.actions_for_group_from_raw

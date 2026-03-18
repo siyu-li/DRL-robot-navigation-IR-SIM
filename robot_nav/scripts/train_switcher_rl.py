@@ -28,11 +28,10 @@ from robot_nav.models.MARL.groups.group_generator import (
 )
 from robot_nav.models.MARL.switcher.rl import (
     RLFeatureBuilder,
-    GROUP_SCALAR_DIM,
-    STATE_SCALAR_DIM,
     SwitcherEnv,
     SwitcherPPO,
 )
+from robot_nav.models.MARL.switcher.config_loader import load_switcher_config
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 # Suppress IRSim warnings - irsim uses loguru, not standard logging
 from loguru import logger
@@ -49,6 +48,10 @@ CONFIG = {
     "disable_plotting": True,
     "obstacle_proximity_threshold": 1.5,
     "goal_threshold": 0.3,
+
+    # ---- Switcher scalar config (YAML path) ----
+    "switcher_config_path": "robot_nav/models/MARL/switcher/switcher_config.yaml",
+
     "max_episode_steps": 1500,          # sim steps per episode
     "selection_interval": 10,           # sim steps per switcher decision
     "reward_phase": 5,                  # underlying sim reward phase (unused by switcher)
@@ -63,8 +66,6 @@ CONFIG = {
 
     # ---- Group generation ----
     "include_sizes": (2, 3),  # candidate group sizes
-    "use_rotation_coupling": True,
-    "rotation_coupling_threshold": 3,
 
     # ---- PPO hyperparameters ----
     "embed_dim": 512,                   # per-robot embedding dim (H from GAT)
@@ -199,12 +200,20 @@ def main():
     print(f"Candidate groups: {len(groups)}  "
           f"(sizes: {sorted(set(len(g) for g in groups))})")
 
-    # ---- 4. Feature builder ----
-    fb = RLFeatureBuilder(
+    # ---- 4. Feature builder (always from YAML config) ----
+    sw_cfg = load_switcher_config(cfg["switcher_config_path"])
+    coupling_mode = sw_cfg.coupling_mode
+    group_scalar_dim = sw_cfg.group_scalar_dim
+    state_scalar_dim = sw_cfg.state_scalar_dim
+    print(f"Switcher config: {cfg['switcher_config_path']}")
+    print(f"  coupling_mode={coupling_mode}, "
+          f"group_scalar_dim={group_scalar_dim}, state_scalar_dim={state_scalar_dim}")
+
+    fb = RLFeatureBuilder.from_config(
+        sw_cfg,
         embed_dim=cfg["embed_dim"],
         pooling="mean",
         max_group_size=max(len(g) for g in groups),
-        rotation_coupling_threshold=cfg["rotation_coupling_threshold"],
     )
 
     # ---- 5. Switcher environment ----
@@ -216,9 +225,8 @@ def main():
         selection_interval=cfg["selection_interval"],
         max_episode_steps=cfg["max_episode_steps"],
         goal_threshold=cfg["goal_threshold"],
-        use_rotation_coupling=cfg["use_rotation_coupling"],
-        rotation_coupling_threshold=cfg["rotation_coupling_threshold"],
         device=device_str,
+        coupling_mode=coupling_mode,
     )
     # Override reward coefficients
     env.k_progress = cfg["k_progress"]
@@ -237,8 +245,8 @@ def main():
     # ---- 6. PPO agent ----
     ppo = SwitcherPPO(
         embed_dim=cfg["embed_dim"],
-        group_scalar_dim=GROUP_SCALAR_DIM,
-        state_scalar_dim=STATE_SCALAR_DIM,
+        group_scalar_dim=group_scalar_dim,
+        state_scalar_dim=state_scalar_dim,
         lr_actor=cfg["lr_actor"],
         lr_critic=cfg["lr_critic"],
         gamma=cfg["gamma"],
@@ -260,6 +268,8 @@ def main():
         value_embed_hidden=cfg["value_embed_hidden"],
         value_scalar_hidden=cfg["value_scalar_hidden"],
     )
+    # Attach switcher config for checkpoint persistence
+    ppo.switcher_config_dict = sw_cfg.to_dict()
 
     # ---- Apply loading mode ----
     load_mode = cfg.get("load_mode", 0)

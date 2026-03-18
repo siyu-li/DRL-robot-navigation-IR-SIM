@@ -1,6 +1,4 @@
-"""
-Group utilities: group generation, action coupling, and learned mixing.
-"""
+"""Group utilities: group generation and action coupling."""
 
 from robot_nav.models.MARL.groups.group_generator import (
     generate_all_groups,
@@ -18,12 +16,6 @@ from robot_nav.models.MARL.groups.action_coupling import (
     actions_for_group,
     actions_for_group_from_raw,
 )
-from robot_nav.models.MARL.groups.mixing_network import MixingNetwork
-from robot_nav.models.MARL.groups.learned_action_coupling import (
-    compute_mixed_actions,
-    compute_mixed_actions_tensor,
-    get_embeddings_from_frozen_actor,
-)
 
 __all__ = [
     "generate_all_groups",
@@ -36,8 +28,4 @@ __all__ = [
     "print_combination_statistics",
     "actions_for_group",
     "actions_for_group_from_raw",
-    "MixingNetwork",
-    "compute_mixed_actions",
-    "compute_mixed_actions_tensor",
-    "get_embeddings_from_frozen_actor",
 ]
