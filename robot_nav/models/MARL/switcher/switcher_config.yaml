@@ -9,7 +9,7 @@
 # Action coupling mode for multi-robot groups (size >= 2).
 #   "min"  — conservative: coupled linear velocity = min of members' scaled vels.
 #   "mean" — cooperative:  coupled linear velocity = mean of members' scaled vels.
-coupling_mode: "min"
+coupling_mode: "mean"
 
 # Base scalars (always 4 when enabled): size_feat, A_in, A_out, A_obs.
 # Set false to exclude these from the scalar vector entirely.

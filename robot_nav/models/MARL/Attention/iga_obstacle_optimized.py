@@ -146,7 +146,7 @@ class AttentionObstacleOptimized(nn.Module):
         obstacle_node_dim (int): Input dimension for obstacle node features. Default 5.
     """
 
-    def __init__(self, embedding_dim, robot_node_dim=5):
+    def __init__(self, embedding_dim, robot_node_dim=5, obstacle_node_dim=5):
         super(AttentionObstacleOptimized, self).__init__()
         self.embedding_dim = embedding_dim
 
@@ -161,9 +161,13 @@ class AttentionObstacleOptimized(nn.Module):
         self.embedding2 = nn.Linear(128, embedding_dim)
         nn.init.kaiming_uniform_(self.embedding2.weight, nonlinearity="leaky_relu")
 
-        # Note: obstacle nodes carry no learnable features; their geometry is
-        # encoded entirely in robot-obstacle edge features. Obstacle node slots
-        # in the mega-graph are filled with zeros as placeholders.
+        # Obstacle node encoder (kept for checkpoint compatibility; geometry is
+        # encoded entirely in robot-obstacle edge features so obstacle node slots
+        # in the mega-graph are filled with zeros as placeholders at runtime).
+        self.obs_embedding1 = nn.Linear(obstacle_node_dim, 128)
+        nn.init.kaiming_uniform_(self.obs_embedding1.weight, nonlinearity="leaky_relu")
+        self.obs_embedding2 = nn.Linear(128, embedding_dim)
+        nn.init.kaiming_uniform_(self.obs_embedding2.weight, nonlinearity="leaky_relu")
 
         # Hard attention MLP for robot-robot edges
         self.hard_mlp = nn.Sequential(
