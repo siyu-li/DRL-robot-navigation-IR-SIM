@@ -85,7 +85,7 @@ CONFIG = {
     "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_100.pt",
 
     # RL switcher model configuration (PPO-trained)
-    "rl_switcher_checkpoint": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots/Mar.01/SwitcherPPO-14robots_update2000.pt",
+    "rl_switcher_checkpoint": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots/Mar.18/SwitcherPPO-14robots_update5000.pt",
 
     # Decentralized model configuration (used for all action generation)
     # Pretrained model paths (decentralized TD3Obstacle policy)
@@ -97,16 +97,16 @@ CONFIG = {
     # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.27_obstacle_14robot",
     # Test configuration
     "test_episodes": 50,
-    "max_steps_per_episode": 6000,
+    "max_steps_per_episode": 5000,
     "disable_plotting": False,
 
     # Group selection interval (re-select group every N steps)
     "selection_interval": 10,
     
     # Group generation settings (must match training data)
-    "include_size_1": False,         # Include individual robots
-    "include_size_2": True,         # Include pairs
-    "include_size_3": True,         # Include triplets
+    "include_size_1": True,         # Include individual robots
+    "include_size_2": False,         # Include pairs
+    "include_size_3": False,         # Include triplets
     "include_size_4": False,         # Include size-4 groups
     "include_size_7": False,         # Include size-7 groups
 
