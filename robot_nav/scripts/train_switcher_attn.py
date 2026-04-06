@@ -88,69 +88,61 @@ class SwitcherAttnDataset(Dataset):
     """
     Dataset for attention-pooling switcher training.
 
-    Each sample needs only:  h, groups, group_scores.
-    h_glob is optional (falls back to h.mean(dim=0)).
+    Each sample stores raw robot embeddings (h) and group indices so that the
+    attention pooling module can be called *during* training.  This avoids
+    pre-computing a multi-GB feature cache (which OOM-kills the process) and
+    ensures that gradients flow correctly through attn_pool on every step.
 
-    Features are pre-computed once at init via AttnGroupFeatureBuilder, so
-    __getitem__ is O(1) tensor lookup.
+    __getitem__ returns: h, groups, pairs, best_idx, n_groups.
+    Feature computation (h → X) is done in the trainer's forward pass.
     """
 
     def __init__(
         self,
         data_path: str,
-        feature_builder: AttnGroupFeatureBuilder,
         embed_dim: Optional[int] = None,
     ):
         """
         Args:
-            data_path:        Path to oracle .pt file.
-            feature_builder:  Pre-built AttnGroupFeatureBuilder (owns attn_pool).
-            embed_dim:        Expected embedding dim; inferred from data if None.
+            data_path: Path to oracle .pt file.
+            embed_dim: Expected embedding dim; inferred from data if None.
         """
         data = torch.load(data_path, weights_only=False)
-        self.samples = data["samples"]
-        self.config  = data.get("config", {})
+        samples = data["samples"]
+        self.config = data.get("config", {})
 
         if embed_dim is None:
-            embed_dim = self.samples[0]["h"].shape[-1]
+            embed_dim = samples[0]["h"].shape[-1]
         self.embed_dim = embed_dim
-        self.feature_builder = feature_builder
 
-        self._validate()
-        print("Pre-computing features for all samples...")
-        self._cache = self._precompute_all()
-        print(f"Pre-computation done. ({len(self._cache)} samples)")
+        self._validate(samples)
+        print("Indexing dataset (pairs + best_idx)...")
+        self._cache = self._build_index(samples)
+        print(f"Dataset ready. ({len(self._cache)} samples)")
 
     # ------------------------------------------------------------------
 
-    def _validate(self):
-        assert len(self.samples) > 0, "No samples in dataset."
-        s = self.samples[0]
+    def _validate(self, samples):
+        assert len(samples) > 0, "No samples in dataset."
+        s = samples[0]
         for key in ("h", "groups", "group_scores"):
             assert key in s, f"Missing required key '{key}' in sample."
-        print(f"Loaded {len(self.samples)} samples | embed_dim={s['h'].shape[-1]} "
+        print(f"Loaded {len(samples)} samples | embed_dim={s['h'].shape[-1]} "
               f"| groups/sample={len(s['groups'])}")
 
-    def _precompute_all(self) -> List[Dict]:
+    def _build_index(self, samples) -> List[Dict]:
+        """Pre-compute only cheap, weight-independent quantities."""
         cache = []
-        for s in self.samples:
-            h            = s["h"]             # (N, D)
-            groups       = s["groups"]        # List[List[int]]
-            group_scores = s["group_scores"]  # (M,)
-            h_glob       = s.get("h_glob", None)
-
-            # AttnGroupFeatureBuilder: (N,D) + groups + h_glob → (M, 2D)
-            X = self.feature_builder(h=h, groups=groups, h_glob=h_glob)
-
+        for s in samples:
+            group_scores = s["group_scores"]
             pairs    = build_pairs_from_scores(group_scores)
             best_idx = int(group_scores.argmax().item())
-
             cache.append({
-                "X":            X,             # (M, 2*embed_dim) — pre-computed, on CPU
-                "group_scores": group_scores,  # (M,)
-                "pairs":        pairs,         # (K, 2)
-                "best_idx":     best_idx,      # int
-                "n_groups":     len(groups),   # int
+                "h":       s["h"],          # (N, D) — raw embeddings, on CPU
+                "groups":  s["groups"],     # List[List[int]]
+                "pairs":   pairs,           # (K, 2)
+                "best_idx": best_idx,       # int
+                "n_groups": len(s["groups"]),
             })
         return cache
 
@@ -244,17 +236,16 @@ class SwitcherAttnTrainer:
             )
 
         embed_dim = config.embed_dim or 512
-        self.attn_pool     = build_attn_pool(sw_cfg, embed_dim=embed_dim)
-        feature_builder    = AttnGroupFeatureBuilder(self.attn_pool, embed_dim=embed_dim)
+        self.attn_pool      = build_attn_pool(sw_cfg, embed_dim=embed_dim)
+        self.feature_builder = AttnGroupFeatureBuilder(self.attn_pool, embed_dim=embed_dim)
 
         print(f"AttentionGroupPooling: n_heads={sw_cfg.attn_n_heads}, "
               f"score_hidden={sw_cfg.attn_score_hidden}")
-        print(f"Group feature dim: {feature_builder.output_dim}  "
+        print(f"Group feature dim: {self.feature_builder.output_dim}  "
               f"(= 2 × embed_dim = 2 × {embed_dim})")
 
         full_dataset = SwitcherAttnDataset(
             data_path=config.data_path,
-            feature_builder=feature_builder,
             embed_dim=embed_dim,
         )
 
@@ -321,7 +312,11 @@ class SwitcherAttnTrainer:
 
             # Batched forward when all samples have the same number of groups
             if len(set(n_groups_list)) == 1:
-                X_batch = torch.stack([s["X"] for s in batch]).to(self.device)  # (B, M, D)
+                X_list = [
+                    self.feature_builder(h=s["h"].to(self.device), groups=s["groups"])
+                    for s in batch
+                ]
+                X_batch = torch.stack(X_list)         # (B, M, 2D)
                 B, M, D = X_batch.shape
                 logits_batch = self.model(X_batch.view(B * M, D)).view(B, M)
             else:
@@ -331,8 +326,13 @@ class SwitcherAttnTrainer:
             batch_acc = batch_top1 = 0.0
 
             for i, sample in enumerate(batch):
-                logits = (logits_batch[i] if logits_batch is not None
-                          else self.model(sample["X"].to(self.device)))
+                if logits_batch is not None:
+                    logits = logits_batch[i]
+                else:
+                    X = self.feature_builder(
+                        h=sample["h"].to(self.device), groups=sample["groups"]
+                    )
+                    logits = self.model(X)
                 pairs    = sample["pairs"].to(self.device)
                 best_idx = sample["best_idx"]
 
@@ -375,15 +375,24 @@ class SwitcherAttnTrainer:
             n_groups_list = [s["n_groups"] for s in batch]
 
             if len(set(n_groups_list)) == 1:
-                X_batch = torch.stack([s["X"] for s in batch]).to(self.device)
+                X_list = [
+                    self.feature_builder(h=s["h"].to(self.device), groups=s["groups"])
+                    for s in batch
+                ]
+                X_batch = torch.stack(X_list)
                 B, M, D = X_batch.shape
                 logits_batch = self.model(X_batch.view(B * M, D)).view(B, M)
             else:
                 logits_batch = None
 
             for i, sample in enumerate(batch):
-                logits = (logits_batch[i] if logits_batch is not None
-                          else self.model(sample["X"].to(self.device)))
+                if logits_batch is not None:
+                    logits = logits_batch[i]
+                else:
+                    X = self.feature_builder(
+                        h=sample["h"].to(self.device), groups=sample["groups"]
+                    )
+                    logits = self.model(X)
                 pairs    = sample["pairs"].to(self.device)
                 best_idx = sample["best_idx"]
 
