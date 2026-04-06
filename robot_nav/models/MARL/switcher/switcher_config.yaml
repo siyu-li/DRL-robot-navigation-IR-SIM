@@ -6,6 +6,22 @@
 # so re-training is required unless dimensions match a saved checkpoint.
 # ========================================================================
 
+# ========================================================================
+# Pooling mode for per-group embeddings.
+#   "mean"      — mean-pool robot embeddings + scalar features (original)
+#   "max"       — max-pool robot embeddings + scalar features
+#   "attention" — learnable 2-head MLP attention pooling, no scalars
+# When set to "attention", base_scalars / extra_group / extra_global are
+# ignored for group features (scalars are not computed).
+# ========================================================================
+pooling: "attention"
+
+# Attention pooling hyper-parameters (only used when pooling == "attention").
+attention_pooling:
+  n_heads: 2
+  score_hidden: [128, 64]
+  dropout: 0.0
+
 # Action coupling mode for multi-robot groups (size >= 2).
 #   "min"  — conservative: coupled linear velocity = min of members' scaled vels.
 #   "mean" — cooperative:  coupled linear velocity = mean of members' scaled vels.

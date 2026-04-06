@@ -33,6 +33,7 @@ Usage examples:
 # ── Supervised switcher ──
 from robot_nav.models.MARL.switcher.supervised import (
     GroupFeatureBuilder,
+    AttnGroupFeatureBuilder,
     _BASE_SCALAR_DIM,
     GroupSwitcher,
     pairwise_logistic_ranking_loss,
@@ -48,17 +49,22 @@ from robot_nav.models.MARL.switcher.supervised import (
 # ── RL switcher ──
 from robot_nav.models.MARL.switcher.rl import (
     RLFeatureBuilder,
+    RLAttnFeatureBuilder,
     SwitcherActorCritic,
     SwitcherPPO,
     SwitcherRolloutBuffer,
     SwitcherEnv,
 )
 
+# ── Attention pooling ──
+from robot_nav.models.MARL.switcher.attention_pooling import AttentionGroupPooling
+
 # ── Config ──
 from robot_nav.models.MARL.switcher.config_loader import (
     SwitcherScalarConfig,
     load_switcher_config,
     config_from_dict,
+    build_attn_pool,
 )
 
 # ── Groups (re-export for backward compatibility) ──
@@ -75,6 +81,7 @@ from robot_nav.models.MARL.groups import (
 __all__ = [
     # Supervised
     "GroupFeatureBuilder",
+    "AttnGroupFeatureBuilder",
     "_BASE_SCALAR_DIM",
     "GroupSwitcher",
     "pairwise_logistic_ranking_loss",
@@ -87,10 +94,13 @@ __all__ = [
     "RankingLossWithScheduledMargin",
     # RL
     "RLFeatureBuilder",
+    "RLAttnFeatureBuilder",
     "SwitcherActorCritic",
     "SwitcherPPO",
     "SwitcherRolloutBuffer",
     "SwitcherEnv",
+    # Attention pooling
+    "AttentionGroupPooling",
     # Groups
     "generate_all_groups",
     "generate_original_groups",
@@ -103,4 +113,5 @@ __all__ = [
     "SwitcherScalarConfig",
     "load_switcher_config",
     "config_from_dict",
+    "build_attn_pool",
 ]

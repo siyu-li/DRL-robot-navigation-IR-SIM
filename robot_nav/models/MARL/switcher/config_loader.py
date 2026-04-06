@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
@@ -35,12 +35,21 @@ class SwitcherScalarConfig:
     """
 
     coupling_mode: str = "min"
+    pooling: str = "mean"  # "mean", "max", or "attention"
+    # Attention pooling hyper-parameters (used when pooling == "attention")
+    attn_n_heads: int = 2
+    attn_score_hidden: List[int] = field(default_factory=lambda: [128, 64])
+    attn_dropout: float = 0.0
     base_scalars: bool = True
     extra_group: List[Tuple[str, str]] = field(default_factory=list)
     extra_global: List[str] = field(default_factory=list)
     state_scalars: List[Tuple[str, str]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if self.pooling not in ("mean", "max", "attention"):
+            raise ValueError(
+                f"pooling must be 'mean', 'max', or 'attention', got '{self.pooling}'"
+            )
         if self.coupling_mode not in ("min", "mean"):
             raise ValueError(
                 f"coupling_mode must be 'min' or 'mean', got '{self.coupling_mode}'"
@@ -81,6 +90,10 @@ class SwitcherScalarConfig:
         """Return a plain dict suitable for YAML / checkpoint serialisation."""
         return {
             "coupling_mode": self.coupling_mode,
+            "pooling": self.pooling,
+            "attn_n_heads": self.attn_n_heads,
+            "attn_score_hidden": list(self.attn_score_hidden),
+            "attn_dropout": self.attn_dropout,
             "base_scalars": self.base_scalars,
             "extra_group": [list(pair) for pair in self.extra_group],
             "extra_global": list(self.extra_global),
@@ -109,8 +122,13 @@ def load_switcher_config(path: str | Path | None = None) -> SwitcherScalarConfig
     extra_global = list(raw.get("extra_global") or [])
     state_scalars = [tuple(pair) for pair in (raw.get("state_scalars") or [])]
 
+    attn_cfg = raw.get("attention_pooling") or {}
     return SwitcherScalarConfig(
         coupling_mode=raw.get("coupling_mode", "min"),
+        pooling=raw.get("pooling", "mean"),
+        attn_n_heads=int(attn_cfg.get("n_heads", 2)),
+        attn_score_hidden=list(attn_cfg.get("score_hidden", [128, 64])),
+        attn_dropout=float(attn_cfg.get("dropout", 0.0)),
         base_scalars=raw.get("base_scalars", True),
         extra_group=extra_group,
         extra_global=extra_global,
@@ -126,8 +144,35 @@ def config_from_dict(d: Dict) -> SwitcherScalarConfig:
 
     return SwitcherScalarConfig(
         coupling_mode=d.get("coupling_mode", "min"),
+        pooling=d.get("pooling", "mean"),
+        attn_n_heads=int(d.get("attn_n_heads", 2)),
+        attn_score_hidden=list(d.get("attn_score_hidden", [128, 64])),
+        attn_dropout=float(d.get("attn_dropout", 0.0)),
         base_scalars=d.get("base_scalars", True),
         extra_group=extra_group,
         extra_global=extra_global,
         state_scalars=state_scalars,
+    )
+
+
+def build_attn_pool(cfg: SwitcherScalarConfig, embed_dim: int = 512):
+    """Create an ``AttentionGroupPooling`` from a ``SwitcherScalarConfig``.
+
+    Returns *None* when ``cfg.pooling != 'attention'``.
+
+    Args:
+        cfg: Loaded switcher config.
+        embed_dim: Robot embedding dimension.
+
+    Returns:
+        ``AttentionGroupPooling`` instance, or ``None``.
+    """
+    if cfg.pooling != "attention":
+        return None
+    from robot_nav.models.MARL.switcher.attention_pooling import AttentionGroupPooling
+    return AttentionGroupPooling(
+        embed_dim=embed_dim,
+        n_heads=cfg.attn_n_heads,
+        score_hidden=tuple(cfg.attn_score_hidden),
+        dropout=cfg.attn_dropout,
     )

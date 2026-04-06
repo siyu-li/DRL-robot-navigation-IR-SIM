@@ -70,16 +70,18 @@ class GroupSwitcher(nn.Module):
             nn.LayerNorm(embed_hidden),
         )
         
-        # Tower 2: Scalar tower
-        # Input: [size_feat, A_in, A_out, A_obs] ∈ R^scalar_dim
-        self.scalar_tower = nn.Sequential(
-            nn.Linear(scalar_dim, scalar_hidden),
-            nn.GELU(),
-            nn.LayerNorm(scalar_hidden),
-        )
-        
-        # Fusion: [e' || s'] ∈ R^(embed_hidden + scalar_hidden)
-        fusion_input_dim = embed_hidden + scalar_hidden
+        # Tower 2: Scalar tower (skipped when scalar_dim == 0)
+        if scalar_dim > 0:
+            self.scalar_tower = nn.Sequential(
+                nn.Linear(scalar_dim, scalar_hidden),
+                nn.GELU(),
+                nn.LayerNorm(scalar_hidden),
+            )
+        else:
+            self.scalar_tower = None
+
+        # Fusion: [e'] when scalar_dim==0, else [e' || s']
+        fusion_input_dim = embed_hidden + (scalar_hidden if scalar_dim > 0 else 0)
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, fusion_hidden),
             nn.GELU(),
@@ -112,19 +114,18 @@ class GroupSwitcher(nn.Module):
         Returns:
             logits: Scores for each group, shape (M,).
         """
-        # Split input into embeddings and scalars
-        # X layout: [h_g, h_glob, size_feat, A_in, A_out, A_obs, ...]
-        embed_features = X[:, :2 * self.embed_dim]  # [h_g || h_glob]
-        scalar_features = X[:, 2 * self.embed_dim:]  # [size_feat, attn_stats, extras]
-        
-        # Tower 1: Process embeddings
+        # Tower 1: Process embeddings [h_g || h_glob]
+        embed_features = X[:, :2 * self.embed_dim]
         e_prime = self.embed_tower(embed_features)  # (M, embed_hidden)
-        
-        # Tower 2: Process scalars
-        s_prime = self.scalar_tower(scalar_features)  # (M, scalar_hidden)
-        
-        # Fusion
-        fused = torch.cat([e_prime, s_prime], dim=-1)  # (M, embed_hidden + scalar_hidden)
+
+        # Tower 2: Process scalars (skipped when scalar_dim == 0)
+        if self.scalar_tower is not None:
+            scalar_features = X[:, 2 * self.embed_dim:]
+            s_prime = self.scalar_tower(scalar_features)  # (M, scalar_hidden)
+            fused = torch.cat([e_prime, s_prime], dim=-1)
+        else:
+            fused = e_prime
+
         logits = self.fusion(fused).squeeze(-1)  # (M,)
         
         return logits

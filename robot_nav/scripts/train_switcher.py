@@ -214,13 +214,13 @@ class SwitcherDataset(Dataset):
         """Build and cache features + pairs for every sample up front."""
         cache = []
         for sample in self.samples:
-            h            = sample["h"]
-            groups       = sample["groups"]
-            group_scores = sample["group_scores"]
-            h_glob  = sample.get("h_glob",  None)
-            attn_rr = sample.get("attn_rr", None)
-            attn_ro = sample.get("attn_ro", None)
-            extra   = sample.get("extra",   None)
+            h            = sample["h"]  # Tensor[N, embed_dim]
+            groups       = sample["groups"] # [List[List[int]]]
+            group_scores = sample["group_scores"] # Tensor[M]
+            h_glob  = sample.get("h_glob",  None) 
+            attn_rr = sample.get("attn_rr", None) #Tensor[N, N]
+            attn_ro = sample.get("attn_ro", None) # Tensor[N, N_obs]
+            extra   = sample.get("extra",   None) # Dict[str, Tensor]
 
             X = self.feature_builder(
                 h=h, groups=groups, h_glob=h_glob,

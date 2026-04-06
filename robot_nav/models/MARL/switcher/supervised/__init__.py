@@ -10,6 +10,9 @@ from robot_nav.models.MARL.switcher.supervised.feature_builder import (
     GroupFeatureBuilder,
     _BASE_SCALAR_DIM,
 )
+from robot_nav.models.MARL.switcher.supervised.attn_feature_builder import (
+    AttnGroupFeatureBuilder,
+)
 from robot_nav.models.MARL.switcher.supervised.switcher_net import (
     GroupSwitcher,
 )
@@ -26,6 +29,7 @@ from robot_nav.models.MARL.switcher.supervised.rank_losses import (
 
 __all__ = [
     "GroupFeatureBuilder",
+    "AttnGroupFeatureBuilder",
     "_BASE_SCALAR_DIM",
     "GroupSwitcher",
     "pairwise_logistic_ranking_loss",

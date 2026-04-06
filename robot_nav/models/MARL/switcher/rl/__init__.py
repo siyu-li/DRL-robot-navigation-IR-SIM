@@ -12,6 +12,9 @@ RL (PPO) group switcher components.
 from robot_nav.models.MARL.switcher.rl.rl_feature_builder import (
     RLFeatureBuilder,
 )
+from robot_nav.models.MARL.switcher.rl.rl_attn_feature_builder import (
+    RLAttnFeatureBuilder,
+)
 from robot_nav.models.MARL.switcher.rl.switcher_ppo import (
     SwitcherActorCritic,
     SwitcherPPO,
@@ -21,6 +24,7 @@ from robot_nav.models.MARL.switcher.rl.switcher_env import SwitcherEnv
 
 __all__ = [
     "RLFeatureBuilder",
+    "RLAttnFeatureBuilder",
     "SwitcherActorCritic",
     "SwitcherPPO",
     "SwitcherRolloutBuffer",
