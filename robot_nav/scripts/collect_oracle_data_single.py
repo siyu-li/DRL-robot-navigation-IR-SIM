@@ -56,13 +56,14 @@ from robot_nav.models.MARL.switcher.config_loader import load_switcher_config
 # =============================================================================
 CONFIG = {
     # Output configuration
-    "output_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots.pt",
-    
+    "output_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_len1500_avev_success.pt",
+
     # Switcher scalar config (YAML path or None for defaults)
+    # Only coupling_mode is decided here; the rest of the config is for training the switcher model and doesn't affect data collection.
     "switcher_config_path": None,  # e.g. "robot_nav/models/MARL/switcher/switcher_config.yaml"
-    
+
     # Data collection settings
-    "n_samples": 7000,              # Number of samples to collect
+    "n_samples": 15000,              # Number of samples to collect
     "n_robots": 14,                  # Number of robots
     "n_obstacles": 7,               # Number of obstacles
     "embed_dim": 512,               # Per-robot embedding dimension from GAT backbone output (2*embedding_dim=2*256)
@@ -73,23 +74,25 @@ CONFIG = {
     "n_rollouts_per_group": 1,      # Number of rollouts to average for each group score
     
     # Group generation settings
-    "include_size_1": True,         # Include individual robots as candidates
+    "include_size_1": False,         # Include individual robots as candidates
     "include_size_2": True,         # Include pairs
     "include_size_3": True,         # Include triplets
-    "include_size_4": True,        # Include size-4 groups (rotation-coupled if enabled)
-    "include_size_7": True,        # Include size-7 groups (rotation-coupled if enabled)
+    "include_size_4": False,        # Include size-4 groups (rotation-coupled if enabled)
+    "include_size_7": False,        # Include size-7 groups (rotation-coupled if enabled)
     
     # Model configuration
     "state_dim": 11,
     "obstacle_state_dim": 4,
     
     # Pretrained model paths (decentralized TD3Obstacle policy)
-    "decentralized_model_name": "TD3-MARL-obstacle-14robots-gpu_epoch800",
-    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu",
-
+    # "decentralized_model_name": "TD3-MARL-obstacle-14robots-gpu_epoch800",
+    # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.10_obstacle_14robot_transfer_gpu",
+    "decentralized_model_name": "TD3-MARL-obstacle-14robots-partial-inactive_epoch210",
+    "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Mar.04_obstacle_14robots_partial_inactive",
+   
     # Simulation settings
     "world_file": "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
-    "disable_plotting": False,
+    "disable_plotting": True,
     "obstacle_proximity_threshold": 1.5,
     "max_steps_per_episode": 1500,   # Reset episode after this many steps
     
@@ -120,7 +123,7 @@ CONFIG = {
     #   "random"  — uniformly random group (original behavior)
     #   "softmax" — sample from all groups weighted by softmax of oracle scores
     "phase2_selection": "softmax",
-    "phase2_temperature": 0.1,     # Softmax temperature: ~0 = always pick max, higher = more uniform
+    "phase2_temperature": 1.0,     # Softmax temperature: ~0 = always pick max, higher = more uniform
 }
 
 

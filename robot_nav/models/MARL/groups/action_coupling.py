@@ -64,9 +64,15 @@ def actions_for_group_from_raw(
                 a_out.append([0.0, 0.0])
         return a_out
 
-    # Size >= 2: coupled linear velocity, individual angular velocity
+    # Size >= 2: coupled linear velocity, individual angular velocity.
+    # For min mode: exclude near-zero velocities (robots that have stopped or
+    # nearly stopped, e.g. already at goal) so they don't drag the coupled
+    # velocity to ~0.  Fall back to the global min only if every member is
+    # near-zero (i.e. the whole group has stopped).
+    _near_zero_threshold = 0.03  # scaled vel range is [0, 0.5]
     if coupling_mode == "min":
-        v_coupled = min(scaled_lin_vels)
+        active_vels = [v for v in scaled_lin_vels if v > _near_zero_threshold]
+        v_coupled = min(active_vels) if active_vels else min(scaled_lin_vels)
     else:
         v_coupled = sum(scaled_lin_vels) / len(scaled_lin_vels)
 
