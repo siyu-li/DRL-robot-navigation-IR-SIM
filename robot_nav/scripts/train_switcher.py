@@ -169,6 +169,7 @@ class SwitcherDataset(Dataset):
         data_path: str,
         embed_dim: Optional[int] = None,
         max_group_size: int = 7,
+        pooling: str = "mean",
         extra_group: List[Tuple[str, str]] = (),
         extra_global: List[str] = (),
         use_urgency_flag: bool = True,
@@ -179,12 +180,13 @@ class SwitcherDataset(Dataset):
             data_path: Path to oracle data file (.pt)
             embed_dim: Dimension of robot embeddings. If None, inferred from data.
             max_group_size: Normalisation constant for size_feat.
+            pooling: Pooling mode for group embedding ("mean" or "max"). From YAML.
             extra_group: Per-group extra features as ``(key, agg)`` pairs.
             extra_global: Global extra feature key names.
             use_urgency_flag: If True, append urgency flag to group features.
             base_scalars: If True, include size_feat + 3 attention scalars.
         """
-        self.data = torch.load(data_path)
+        self.data = torch.load(data_path, weights_only=False)
         self.samples = self.data["samples"]
         self.config = self.data.get("config", {})
         self.use_urgency_flag = use_urgency_flag
@@ -197,6 +199,7 @@ class SwitcherDataset(Dataset):
         self.feature_builder = GroupFeatureBuilder(
             embed_dim=embed_dim,
             max_group_size=max_group_size,
+            pooling=pooling,                 # ← from YAML
             extra_group=extra_group,
             extra_global=extra_global,
             base_scalars=base_scalars,
@@ -488,6 +491,7 @@ class SwitcherTrainer:
             data_path=config.data_path,
             embed_dim=None,  # Infer from data
             max_group_size=config.max_group_size,
+            pooling=sw_cfg.pooling,          # ← from YAML: "mean" or "max"
             extra_group=sw_cfg.extra_group,
             extra_global=sw_cfg.extra_global,
             use_urgency_flag=config.use_urgency_flag,

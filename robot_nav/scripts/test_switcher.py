@@ -41,7 +41,7 @@ from robot_nav.models.MARL.switcher.rl import (
     SwitcherActorCritic,
 )
 from robot_nav.models.MARL.switcher.embedding_utils import extract_embeddings
-from robot_nav.models.MARL.switcher.config_loader import load_switcher_config
+from robot_nav.models.MARL.switcher.config_loader import config_from_dict
 from robot_nav.models.MARL.groups.group_generator import (
     generate_all_groups,
     filter_groups_by_size,
@@ -57,14 +57,14 @@ logger.disable("irsim")
 # =============================================================================
 CONFIG = {
     # Selection mode: "switcher", "rl_switcher", or "random"
-    "selection_mode": "random",  # Change to "random" for baseline, "rl_switcher" for RL-trained
+    "selection_mode": "switcher",  # Change to "random" for baseline, "rl_switcher" for RL-trained
 
     # Group selection strategy for switcher mode:
     #   "argmax"  — always select the highest-scoring group (deterministic)
     #   "top_k"   — uniformly random from top k groups (original behavior)
     #   "softmax" — sample from all groups weighted by softmax of scores
     #   "sample"  — RL stochastic policy
-    "selection_strategy": "sample",  # Options: "argmax", "top_k", "softmax"
+    "selection_strategy": "softmax",  # Options: "argmax", "top_k", "softmax"
 
     # Top-k selection: randomly select from top k groups (only used if selection_strategy="top_k")
     # Set to 1 for deterministic (always best), >1 for stochastic selection
@@ -82,7 +82,7 @@ CONFIG = {
     "trials_per_episode": 3,
 
     # Switcher model configuration (supervised)
-    "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/epoch_100.pt",
+    "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/len1200_decouple_couple_success/epoch_100.pt",
 
     # RL switcher model configuration (PPO-trained)
     "rl_switcher_checkpoint": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots/Mar.18/SwitcherPPO-14robots_update5000.pt",
@@ -104,9 +104,9 @@ CONFIG = {
     "selection_interval": 10,
     
     # Group generation settings (must match training data)
-    "include_size_1": True,         # Include individual robots
-    "include_size_2": False,         # Include pairs
-    "include_size_3": False,         # Include triplets
+    "include_size_1": False,         # Include individual robots
+    "include_size_2": True,         # Include pairs
+    "include_size_3": True,         # Include triplets
     "include_size_4": False,         # Include size-4 groups
     "include_size_7": False,         # Include size-7 groups
 
@@ -118,15 +118,13 @@ CONFIG = {
     "embedding_dim": 256,
     "v_min": 0.0,
     "v_max": 0.5,
-    "pooling": "mean",
 
-    # Switcher feature configuration (must match training)
-    # Loads scalar config from YAML
-    "switcher_config_path": "robot_nav/models/MARL/switcher/switcher_config.yaml",
+    # max_group_size is only used to normalise size_feat inside GroupFeatureBuilder.
+    # Must match the value used during training (default: 7).
     "max_group_size": 7,
-    
+
     # Urgency tracking (for stuck robot detection)
-    "use_urgency_flag": False,       # Enable urgency flag as additional scalar feature
+    "use_urgency_flag": True,       # Enable urgency flag as additional scalar feature
     "urgency_lookback_window": 20,  # Number of steps to track per robot
     "urgency_stuck_threshold": 0.3, # If robot moved < this distance over lookback, it's stuck
 
@@ -1382,18 +1380,20 @@ def main():
         model_config = checkpoint.get("config", {})
         embed_dim = model_config.get("embed_dim", config["embedding_dim"] * 2)
 
-        # Build feature_builder from YAML config (same as training)
-        sw_cfg = load_switcher_config(config["switcher_config_path"])
+        # Reconstruct the exact feature layout used at training time.
+        # The checkpoint is the single source of truth — no YAML involved.
+        sw_cfg = config_from_dict(checkpoint["switcher_config"])
+
         feature_builder = GroupFeatureBuilder.from_config(
             sw_cfg,
             embed_dim=embed_dim,
+            pooling=sw_cfg.pooling,
             max_group_size=config.get("max_group_size", 7),
         )
-        
-        # scalar_dim is computed by GroupFeatureBuilder
-        # If urgency flag is enabled, add 1 to scalar_dim for the model
+
+        # scalar_dim is fully determined by the saved switcher_config + urgency flag
         base_scalar_dim = feature_builder.scalar_dim
-        use_urgency_flag = config.get("use_urgency_flag", True)
+        use_urgency_flag = config.get("use_urgency_flag", False)
         urgency_dim = 1 if use_urgency_flag else 0
         scalar_dim = base_scalar_dim + urgency_dim
 
@@ -1462,8 +1462,9 @@ def main():
         embed_tower_weight = rl_checkpoint["policy_state_dict"]["actor_embed_tower.0.weight"]
         embed_dim = embed_tower_weight.shape[1] // 2  # 2*embed_dim → embed_dim
 
-        # Build RLFeatureBuilder from YAML config
-        sw_cfg = load_switcher_config(config["switcher_config_path"])
+        # Build RLFeatureBuilder from the checkpoint's saved switcher_config.
+        # The checkpoint is the single source of truth — no YAML involved.
+        sw_cfg = config_from_dict(rl_checkpoint.get("switcher_config", {}))
         rl_feature_builder = RLFeatureBuilder.from_config(
             sw_cfg,
             embed_dim=embed_dim,
