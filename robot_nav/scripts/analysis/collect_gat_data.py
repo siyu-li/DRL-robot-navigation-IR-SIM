@@ -89,6 +89,9 @@ def collect(
     N = sim.num_robots
     M = sim.num_obstacles
 
+    SIGMA_2 = 2.0   # narrow bandwidth (m)
+    SIGMA_4 = 4.0   # wide bandwidth (m)
+
     # Per-snapshot accumulators
     pos_list:        List[np.ndarray] = []   # (N, 3)
     goal_list:       List[np.ndarray] = []   # (N, 2)
@@ -101,6 +104,8 @@ def collect(
     dist_rr_list:    List[np.ndarray] = []   # (N, N)
     dist_ro_list:    List[np.ndarray] = []   # (N, M)
     hard_rr_list:    List[np.ndarray] = []   # (N, N)
+    density_s2_list: List[np.ndarray] = []   # (N,)  σ=2m
+    density_s4_list: List[np.ndarray] = []   # (N,)  σ=4m
 
     (
         poses, distance, cos_val, sin_val, collision, goal, a, reward,
@@ -163,6 +168,24 @@ def collect(
             for (px, py, th), (gx, gy) in zip(poses, goal_positions)
         ])  # (N,)
 
+        # ---- Gaussian density scores per robot ----
+        # drr: (N, N)  centre-to-centre robot-robot distances
+        # dro: (N, M)  centre-to-centre robot-obstacle distances
+        # Exclude self (diagonal) from robot-robot sum via the eye mask.
+        eye_mask = np.eye(N, dtype=bool)  # (N, N)
+
+        def _gaussian_density(sigma: float) -> np.ndarray:
+            # robot-robot contribution (exclude i==j)
+            rr = np.exp(-drr ** 2 / (2 * sigma ** 2))
+            rr[eye_mask] = 0.0
+            rr_sum = rr.sum(axis=1)          # (N,)
+            # robot-obstacle contribution
+            ro_sum = np.exp(-dro ** 2 / (2 * sigma ** 2)).sum(axis=1)  # (N,)
+            return rr_sum + ro_sum
+
+        density_s2 = _gaussian_density(SIGMA_2)  # (N,)
+        density_s4 = _gaussian_density(SIGMA_4)  # (N,)
+
         # ---- Accumulate ----
         pos_list.append(pos_snap)
         goal_list.append(goal_snap)
@@ -175,6 +198,8 @@ def collect(
         dist_rr_list.append(drr)
         dist_ro_list.append(dro)
         hard_rr_list.append(hrr)
+        density_s2_list.append(density_s2)
+        density_s4_list.append(density_s4)
 
         collected += 1
         if collected % 100 == 0:
@@ -214,6 +239,9 @@ def collect(
         "dist_rr":         np.stack(dist_rr_list),
         "dist_ro":         np.stack(dist_ro_list),
         "hard_weights_rr": np.stack(hard_rr_list),
+        # (S, N)  Gaussian kernel density scores
+        "density_sigma2":  np.stack(density_s2_list),
+        "density_sigma4":  np.stack(density_s4_list),
     }
 
 
@@ -293,61 +321,63 @@ def main():
     # ---- Distribution histograms ----
     print("\nPlotting distributions ...")
 
-    # Flatten arrays, excluding self-distances on the diagonal for dist_rr
-    dtg_flat  = data["dist_to_goal"].ravel()
+    ROBOT_RADIUS    = 0.2
+    OBSTACLE_RADIUS = 0.7
 
-    # Robot-robot: mask out diagonal (distance from robot to itself = 0)
-    drr      = data["dist_rr"]                           # (S, N, N)
-    mask_rr  = ~np.eye(N, dtype=bool)[np.newaxis, :, :]  # (1, N, N)
-    drr_flat = drr[np.broadcast_to(mask_rr, drr.shape)].ravel()
+    # dist_to_goal: goal is a point, no radius subtraction
+    dtg_flat = data["dist_to_goal"].ravel()
 
-    dro_flat = data["dist_ro"].ravel()
+    # Robot-robot proximity: subtract both robot radii, exclude self-distance diagonal
+    drr     = data["dist_rr"]                            # (S, N, N)
+    mask_rr = ~np.eye(N, dtype=bool)[np.newaxis, :, :]  # (1, N, N)
+    prox_rr_flat = (drr - 2 * ROBOT_RADIUS)[np.broadcast_to(mask_rr, drr.shape)].ravel()
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle("Collected Data — Distance Distributions", fontsize=13, fontweight="bold")
+    # Robot-obstacle proximity: subtract one robot radius and one obstacle radius
+    prox_ro_flat = (data["dist_ro"] - ROBOT_RADIUS - OBSTACLE_RADIUS).ravel()
 
-    # --- dist_to_goal ---
-    ax = axes[0]
-    ax.hist(dtg_flat, bins=60, color="steelblue", edgecolor="white", linewidth=0.4)
-    p33, p67 = np.percentile(dtg_flat, 33), np.percentile(dtg_flat, 67)
-    ax.axvline(p33, color="orange", linestyle="--", linewidth=1.2, label=f"p33={p33:.2f}m")
-    ax.axvline(p67, color="red",    linestyle="--", linewidth=1.2, label=f"p67={p67:.2f}m")
-    ax.set_xlabel("Distance to goal (m)")
-    ax.set_ylabel("Count")
-    ax.set_title("dist_to_goal")
-    ax.legend(fontsize=8)
+    dens_s2_flat = data["density_sigma2"].ravel()
+    dens_s4_flat = data["density_sigma4"].ravel()
 
-    # --- robot-robot distances ---
-    ax = axes[1]
-    ax.hist(drr_flat, bins=60, color="seagreen", edgecolor="white", linewidth=0.4)
-    p33r, p67r = np.percentile(drr_flat, 33), np.percentile(drr_flat, 67)
-    ax.axvline(p33r, color="orange", linestyle="--", linewidth=1.2, label=f"p33={p33r:.2f}m")
-    ax.axvline(p67r, color="red",    linestyle="--", linewidth=1.2, label=f"p67={p67r:.2f}m")
-    ax.set_xlabel("Robot-robot distance (m)")
-    ax.set_ylabel("Count")
-    ax.set_title("dist_rr  (off-diagonal)")
-    ax.legend(fontsize=8)
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    fig.suptitle("Collected Data — Proximity & Density Distributions", fontsize=13, fontweight="bold")
+    axes = axes.ravel()
 
-    # --- robot-obstacle distances ---
-    ax = axes[2]
-    ax.hist(dro_flat, bins=60, color="salmon", edgecolor="white", linewidth=0.4)
-    p33o, p67o = np.percentile(dro_flat, 33), np.percentile(dro_flat, 67)
-    ax.axvline(p33o, color="orange", linestyle="--", linewidth=1.2, label=f"p33={p33o:.2f}m")
-    ax.axvline(p67o, color="red",    linestyle="--", linewidth=1.2, label=f"p67={p67o:.2f}m")
-    ax.set_xlabel("Robot-obstacle distance (m)")
-    ax.set_ylabel("Count")
-    ax.set_title("dist_ro")
-    ax.legend(fontsize=8)
+    def _hist_with_percentiles(ax, arr, color, xlabel, title, vline_zero=False):
+        ax.hist(arr, bins=60, color=color, edgecolor="white", linewidth=0.4)
+        p33v, p67v = np.percentile(arr, 33), np.percentile(arr, 67)
+        ax.axvline(p33v, color="orange", linestyle="--", linewidth=1.2, label=f"p33={p33v:.2f}")
+        ax.axvline(p67v, color="red",    linestyle="--", linewidth=1.2, label=f"p67={p67v:.2f}")
+        if vline_zero:
+            ax.axvline(0, color="black", linestyle=":", linewidth=1.0, label="contact (0m)")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Count")
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+
+    # Row 0 — proximity
+    _hist_with_percentiles(axes[0], dtg_flat,    "steelblue", "Distance to goal (m)",    "dist_to_goal")
+    _hist_with_percentiles(axes[1], prox_rr_flat,"seagreen",  "Robot-robot proximity (m)",
+                           f"prox_rr  (c2c − {2*ROBOT_RADIUS:.1f}m)", vline_zero=True)
+    _hist_with_percentiles(axes[2], prox_ro_flat,"salmon",    "Robot-obstacle proximity (m)",
+                           f"prox_ro  (c2c − {ROBOT_RADIUS+OBSTACLE_RADIUS:.1f}m)", vline_zero=True)
+
+    # Row 1 — density scores
+    _hist_with_percentiles(axes[3], dens_s2_flat, "mediumpurple", "Density score",
+                           "density  σ=2m  (per robot)")
+    _hist_with_percentiles(axes[4], dens_s4_flat, "darkorchid",   "Density score",
+                           "density  σ=4m  (per robot)")
+    axes[5].axis("off")   # spare panel — left blank
 
     fig.tight_layout()
     hist_path = save_path.parent / "distance_distributions.png"
     fig.savefig(hist_path, dpi=150, bbox_inches="tight")
-    plt.show()
+    plt.close(fig)
     print(f"  Histogram saved to {hist_path}")
 
     # ---- Print percentile summary ----
     print("\nPercentile summary (useful for threshold setting):")
-    for name, arr in [("dist_to_goal", dtg_flat), ("dist_rr", drr_flat), ("dist_ro", dro_flat)]:
+    for name, arr in [("dist_to_goal", dtg_flat), ("prox_rr", prox_rr_flat), ("prox_ro", prox_ro_flat),
+                      ("density_sigma2", dens_s2_flat), ("density_sigma4", dens_s4_flat)]:
         p10, p25, p33, p50, p67, p75, p90 = np.percentile(arr, [10, 25, 33, 50, 67, 75, 90])
         print(f"  {name:<20}  p10={p10:.2f}  p25={p25:.2f}  p33={p33:.2f}  "
               f"p50={p50:.2f}  p67={p67:.2f}  p75={p75:.2f}  p90={p90:.2f}")
