@@ -82,7 +82,7 @@ CONFIG = {
     "trials_per_episode": 3,
 
     # Switcher model configuration (supervised)
-    "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/len1200_decouple_couple_success/epoch_100.pt",
+    "switcher_checkpoint": "robot_nav/models/MARL/switcher/runs/switcher/len1500_decouple_min_success/epoch_100.pt",
 
     # RL switcher model configuration (PPO-trained)
     "rl_switcher_checkpoint": "robot_nav/models/MARL/switcher/checkpoint/rl_switcher_14robots/Mar.18/SwitcherPPO-14robots_update5000.pt",
@@ -97,7 +97,7 @@ CONFIG = {
     # "decentralized_model_directory": "robot_nav/models/MARL/marlTD3/checkpoint/Feb.27_obstacle_14robot",
     # Test configuration
     "test_episodes": 50,
-    "max_steps_per_episode": 5000,
+    "max_steps_per_episode": 3000,
     "disable_plotting": False,
 
     # Group selection interval (re-select group every N steps)
@@ -121,10 +121,10 @@ CONFIG = {
 
     # max_group_size is only used to normalise size_feat inside GroupFeatureBuilder.
     # Must match the value used during training (default: 7).
-    "max_group_size": 7,
+    "max_group_size": 3,
 
     # Urgency tracking (for stuck robot detection)
-    "use_urgency_flag": True,       # Enable urgency flag as additional scalar feature
+    "use_urgency_flag": False,       # Enable urgency flag as additional scalar feature
     "urgency_lookback_window": 20,  # Number of steps to track per robot
     "urgency_stuck_threshold": 0.3, # If robot moved < this distance over lookback, it's stuck
 

@@ -14,18 +14,18 @@
 # When set to "attention", base_scalars / extra_group / extra_global are
 # ignored for group features (scalars are not computed).
 # ========================================================================
-pooling: "attention"
+pooling: "mean"
 
 # Attention pooling hyper-parameters (only used when pooling == "attention").
-attention_pooling:
-  n_heads: 2
-  score_hidden: [128, 64]
-  dropout: 0.0
+# attention_pooling:
+#   n_heads: 2
+#   score_hidden: [128, 64]
+#   dropout: 0.0
 
 # Action coupling mode for multi-robot groups (size >= 2).
 #   "min"  — conservative: coupled linear velocity = min of members' scaled vels.
 #   "mean" — cooperative:  coupled linear velocity = mean of members' scaled vels.
-coupling_mode: "mean"
+# coupling_mode: "mean"
 
 # Base scalars (always 4 when enabled): size_feat, A_in, A_out, A_obs.
 # Set false to exclude these from the scalar vector entirely.

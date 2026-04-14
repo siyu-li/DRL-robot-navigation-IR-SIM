@@ -7,7 +7,8 @@ Applies velocity coupling rules to robot groups:
   - Size-1 groups: just scale the individual robot's action.
   - Robots NOT in the active group get [0, 0].
 
-Linear velocity scaling: raw in [-1, 1] -> scaled in [0, 0.5] via (v + 1) / 4.
+Linear velocity scaling: raw in [-1, 1] -> scaled in [0, 0.5] via (v + 1) / 4,
+then clamped to a minimum of 0.05.
 
 Two entry points:
   - ``actions_for_group``:          runs the policy forward pass, then couples.
@@ -35,6 +36,8 @@ def actions_for_group_from_raw(
       - Size >= 2: coupled linear velocity (mean or min), individual angular
         velocity.
       - Inactive robots get ``[0.0, 0.0]``.
+      - Each scaled linear velocity is clamped to a minimum of ``0.05`` so very
+        slow robots cannot stall the whole group.
 
     Args:
         raw_actions: Pre-computed raw actions, shape ``(num_robots, 2)``,
@@ -50,7 +53,9 @@ def actions_for_group_from_raw(
     group_set = set(group)
 
     # Scaled linear velocities for group members: [-1,1] -> [0,0.5]
-    scaled_lin_vels = [(raw_actions[idx][0] + 1) / 4 for idx in group]
+    # Clamp to a minimum of 0.05 so very slow robots don't stall the group.
+    _vel_threshold = 0.05
+    scaled_lin_vels = [max((raw_actions[idx][0] + 1) / 4, _vel_threshold) for idx in group]
 
     if group_size == 1:
         # Size-1: individual action, no coupling needed
@@ -65,14 +70,8 @@ def actions_for_group_from_raw(
         return a_out
 
     # Size >= 2: coupled linear velocity, individual angular velocity.
-    # For min mode: exclude near-zero velocities (robots that have stopped or
-    # nearly stopped, e.g. already at goal) so they don't drag the coupled
-    # velocity to ~0.  Fall back to the global min only if every member is
-    # near-zero (i.e. the whole group has stopped).
-    _near_zero_threshold = 0.03  # scaled vel range is [0, 0.5]
     if coupling_mode == "min":
-        active_vels = [v for v in scaled_lin_vels if v > _near_zero_threshold]
-        v_coupled = min(active_vels) if active_vels else min(scaled_lin_vels)
+        v_coupled = min(scaled_lin_vels)
     else:
         v_coupled = sum(scaled_lin_vels) / len(scaled_lin_vels)
 

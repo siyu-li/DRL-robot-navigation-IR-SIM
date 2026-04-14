@@ -67,7 +67,7 @@ from robot_nav.models.MARL.switcher.config_loader import load_switcher_config
 # =============================================================================
 CONFIG = {
     # Output configuration
-    "output_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_len1500_avev_success.pt",
+    "output_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_len1500_min_success.pt",
 
     # Switcher scalar config (YAML path or None for defaults) 
     # Only coupling_mode is decided here, the rest of the config is for training the switcher model and doesn't affect data collection.
@@ -105,7 +105,7 @@ CONFIG = {
     "world_file": "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
     "disable_plotting": True,
     "obstacle_proximity_threshold": 1.5,
-    "max_steps_per_episode": 1500,   # Reset episode after this many steps
+    "max_steps_per_episode": 2000,   # Reset episode after this many steps
     
     # Goal reach threshold (matches world yaml goal_threshold)
     "goal_reach_threshold": 0.3,

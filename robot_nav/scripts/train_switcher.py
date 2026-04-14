@@ -44,14 +44,14 @@ from robot_nav.models.MARL.switcher.config_loader import (
 # =============================================================================
 CONFIG = {
     # Data configuration
-    "data_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_couple_group_len1200_avev_success.pt",
+    "data_path": "robot_nav/models/MARL/switcher/data/oracle_data_14robots_decouple_len1500_min_success.pt",
     "embed_dim": 512,              # Dimension of per-robot embeddings: Will be adjust based on data if None
     
     # Switcher scalar config (YAML path)
     "switcher_config_path": "robot_nav/models/MARL/switcher/switcher_config.yaml",
     
     # GroupFeatureBuilder config
-    "max_group_size": 7,
+    "max_group_size": 3,
     
     # Urgency flag: Binary indicator for single-robot groups with urgent robots
     #   1.0 if group size == 1 AND that robot is urgent
@@ -77,7 +77,7 @@ CONFIG = {
     "eval_every": 5,                # Validate every N epochs
     
     # Saving configuration
-    "save_dir": "robot_nav/models/MARL/switcher/runs/switcher",
+    "save_dir": "robot_nav/models/MARL/switcher/runs/switcher/len1500_decouple_min_success",
     "save_every": 10,               # Save checkpoint every N epochs
     
     # Device configuration
