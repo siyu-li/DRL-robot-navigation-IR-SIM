@@ -1,20 +1,20 @@
 """
-MLP classification probe for group (2-robot pair) embeddings.
+MLP classification probes for group (2-robot pair) embeddings.
 
-Tests whether a small MLP (2–3 hidden layers) can classify the 4-way
-goal category from the pooled group embedding, even when t-SNE shows
-overlapping clusters.
+This script evaluates whether a small MLP (2–3 hidden layers) can classify:
+    1) 4-way goal category (`goal_category`)
+    2) 3-way density category (`density_cat_s2`, same as visualize_group_tsne)
 
-For each embedding × pooling combination, trains a balanced 4-class
-classifier and reports:
-  - Overall accuracy
-  - Per-class precision / recall / F1
-  - Confusion matrix (printed and saved as heatmap)
+For each embedding × pooling combination, it trains a balanced classifier
+and reports:
+    - Overall accuracy
+    - Per-class precision / recall / F1
+    - Confusion matrix (printed and saved as heatmap)
 
 Uses the same group_data.npz produced by build_group_data.py.
 
 Usage:
-    python -m robot_nav.scripts.analysis.classify_group_mlp
+        python -m robot_nav.scripts.analysis.classify_group_mlp
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ CONFIG = {
 
 # Label names
 GOAL_LABELS = {0: "both-close", 1: "both-far", 2: "both-mid", 3: "mixed"}
+DENSITY_LABELS = {0: "both-sparse", 1: "both-dense", 2: "mixed"}
 
 
 # =====================================================================
@@ -113,10 +114,13 @@ def run_probe(
     save_dir: Path,
     device: torch.device,
     rng: np.random.Generator,
+    target_key: str,
+    label_map: dict,
+    task_tag: str,
 ) -> dict:
     arr_key  = f"{emb_key}_{pool}"
     X_all    = data[arr_key]
-    y_all    = data["goal_category"]
+    y_all    = data[target_key]
 
     # ---- Balanced sample ----
     idx      = balanced_sample(y_all, cfg["max_per_class"], rng)
@@ -178,7 +182,7 @@ def run_probe(
     y_true = y_te_t.cpu().numpy()
 
     acc = float((preds == y_true).mean())
-    label_names = [GOAL_LABELS[i] for i in range(n_classes)]
+    label_names = [label_map[i] for i in range(n_classes)]
 
     report = classification_report(y_true, preds, target_names=label_names,
                                    digits=3, zero_division=0)
@@ -186,6 +190,7 @@ def run_probe(
 
     # ---- Print ----
     tag = f"{emb_key} × {pool}"
+    full_tag = f"{task_tag} | {tag}"
     print(f"\n  [{tag}]  test acc = {acc:.3f}  "
           f"(train={len(X_train)}, test={len(X_test)})")
     print(report)
@@ -206,14 +211,68 @@ def run_probe(
                     fontsize=9, color=color)
     ax.set_xlabel("Predicted")
     ax.set_ylabel("True")
-    ax.set_title(f"Confusion — {tag}\nacc={acc:.3f}", fontsize=10)
+    ax.set_title(f"Confusion — {full_tag}\nacc={acc:.3f}", fontsize=10)
     fig.tight_layout()
-    fname = f"cm_{emb_key}_{pool}.png"
+    fname = f"cm_{task_tag}_{emb_key}_{pool}.png"
     fig.savefig(save_dir / fname, dpi=cfg["dpi"], bbox_inches="tight")
     plt.close(fig)
     print(f"    Saved {fname}")
 
-    return {"tag": tag, "accuracy": acc, "cm": cm, "report": report}
+    return {"tag": tag, "accuracy": acc, "cm": cm, "report": report, "task": task_tag}
+
+
+def run_task(
+    *,
+    task_title: str,
+    task_tag: str,
+    target_key: str,
+    label_map: dict,
+    cfg: dict,
+    data,
+    save_dir: Path,
+    device: torch.device,
+    rng: np.random.Generator,
+) -> list[dict]:
+    print("=" * 60)
+    print(task_title)
+    print("=" * 60)
+
+    y = data[target_key]
+    total = len(y)
+    print(f"\nTotal rows: {total:,}")
+    for lbl, name in label_map.items():
+        cnt = int((y == lbl).sum())
+        print(f"  [{lbl}] {name:<15}  {cnt:>8,}  ({100*cnt/total:.1f}%)")
+    print(f"  [-1] unassigned     {int((y == -1).sum()):>8,}")
+
+    results = []
+    for emb_key, pool in cfg["runs"]:
+        print(f"\n{'─'*60}")
+        print(f"  Training: {emb_key} × {pool}")
+        print(f"    Input dim: {data[f'{emb_key}_{pool}'].shape[1]}")
+        r = run_probe(
+            emb_key,
+            pool,
+            data,
+            cfg,
+            save_dir,
+            device,
+            rng,
+            target_key=target_key,
+            label_map=label_map,
+            task_tag=task_tag,
+        )
+        results.append(r)
+
+    print(f"\n{'='*60}")
+    print(f"SUMMARY — {task_title}")
+    print(f"{'='*60}")
+    print(f"  {'Configuration':<35}  {'Accuracy':>8}")
+    print(f"  {'─'*35}  {'─'*8}")
+    for r in results:
+        print(f"  {r['tag']:<35}  {r['accuracy']:>8.3f}")
+    print(f"{'='*60}")
+    return results
 
 
 # =====================================================================
@@ -226,37 +285,31 @@ def main():
     rng      = np.random.default_rng(cfg["random_seed"])
     device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("=" * 60)
-    print("MLP Classification Probe — Goal Category (4-way)")
-    print("=" * 60)
-
     data = np.load(cfg["data_path"])
-    gc   = data["goal_category"]
-    total = len(gc)
-    print(f"\nTotal rows: {total:,}")
-    for lbl, name in GOAL_LABELS.items():
-        cnt = int((gc == lbl).sum())
-        print(f"  [{lbl}] {name:<15}  {cnt:>8,}  ({100*cnt/total:.1f}%)")
-    print(f"  [-1] unassigned     {int((gc == -1).sum()):>8,}")
+    run_task(
+        task_title="MLP Classification Probe — Goal Category (4-way)",
+        task_tag="goal4",
+        target_key="goal_category",
+        label_map=GOAL_LABELS,
+        cfg=cfg,
+        data=data,
+        save_dir=save_dir,
+        device=device,
+        rng=rng,
+    )
 
-    # ---- Run all probes ----
-    results = []
-    for emb_key, pool in cfg["runs"]:
-        print(f"\n{'─'*60}")
-        print(f"  Training: {emb_key} × {pool}")
-        print(f"    Input dim: {data[f'{emb_key}_{pool}'].shape[1]}")
-        r = run_probe(emb_key, pool, data, cfg, save_dir, device, rng)
-        results.append(r)
+    run_task(
+        task_title="MLP Classification Probe — Density Category (3-way, sigma=2m)",
+        task_tag="density3",
+        target_key="density_cat_s2",
+        label_map=DENSITY_LABELS,
+        cfg=cfg,
+        data=data,
+        save_dir=save_dir,
+        device=device,
+        rng=rng,
+    )
 
-    # ---- Summary table ----
-    print(f"\n{'='*60}")
-    print("SUMMARY — Test Accuracy by Embedding × Pooling")
-    print(f"{'='*60}")
-    print(f"  {'Configuration':<35}  {'Accuracy':>8}")
-    print(f"  {'─'*35}  {'─'*8}")
-    for r in results:
-        print(f"  {r['tag']:<35}  {r['accuracy']:>8.3f}")
-    print(f"{'='*60}")
     print(f"\nAll confusion matrices saved to: {save_dir.resolve()}")
 
 
