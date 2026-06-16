@@ -13,7 +13,8 @@
 /robot_nav/SIM_ENV/__pycache__
 robot_nav/.DS_Store
 *.pth
-/tests/__pycache__
+*__pycache__/
+*/__pycache__/
 *.yml
 *.pyc
 *.pt
