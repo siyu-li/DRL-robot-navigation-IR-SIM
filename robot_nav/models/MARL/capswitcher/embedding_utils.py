@@ -88,8 +88,9 @@ def extract_embeddings_and_actions(
     robot_obs: np.ndarray,
     obstacle_obs: Union[np.ndarray, torch.Tensor],
     device: torch.device,
+    embedding_source: str = "decoder",
 ) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Single forward pass → raw actions **and** pre-decoder embeddings.
+    """Single forward pass → raw actions **and** per-robot embeddings.
 
     Avoids running the attention module twice (once for actions, once for
     observation building).
@@ -99,13 +100,27 @@ def extract_embeddings_and_actions(
         robot_obs: Robot observations ``(N, state_dim)``.
         obstacle_obs: Obstacle observations — numpy or torch.Tensor.
         device: Torch device for computation.
+        embedding_source: Which per-robot embedding to return:
+
+            * ``"decoder"`` (default) — the post-decoder embedding ``H`` that
+              feeds the policy head (``attn_out``). Encodes "what the navigation
+              policy wants to do here"; used by the CAPSwitcher.
+            * ``"pre_decoder"`` — the earlier ``_pre_decoder_embedding``
+              (``self_embed ⊕ attn_aggregation``), retained for ablation.
 
     Returns:
         raw_actions: ``(N, 2)`` numpy array on CPU.
-        h: Pre-decoder per-robot embeddings ``(N, embed_dim)`` (detached).
+        h: Per-robot embeddings ``(N, embed_dim)`` (detached) from the chosen
+           source.
         attn_rr: Robot-robot hard attention ``(N, N)``.
         attn_ro: Robot-obstacle hard attention ``(N, N_obs)``.
     """
+    if embedding_source not in ("decoder", "pre_decoder"):
+        raise ValueError(
+            f"embedding_source must be 'decoder' or 'pre_decoder', "
+            f"got {embedding_source!r}"
+        )
+
     robot_t = torch.as_tensor(
         robot_obs, dtype=torch.float32, device=device,
     ).unsqueeze(0)
@@ -121,9 +136,13 @@ def extract_embeddings_and_actions(
         action = actor.policy_head(H)
 
     N = robot_t.shape[1]
-    pre_dec = actor.attention._pre_decoder_embedding               # (B*N, 512)
-    embed_dim = pre_dec.shape[-1]
-    h = pre_dec.view(-1, N, embed_dim).squeeze(0)                  # (N, embed_dim)
+    if embedding_source == "decoder":
+        # H is the decoder output (attn_out) fed to the policy head: (B*N, 512).
+        src = H
+    else:
+        src = actor.attention._pre_decoder_embedding               # (B*N, 512)
+    embed_dim = src.shape[-1]
+    h = src.view(-1, N, embed_dim).squeeze(0)                      # (N, embed_dim)
     attn_rr = hard_weights_rr.squeeze(0)                           # (N, N)
     attn_ro = hard_weights_ro.squeeze(0)                           # (N, N_obs)
 

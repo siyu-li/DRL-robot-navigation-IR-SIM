@@ -51,9 +51,11 @@ class GATBackbone:
         num_robots: int,
         num_obstacles: int,
         device: torch.device,
+        embedding_source: str = "decoder",
     ) -> None:
         self.device = device
         self.num_robots = num_robots
+        self.embedding_source = embedding_source
 
         checkpoint_path = Path(checkpoint_path)
         directory = checkpoint_path.parent
@@ -124,14 +126,16 @@ class GATBackbone:
             raw_actions: (N, 2) numpy array in actor output space (Tanh,
                          values ∈ [−1, 1]).  Convert to sim-input via
                          ``lin_vel = (raw[0]+1)/4, ang_vel = raw[1]``.
-            h:           (N, 512) pre-decoder embeddings as a CPU tensor
-                         (detached, float32).
+            h:           (N, 512) per-robot embeddings as a CPU tensor
+                         (detached, float32).  Source set by
+                         ``self.embedding_source`` ("decoder" by default).
         """
         raw_actions, h, _, _ = extract_embeddings_and_actions(
             actor=self._td3.actor,
             robot_obs=np.asarray(robot_state, dtype=np.float32),
             obstacle_obs=obstacle_states,
             device=self.device,
+            embedding_source=self.embedding_source,
         )
         return raw_actions, h.cpu()
 

@@ -1,26 +1,35 @@
 """
-Training script for CAPSwitcher PPO.
+Training script for CAPSwitcher (off-policy DQN).
 
 Trains a binary switcher (coarse vs. precise) on top of a frozen GAT backbone
 (pre-trained TD3Obstacle for 6-robot obstacle navigation).  The switcher learns
 to select coarse group control in free space and precise individual control near
 obstacles, producing more physically efficient navigation than either mode alone.
 
+Why DQN (off-policy) instead of PPO
+-----------------------------------
+The switcher is a binary decision over a frozen backbone observed as a fixed
+512-dim embedding.  A replay buffer lets every collected transition be reused
+for many gradient updates, so far fewer (expensive) IR-SIM steps are needed to
+converge than with on-policy PPO, which discards each rollout.  The cached
+embeddings live in the buffer, so DQN updates are pure MLP passes — the GAT
+backbone runs only during data collection.
+
+Device note (Plan A)
+---------------------
+The backbone forward during rollout is batch-1 over a ~6-node graph.  On such a
+tiny graph CPU is faster than CUDA (kernel-launch + host<->device transfer
+latency dominates the matmul), so the environment/backbone run on CPU
+deliberately.  The DQN MLP is also tiny and runs on CPU.
+
 Usage:
     python -m robot_nav.marl_train_capswitcher
-
-Key hyperparameters
--------------------
-  rollout_steps  : 512   — switcher decisions per PPO update
-  ppo_epochs     : 10    — PPO mini-batch passes per update
-  batch_size     : 64
-  selection_interval : 5 — sim steps committed per switcher decision
-  mode costs     : coarse=-0.2/step, precise=-1.0/step
-  max_updates    : 10000
 """
 
+from collections import deque
 from pathlib import Path
 
+import numpy as np
 import torch
 from loguru import logger
 
@@ -28,7 +37,7 @@ from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 from robot_nav.models.MARL.capswitcher.policies.gat_backbone import GATBackbone
 from robot_nav.models.MARL.capswitcher.policies.coarse_steering import CoarseSteering
 from robot_nav.models.MARL.capswitcher.rl.switcher_env import SwitcherEnv
-from robot_nav.models.MARL.capswitcher.rl.switcher_ppo import SwitcherPPO
+from robot_nav.models.MARL.capswitcher.rl.switcher_dqn import SwitcherDQN
 
 # Suppress irsim logging noise
 logger.disable("irsim")
@@ -36,9 +45,9 @@ logger.disable("irsim")
 
 def main() -> None:
     # ------------------------------------------------------------------ #
-    # Device                                                               #
+    # Device — keep the rollout backbone + DQN on CPU (see module docstring) #
     # ------------------------------------------------------------------ #
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     print(f"Using device: {device}")
 
     # ------------------------------------------------------------------ #
@@ -69,6 +78,7 @@ def main() -> None:
         num_robots=sim.num_robots,
         num_obstacles=sim.num_obstacles,
         device=device,
+        embedding_source="decoder",  # per-robot decoder output (attn_out)
     )
 
     # ------------------------------------------------------------------ #
@@ -93,76 +103,120 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------ #
-    # PPO trainer                                                          #
+    # DQN trainer                                                          #
     # ------------------------------------------------------------------ #
-    ppo = SwitcherPPO(
-        embed_dim=512,
-        hidden1=256,
-        hidden2=128,
+    dqn = SwitcherDQN(
+        num_robots=sim.num_robots,
+        embed_dim=env.EMBED_DIM,        # 512 per-robot decoder output
+        phi_dims=(256, 128),            # Deep Sets per-robot encoder φ
+        rho_dims=(128,),                # post-aggregation ρ
+        aggregation="sum_max",          # sum (density) ⊕ max (worst-case robot)
+        num_actions=env.NUM_ACTIONS,
         lr=3e-4,
         gamma=0.99,
-        lam=0.95,
-        clip_eps=0.2,
-        ppo_epochs=10,
-        batch_size=64,
-        ent_coef=0.01,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
+        buffer_size=50_000,             # (N,512) obs ≈ 24 KB/transition → ~1.2 GB
+        batch_size=128,
+        learn_starts=1_000,
+        train_freq=1,
+        target_update_freq=500,
+        eps_start=1.0,
+        eps_end=0.05,
+        eps_decay_steps=50_000,
+        double_dqn=True,
         device=device,
-        writer_comment="CAPSwitcher",
+        writer_comment="CAPSwitcherDQN",
         save_dir=Path(
             "robot_nav/models/MARL/capswitcher/checkpoints/cap_switcher"
         ),
-        model_name="capswitcher",
+        model_name="capswitcher_dqn",
     )
 
     # ------------------------------------------------------------------ #
     # Training loop                                                        #
     # ------------------------------------------------------------------ #
-    num_updates = 10_000
-    rollout_steps = 512
-    save_every = 100
+    total_steps = 200_000   # switcher decisions
+    log_every = 1_000       # env steps between TensorBoard writes
+    save_every = 20_000     # env steps between checkpoints
+    stats_window = 50       # episodes to average for reporting
 
     print(
-        f"\nStarting CAPSwitcher PPO training for {num_updates} updates ...\n"
-        f"  rollout_steps={rollout_steps}, ppo_epochs={ppo.ppo_epochs}, "
-        f"batch_size={ppo.batch_size}, selection_interval={env.selection_interval}"
+        f"\nStarting CAPSwitcher DQN training for {total_steps} steps ...\n"
+        f"  batch_size={dqn.batch_size}, buffer={dqn.buffer.capacity}, "
+        f"learn_starts={dqn.learn_starts}, target_update={dqn.target_update_freq}, "
+        f"selection_interval={env.selection_interval}"
     )
 
-    for update in range(1, num_updates + 1):
-        # ---- Collect rollout -------------------------------------------
-        buffer, rollout_stats = ppo.collect_rollout(env, rollout_steps=rollout_steps)
+    ep_rewards: deque[float] = deque(maxlen=stats_window)
+    ep_lengths: deque[int] = deque(maxlen=stats_window)
+    ep_success: deque[float] = deque(maxlen=stats_window)
+    ep_collision: deque[float] = deque(maxlen=stats_window)
+    ep_coarse_frac: deque[float] = deque(maxlen=stats_window)
 
-        # Bootstrap value from the final observation after the rollout.
-        last_obs = env._get_obs()
+    obs = env.reset()
+    ep_reward = 0.0
+    ep_len = 0
+    ep_coarse = 0
+    last_loss: dict = {}
 
-        # ---- PPO update ------------------------------------------------
-        loss_stats = ppo.train(buffer, last_obs=last_obs)
+    for step in range(1, total_steps + 1):
+        eps = dqn.epsilon(step)
+        action = dqn.select_action(obs, eps)
+        next_obs, reward, done, info = env.step(action)
 
-        ppo.update_count = update
+        dqn.store(obs, action, reward, next_obs, done)
 
-        # ---- TensorBoard -----------------------------------------------
-        ppo.log(rollout_stats, loss_stats)
+        ep_reward += reward
+        ep_len += 1
+        if action == 0:
+            ep_coarse += 1
+        obs = next_obs
 
-        # ---- Console ---------------------------------------------------
-        if update % 10 == 0:
+        # ---- Learn -----------------------------------------------------
+        if step >= dqn.learn_starts and step % dqn.train_freq == 0:
+            stats = dqn.update()
+            if stats is not None:
+                last_loss = stats
+        if step % dqn.target_update_freq == 0:
+            dqn.update_target()
+
+        # ---- Episode boundary -----------------------------------------
+        if done:
+            ep_rewards.append(ep_reward)
+            ep_lengths.append(ep_len)
+            ep_success.append(1.0 if info.get("all_reached") else 0.0)
+            ep_collision.append(1.0 if info.get("collision") else 0.0)
+            ep_coarse_frac.append(ep_coarse / max(ep_len, 1))
+            ep_reward, ep_len, ep_coarse = 0.0, 0, 0
+            obs = env.reset()
+
+        # ---- Logging ---------------------------------------------------
+        if step % log_every == 0 and ep_rewards:
+            log_stats = {
+                "rollout/mean_reward":    float(np.mean(ep_rewards)),
+                "rollout/mean_ep_length": float(np.mean(ep_lengths)),
+                "switcher/frac_coarse":   float(np.mean(ep_coarse_frac)),
+                "episode/success_rate":   float(np.mean(ep_success)),
+                "episode/collision_rate": float(np.mean(ep_collision)),
+                "train/epsilon":          eps,
+                **last_loss,
+            }
+            dqn.log(step, log_stats)
             print(
-                f"Update {update:5d}/{num_updates} | "
-                f"Reward: {rollout_stats['mean_reward']:+7.2f} | "
-                f"Coarse%: {rollout_stats['frac_coarse']*100:5.1f}% | "
-                f"Success: {rollout_stats['success_rate']*100:5.1f}% | "
-                f"Collision: {rollout_stats['collision_rate']*100:5.1f}% | "
-                f"PiLoss: {loss_stats['ppo/policy_loss']:.4f} | "
-                f"VLoss: {loss_stats['ppo/value_loss']:.4f} | "
-                f"Entropy: {loss_stats['ppo/entropy']:.4f}"
+                f"Step {step:7d}/{total_steps} | "
+                f"Reward: {log_stats['rollout/mean_reward']:+7.2f} | "
+                f"Coarse%: {log_stats['switcher/frac_coarse']*100:5.1f}% | "
+                f"Success: {log_stats['episode/success_rate']*100:5.1f}% | "
+                f"Collision: {log_stats['episode/collision_rate']*100:5.1f}% | "
+                f"Eps: {eps:.3f} | "
+                f"Loss: {last_loss.get('dqn/loss', float('nan')):.4f}"
             )
 
         # ---- Checkpoint ------------------------------------------------
-        if update % save_every == 0:
-            ppo.save()
+        if step % save_every == 0:
+            dqn.save(filename=f"{dqn.model_name}_step{step}")
 
     print("\nTraining complete!")
-    ppo.save(filename=f"{ppo.model_name}_final")
+    dqn.save(filename=f"{dqn.model_name}_final")
 
 
 if __name__ == "__main__":
