@@ -106,7 +106,7 @@ def run_eval(
     max_episodes,
     max_steps,
     render_delay,
-    move_distance=0.5,
+    move_distance=1.5,
     seed=0,
 ):
     """
@@ -272,7 +272,7 @@ def main():
 
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle.yaml",
-        disable_plotting=False,
+        disable_plotting=True,
         reward_phase=6,
         per_robot_goal_reset=False,  # resets handled manually
         obstacle_proximity_threshold=1.5,
