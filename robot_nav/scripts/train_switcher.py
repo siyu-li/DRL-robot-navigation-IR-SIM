@@ -77,7 +77,7 @@ CONFIG = {
     "eval_every": 5,                # Validate every N epochs
     
     # Saving configuration
-    "save_dir": "robot_nav/models/MARL/switcher/runs/switcher/len1500_decouple_min_success",
+    "save_dir": "robot_nav/models/MARL/switcher/runs/switcher/len1500_decouple_min_success_withscalar",
     "save_every": 10,               # Save checkpoint every N epochs
     
     # Device configuration
