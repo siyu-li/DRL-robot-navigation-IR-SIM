@@ -103,6 +103,10 @@ class SwitcherEnv:
         self._cached_raw_actions: np.ndarray | None = None  # (N, 2) actor space
         self._cache_valid: bool = False
 
+        # RNG for the random coarse move-group choice (no switcher selects the
+        # group yet, so it is sampled uniformly from the selectable groups).
+        self._coarse_rng = np.random.default_rng()
+
     # ------------------------------------------------------------------
     # Gym-style interface
     # ------------------------------------------------------------------
@@ -162,15 +166,34 @@ class SwitcherEnv:
             "timeout":     False,
             "oob":         False,
             "mode":        action,
+            "group":       None,
             "steps_taken": 0,
         }
 
-        for sub in range(self.selection_interval):
+        # ---- Pre-build the sub-step frames for this decision ----------
+        # Coarse: one coarse control of a randomly chosen group expands into a
+        # sequence of rotation sub-steps (A-matrix steering, fully realised)
+        # followed by a single forward move sub-step.  The whole control is
+        # computed once from the decision-time state.  Precise: re-derive the
+        # actor action each sub-step (state-dependent), as before.
+        if action == 0:
+            group = int(self._coarse_rng.choice(self.coarse.selectable_groups()))
+            rotation_frames, move_frame = self.coarse.compute_actions(
+                self._robot_state, group
+            )
+            coarse_frames = rotation_frames + [move_frame]
+            n_substeps = len(coarse_frames)
+            info["group"] = group
+        else:
+            coarse_frames = None
+            n_substeps = self.selection_interval
+
+        for sub in range(n_substeps):
             # ---- Choose sim-input actions based on mode ---------------
             if action == 0:
-                # Coarse: least-squares steering — already in sim-input format.
+                # Coarse: pre-built rotation/move frame, already sim-input.
                 # Needs no backbone forward.
-                sim_actions = self.coarse.compute_actions(self._robot_state)
+                sim_actions = coarse_frames[sub]
             else:
                 # Precise: reuse the actions produced by the cached forward for
                 # the current state (computed either by the previous decision's

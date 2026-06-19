@@ -86,8 +86,10 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     coarse_steering = CoarseSteering(
         num_robots=sim.num_robots,
-        use_groups=2,   # rank-2 actuation matrix
-        lin_vel=0.25,   # moderate forward speed in sim-input units
+        lin_vel=0.25,                # moderate forward speed in sim-input units
+        method="least_squares",      # or "nonlinear" (location-progress optimiser)
+        step_time=sim.env.step_time,  # used to fully realise rotations sub-step-wise
+        ang_max=1.0,                 # sim angular-velocity bound
     )
 
     # ------------------------------------------------------------------ #
