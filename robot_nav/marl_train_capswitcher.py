@@ -55,9 +55,10 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle.yaml",
-        disable_plotting=True,
-        reward_phase=6,          # progress + collision + goal
-        per_robot_goal_reset=True,
+        disable_plotting=False,
+        reward_phase=6,          # only used for backbone state prep, not the
+                                 # switcher reward (which is decision-level)
+        per_robot_goal_reset=False,  # fixed goals; episode ends when ALL reached
         obstacle_proximity_threshold=1.5,
         num_inactive_robots=0,
     )
@@ -86,8 +87,8 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     coarse_steering = CoarseSteering(
         num_robots=sim.num_robots,
-        move_distance=0.5,           # coarse translation length per control (metres)
-        method="least_squares",      # or "nonlinear" (location-progress optimiser)
+        move_distance=1.5,           # coarse translation length per control (metres)
+        method="nonlinear",      # or "nonlinear" (location-progress optimiser)
         step_time=sim.env.step_time,  # realise rotations/translations sub-step-wise
         ang_max=1.0,                 # sim angular-velocity bound
         lin_max=0.5,                 # sim linear-velocity bound
@@ -100,8 +101,8 @@ def main() -> None:
         sim=sim,
         backbone=gat_backbone,
         coarse_steering=coarse_steering,
-        selection_interval=5,
-        max_steps=300,
+        selection_interval=5,       # sub-steps per robot during precise mode
+        max_decisions=60,           # episode budget counted in switcher decisions
         device=device,
     )
 

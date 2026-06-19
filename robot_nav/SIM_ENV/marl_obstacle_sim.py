@@ -168,6 +168,58 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         clearances = np.maximum(center_dists - obs_radii, 0.0)
         return float(clearances.min())
 
+    def proximity_penalties(
+        self,
+        cl_threshold: float = 1.25,
+        cl_weight: float = 1.0,
+        obs_threshold: float = 1.5,
+        obs_weight: float = 2.0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Per-robot robot–robot and obstacle proximity penalties for the *current*
+        world state.
+
+        Reuses the same quadratic-barrier form and default thresholds/weights as
+        the phase-6 reward (``_compute_rewards_vectorized``), so the CAPSwitcher
+        decision-level clearance shaping is consistent with the GAT training
+        signal.  Recomputed from the live simulator state, so it reflects the
+        state at the moment it is called (the switcher evaluates it once at
+        decision end).
+
+        Args:
+            cl_threshold:  Robot–robot distance below which a penalty applies (m).
+            cl_weight:     Weight on the robot–robot penalty.
+            obs_threshold: Obstacle clearance below which a penalty applies (m).
+            obs_weight:    Weight on the obstacle penalty.
+
+        Returns:
+            (cl_pen, obs_pen): two (N,) non-negative arrays.
+        """
+        robot_positions = np.array(
+            [r.position.flatten() for r in self.env.robot_list]
+        )
+
+        # --- Robot–robot proximity (sum of squared barrier over neighbours) ---
+        pairwise = cdist(robot_positions, robot_positions)
+        np.fill_diagonal(pairwise, np.inf)  # exclude self
+        close = pairwise < cl_threshold
+        cl_pen = cl_weight * np.sum(
+            np.where(close, (cl_threshold - pairwise) ** 2, 0.0), axis=1
+        )
+
+        # --- Obstacle proximity (squared barrier on nearest obstacle) ---
+        clearances = self.get_robot_obstacle_clearances()  # (N, M)
+        if clearances.size > 0:
+            min_clearances = clearances.min(axis=1)  # (N,)
+        else:
+            min_clearances = np.full(self.num_robots, np.inf)
+        obs_close = min_clearances < obs_threshold
+        obs_pen = obs_weight * np.where(
+            obs_close, (obs_threshold - min_clearances) ** 2, 0.0
+        )
+
+        return cl_pen, obs_pen
+
     def step(self, action, connection=None, combined_weights=None):
         """
         Perform a simulation step for all robots.
