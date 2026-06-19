@@ -7,7 +7,8 @@ from the selectable groups at every coarse decision.
 
 Each coarse decision executes one coarse control of the chosen group:
     1. a sequence of rotation sub-steps (A-matrix steering, fully realised), then
-    2. a single forward move sub-step (only the chosen group's members move).
+    2. a sequence of translation sub-steps that advance only the chosen group's
+       members by the full move_distance (also fully realised under lin_max).
 
 Runs both steering methods (least_squares and nonlinear) on the same env setup
 as ``marl_test_obstacle_6robots.py`` and reports success rate, reward, a rough
@@ -105,7 +106,7 @@ def run_eval(
     max_episodes,
     max_steps,
     render_delay,
-    lin_vel=0.25,
+    move_distance=0.5,
     seed=0,
 ):
     """
@@ -116,10 +117,11 @@ def run_eval(
     """
     coarse = CoarseSteering(
         num_robots=sim.num_robots,
-        lin_vel=lin_vel,
+        move_distance=move_distance,
         method=method,
         step_time=sim.env.step_time,
         ang_max=1.0,
+        lin_max=0.5,
         seed=seed,
     )
     selectable = coarse.selectable_groups()
@@ -158,11 +160,11 @@ def run_eval(
             group = random.choice(selectable)
             state = build_states(poses, goal_positions)
 
-            rotation_frames, move_frame = coarse.compute_actions(state, group)
+            rotation_frames, translation_frames = coarse.compute_actions(state, group)
             solve_times.append(coarse.last_solve_time_s)
 
-            # Rotation sub-steps followed by the single move sub-step.
-            decision_frames = rotation_frames + [move_frame]
+            # Rotation sub-steps followed by the translation sub-steps.
+            decision_frames = rotation_frames + translation_frames
 
             terminated_episode = False
             for frame in decision_frames:

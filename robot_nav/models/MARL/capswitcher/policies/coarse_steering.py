@@ -13,8 +13,20 @@ A single coarse control of group ``g`` has two physical parts:
 
    and apply ``dθ_actual = A_reduced @ t*`` to every robot.
 
-2. **Move.** Only the *members* of the chosen group (``M[:, g] == 1``) drive
-   forward by the fixed linear velocity; non-members hold still.
+2. **Move.** Only the *members* of the chosen group (``M[:, g] == 1``) advance
+   forward by a fixed **translation length** ``move_distance`` (metres); non-members
+   hold still.
+
+Two linear quantities — keep them distinct
+------------------------------------------
+``move_distance`` (metres) is the coarse translation length: how far the group's
+members travel per coarse control.  ``lin_max`` (m/s) is the simulator's fixed
+per-step linear-velocity bound on the action command.  They relate by
+``distance = velocity · step_time``, so a single env step can realise at most
+``lin_max · step_time`` metres.  When ``move_distance`` exceeds that, the move is
+split into ``n_trans = ceil(move_distance / (lin_max · step_time))`` equal
+sub-steps — the exact mirror of how a large rotation ``dθ`` is split into
+``n_rot`` sub-steps under the ``ang_max`` bound.
 
 Group-dependent rank reduction
 -------------------------------
@@ -85,30 +97,36 @@ class CoarseSteering:
     Each call produces the sim-input action frames for one coarse control of a
     chosen group: a sequence of rotation sub-steps (so even large rotations are
     fully realised within the per-step angular-velocity bound) followed by a
-    single forward move sub-step for the group's members.
+    sequence of translation sub-steps (so the full ``move_distance`` is realised
+    within the per-step linear-velocity bound) for the group's members.
 
     Args:
-        num_robots: Number of robots (must be 6 for the default matrix).
-        lin_vel:    Fixed forward linear velocity for the move sub-step, in
-                    sim-input units (passed directly to the simulator,
-                    ∈ [0, lin_max]). Default 0.25.
-        method:     ``"least_squares"`` (pinv heading) or ``"nonlinear"``
-                    (maximise members' distance-to-goal reduction). Default
-                    ``"least_squares"``.
-        step_time:  Simulator step duration (s). Used to convert the target
-                    rotation into a per-step angular velocity. Default 0.3.
-        ang_max:    Maximum angular velocity magnitude (rad/s) the simulator
-                    accepts. Default 1.0.
-        seed:       Optional seed for the random column drop (reproducibility).
+        num_robots:    Number of robots (must be 6 for the default matrix).
+        move_distance: Coarse translation length (metres): how far the chosen
+                       group's members advance per coarse control. Independent of
+                       the simulator velocity cap — large values are split across
+                       several sub-steps. Default 0.5.
+        method:        ``"least_squares"`` (pinv heading) or ``"nonlinear"``
+                       (maximise members' distance-to-goal reduction). Default
+                       ``"least_squares"``.
+        step_time:     Simulator step duration (s). Converts target rotation /
+                       translation into per-step velocities. Default 0.3.
+        ang_max:       Maximum angular velocity magnitude (rad/s) the simulator
+                       accepts. Default 1.0.
+        lin_max:       Maximum linear velocity (m/s) the simulator accepts. Used
+                       only to decide how many translation sub-steps realise
+                       ``move_distance``. Default 0.5.
+        seed:          Optional seed for the random column drop (reproducibility).
     """
 
     def __init__(
         self,
         num_robots: int = 6,
-        lin_vel: float = 0.25,
+        move_distance: float = 0.5,
         method: str = "least_squares",
         step_time: float = 0.3,
         ang_max: float = 1.0,
+        lin_max: float = 0.5,
         seed: int | None = None,
     ) -> None:
         if num_robots != 6:
@@ -121,10 +139,11 @@ class CoarseSteering:
                 f"method must be 'least_squares' or 'nonlinear' (got {method!r})."
             )
         self.num_robots = num_robots
-        self.lin_vel = lin_vel
+        self.move_distance = move_distance
         self.method = method
         self.step_time = step_time
         self.ang_max = ang_max
+        self.lin_max = lin_max
         self.rng = np.random.default_rng(seed)
 
         self.A_full = _A_FULL_6.copy()
@@ -189,8 +208,8 @@ class CoarseSteering:
             t* = pinv(A_reduced) @ dθ_desired   (closest reachable headings).
         nonlinear:
             t* = argmax Σ_{i∈members} (‖goal_i − p_i‖ − ‖goal_i − p_new_i‖)
-            where p_new_i is p_i advanced by the fixed forward distance
-            (lin_vel · step_time) along the rotated heading. Optimises *location*
+            where p_new_i is p_i advanced by the fixed translation length
+            ``move_distance`` along the rotated heading. Optimises *location*
             progress toward the goal, not heading alignment. Initialised at the
             least-squares solution.
 
@@ -205,8 +224,8 @@ class CoarseSteering:
         if self.method == "least_squares":
             t_star = t_ls
         else:
-            # Fixed forward distance (only members actually translate).
-            d = self.lin_vel * self.step_time
+            # Fixed translation length (only members actually translate).
+            d = self.move_distance
             pm = np.stack([px[members], py[members]], axis=1)        # (Nm, 2)
             gm = np.stack([gx[members], gy[members]], axis=1)        # (Nm, 2)
             theta_m = theta_current[members]                          # (Nm,)
@@ -253,8 +272,11 @@ class CoarseSteering:
                 ``[0.0, ang_vel_i]`` sim-input pairs.  Applying them in sequence
                 fully realises ``dθ_actual`` for every robot within the angular
                 velocity bound.  Empty if no rotation is needed.
-            move_frame: single list of N ``[lin_vel_or_0, 0.0]`` pairs — only the
-                chosen group's members drive forward.
+            translation_frames: list of ``n_trans`` frames, each a list of N
+                ``[lin_vel_or_0, 0.0]`` pairs.  Applying them in sequence advances
+                the chosen group's members by the full ``move_distance`` within the
+                linear velocity bound; non-members stay still.  Empty if
+                ``move_distance`` is zero.
         """
         if group not in self.selectable_groups():
             raise ValueError(
@@ -292,11 +314,22 @@ class CoarseSteering:
             frame = [[0.0, float(ang_vels[i])] for i in range(self.num_robots)]
             rotation_frames = [list(map(list, frame)) for _ in range(n_rot)]
 
-        # ---- Move sub-step ------------------------------------------------
+        # ---- Translation sub-steps ----------------------------------------
+        # Mirror of the rotation split: pick the smallest number of equal
+        # sub-steps so the per-step linear velocity stays within lin_max, then
+        # advance the members at a constant velocity that covers the full
+        # move_distance over those steps.  Non-members stay still throughout.
         member_set = set(int(i) for i in members)
-        move_frame = [
-            [self.lin_vel if i in member_set else 0.0, 0.0]
-            for i in range(self.num_robots)
-        ]
+        max_per_step_lin = self.lin_max * self.step_time  # metres realisable per step
+        translation_frames: list[list[list[float]]] = []
+        if self.move_distance > 1e-9:
+            n_trans = int(np.ceil(self.move_distance / max_per_step_lin))
+            lin_cmd = self.move_distance / (n_trans * self.step_time)  # ≤ lin_max
+            lin_cmd = min(lin_cmd, self.lin_max)
+            frame = [
+                [lin_cmd if i in member_set else 0.0, 0.0]
+                for i in range(self.num_robots)
+            ]
+            translation_frames = [list(map(list, frame)) for _ in range(n_trans)]
 
-        return rotation_frames, move_frame
+        return rotation_frames, translation_frames

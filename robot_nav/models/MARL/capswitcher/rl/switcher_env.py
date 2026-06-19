@@ -173,15 +173,16 @@ class SwitcherEnv:
         # ---- Pre-build the sub-step frames for this decision ----------
         # Coarse: one coarse control of a randomly chosen group expands into a
         # sequence of rotation sub-steps (A-matrix steering, fully realised)
-        # followed by a single forward move sub-step.  The whole control is
-        # computed once from the decision-time state.  Precise: re-derive the
-        # actor action each sub-step (state-dependent), as before.
+        # followed by a sequence of translation sub-steps (members advance by the
+        # full move_distance).  The whole control is computed once from the
+        # decision-time state.  Precise: re-derive the actor action each sub-step
+        # (state-dependent), as before.
         if action == 0:
             group = int(self._coarse_rng.choice(self.coarse.selectable_groups()))
-            rotation_frames, move_frame = self.coarse.compute_actions(
+            rotation_frames, translation_frames = self.coarse.compute_actions(
                 self._robot_state, group
             )
-            coarse_frames = rotation_frames + [move_frame]
+            coarse_frames = rotation_frames + translation_frames
             n_substeps = len(coarse_frames)
             info["group"] = group
         else:
