@@ -45,7 +45,7 @@ from robot_nav.models.MARL.capswitcher.policies.deep_sets_head import DeepSetsHe
 # DeepSetsQNet
 # ---------------------------------------------------------------------------
 
-class DeepSetsQNet(nn.Module):
+class DeepSetsQNet(DeepSetsHead):
     """
     Deep Sets Q-network for the binary CAPSwitcher.
 
@@ -55,36 +55,39 @@ class DeepSetsQNet(nn.Module):
 
         Q(s, ·) = ρ( aggregate_i φ(h_i) )
 
+    The final ρ layer is initialized small so Q(s, ·) ≈ 0 at start (see
+    :meth:`_init_output_small`).
+
     Args:
-        embed_dim:   Per-robot input embedding dimension. Default 512.
-        phi_dims:    Hidden widths of the per-robot encoder φ. Default (256, 128).
-        rho_dims:    Hidden widths of the post-aggregation ρ. Default (128,).
-        num_actions: Number of discrete actions. Default 2 (coarse/precise).
-        aggregation: Deep Sets pooling. Default "sum_max".
+        num_actions:  Number of discrete actions. Default 2 (coarse/precise).
+        output_bound: Half-width of the uniform init on the final ρ layer.
+                      Default 3e-3 (DDPG-style). Set 0 to keep default init.
+        **kw:         Forwarded to :class:`DeepSetsHead` (``embed_dim``,
+                      ``phi_dims``, ``rho_dims``, ``aggregation``).
     """
 
     def __init__(
-        self,
-        embed_dim: int = 512,
-        phi_dims: Sequence[int] = (256, 128),
-        rho_dims: Sequence[int] = (128,),
-        num_actions: int = 2,
-        aggregation: str = "sum_max",
+        self, *, num_actions: int = 2, output_bound: float = 3e-3, **kw
     ) -> None:
-        super().__init__()
-        self.head = DeepSetsHead(
-            embed_dim=embed_dim,
-            phi_dims=phi_dims,
-            rho_dims=rho_dims,
-            out_dim=num_actions,
-            aggregation=aggregation,
-        )
+        super().__init__(out_dim=num_actions, **kw)
+        if output_bound:
+            self._init_output_small(output_bound)
 
-    def forward(
-        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Args: x (B, N, embed_dim). Returns: Q-values (B, num_actions)."""
-        return self.head(x, mask)
+    def _init_output_small(self, bound: float = 3e-3) -> None:
+        """
+        Shrink the final ρ layer so initial Q-values sit near zero.
+
+        Large random output weights make the bootstrap target
+        ``r + γ·max_a' Q(s', a')`` both large and biased upward (the max
+        amplifies positive noise), which destabilizes the early, most-fragile
+        DQN updates. Starting near zero keeps the target on the scale of early
+        rewards and the TD error well-conditioned. This is the DDPG small-output
+        trick (Lillicrap et al. 2016); it conditions early optimization and is
+        not a convergence guarantee.
+        """
+        last_linear = [m for m in self.rho if isinstance(m, nn.Linear)][-1]
+        nn.init.uniform_(last_linear.weight, -bound, bound)
+        nn.init.zeros_(last_linear.bias)
 
 
 # ---------------------------------------------------------------------------

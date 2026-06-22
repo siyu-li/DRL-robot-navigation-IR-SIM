@@ -51,7 +51,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from robot_nav.models.MARL.capswitcher.rl.reward import SwitcherReward
+from robot_nav.models.MARL.capswitcher.rl.reward import (
+    StepPenaltyReward,
+    SwitcherReward,
+)
 
 
 def _outside_bounds(poses: list, sim) -> bool:
@@ -78,8 +81,9 @@ class SwitcherEnv:
         max_decisions:      Maximum number of switcher decisions per episode
                             (episode budget counted in decisions, not sub-steps).
                             Default 60.
-        reward_fn:          Optional :class:`SwitcherReward`. Defaults to one with
-                            the agreed constants.
+        reward_fn:          Optional reward callable (:class:`SwitcherReward` or
+                            :class:`StepPenaltyReward`). Defaults to a
+                            :class:`SwitcherReward` with the agreed constants.
         device:             Torch device used by the backbone.
     """
 
@@ -93,7 +97,7 @@ class SwitcherEnv:
         coarse_steering,
         selection_interval: int = 5,
         max_decisions: int = 60,
-        reward_fn: SwitcherReward | None = None,
+        reward_fn: SwitcherReward | StepPenaltyReward | None = None,
         device: torch.device = torch.device("cpu"),
     ) -> None:
         self.sim = sim

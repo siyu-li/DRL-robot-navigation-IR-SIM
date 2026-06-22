@@ -7,8 +7,7 @@ Policies (frozen backbone + coarse steering + readout)
   CoarseSteering       — least-squares pinv(A) group steering
   GATBackbone          — frozen TD3Obstacle actor wrapper (per-robot embeddings)
   DeepSetsHead         — permutation-invariant readout over per-robot embeddings
-  SwitcherHead         — legacy mean-pool MLP head (kept for reference)
-
+  
 RL training (off-policy DQN)
   SwitcherEnv          — Gym-like environment (binary mode selection)
   DeepSetsQNet         — Deep Sets Q-network (per-robot → sum⊕max → Q-values)
@@ -21,9 +20,7 @@ Usage:
 
 from robot_nav.models.MARL.capswitcher.policies.coarse_steering import CoarseSteering
 from robot_nav.models.MARL.capswitcher.policies.gat_backbone import GATBackbone
-from robot_nav.models.MARL.capswitcher.policies.cap_switcher import SwitcherHead
 from robot_nav.models.MARL.capswitcher.policies.deep_sets_head import DeepSetsHead
-
 from robot_nav.models.MARL.capswitcher.rl.switcher_env import SwitcherEnv
 from robot_nav.models.MARL.capswitcher.rl.switcher_dqn import (
     DeepSetsQNet,
@@ -35,7 +32,6 @@ __all__ = [
     "CoarseSteering",
     "GATBackbone",
     "DeepSetsHead",
-    "SwitcherHead",
     "SwitcherEnv",
     "DeepSetsQNet",
     "ReplayBuffer",

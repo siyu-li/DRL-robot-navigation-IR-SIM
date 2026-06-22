@@ -38,6 +38,7 @@ from robot_nav.models.MARL.capswitcher.policies.gat_backbone import GATBackbone
 from robot_nav.models.MARL.capswitcher.policies.coarse_steering import CoarseSteering
 from robot_nav.models.MARL.capswitcher.rl.switcher_env import SwitcherEnv
 from robot_nav.models.MARL.capswitcher.rl.switcher_dqn import SwitcherDQN
+from robot_nav.models.MARL.capswitcher.rl.reward import StepPenaltyReward
 
 # Suppress irsim logging noise
 logger.disable("irsim")
@@ -103,6 +104,7 @@ def main() -> None:
         coarse_steering=coarse_steering,
         selection_interval=5,       # sub-steps per robot during precise mode
         max_decisions=60,           # episode budget counted in switcher decisions
+        reward_fn=StepPenaltyReward(),  # terminals + large precise step penalty
         device=device,
     )
 

@@ -30,7 +30,7 @@ The **actuation matrix A** is derived from the membership matrix by **complement
 
 Group 4 (membership all-zeros) complements to all-ones in A, providing a mode where **all robots rotate by the same angle**.
 
-When group s is activated with rotation parameter t, each robot i rotates by dθ\_i = A[i, s] · t. Then all robots drive forward along their individual headings by the same distance d. The total rotation from activating multiple groups with parameters **t** = [t1, t2, ..., t_K] is **dθ = A · t**.
+When group s is activated with rotation parameter t, each robot i rotates by dθ\_i = A[i, s] · t. Then the group's **members** drive forward along their individual headings by a fixed distance d (non-members hold still). The total rotation from activating multiple groups with parameters **t** = [t1, t2, ..., t_K] is **dθ = A · t**.
 
 ### The Rank-Deficiency Problem
 
@@ -38,9 +38,11 @@ The actuation matrix **A** is rank-deficient: it has fewer independent columns t
 
 ### Two Control Regimes
 
-**Coarse group control.** When a coarse group is activated, all robots rotate according to the actuation matrix (robots outside the group membership rotate by t, group members do not), then all robots drive forward by the same distance along their individual headings. This is physically efficient — every robot makes forward progress with no reversal or back-and-forth. However, due to rank deficiency of A, the rotation cannot independently steer each robot. The swarm can only adjust headings within the low-dimensional controllable subspace. Obstacle avoidance is not possible at this level.
+**Coarse group control.** A coarse control of a chosen group has two physical phases. (1) **Rotation:** all robots rotate according to the actuation matrix (robots outside the group membership rotate by t, group members do not). (2) **Move:** only the *members* of the chosen group advance forward by a fixed translation length; non-members hold still. This is physically efficient — the moving robots make forward progress with no reversal or back-and-forth. However, due to rank deficiency of A, the rotation cannot independently steer each robot. The swarm can only adjust headings within the low-dimensional controllable subspace. Obstacle avoidance is not possible at this level.
 
-**Precise (dense) group control.** Individual robots can be steered independently by composing multiple group activations. For example, to move a specific subset of 3 robots in a desired direction, the system activates a coarse group (all robots rotate and move forward), then activates additional groups to rotate certain robots by 180° and move them backward, effectively reversing the unwanted motion for robots outside the target subset. This is achieved through the existing Graph Attention Network (GAT) policy, which provides per-robot navigation actions with obstacle avoidance. However, precise control is physically wasteful: the back-and-forth reversal means robots travel extra distance to achieve the net effect of moving only a subset.
+> Implementation note: in code (`coarse_steering.py`) each phase is split into velocity-bounded **sub-step frames** so a large rotation/translation is realised over several simulator steps within the angular/linear-velocity caps. The reduced actuation matrix is rebuilt per call (the chosen group's own column is dropped, then one of the remaining columns is dropped at random) to give an artificially rank-2 system.
+
+**Precise (dense) group control.** Individual robots can be steered independently. Conceptually this composes multiple group activations (e.g. activating a coarse group, then additional groups that rotate unwanted robots by 180° and move them backward to cancel their motion), which is physically wasteful because of the back-and-forth reversal. In implementation, precise control is realised by the frozen Graph Attention Network (GAT) policy run **sequentially, one robot at a time**: each robot is driven by its individual GAT navigation action (with obstacle avoidance) for a few sub-steps while all other robots hold still. Resolving robots one-by-one is the source of the physical/time inefficiency the switcher must weigh against coarse control.
 
 ### The Efficiency Trade-Off
 
@@ -62,19 +64,14 @@ Design a learned switcher — the **CAPSwitcher** (Coarse-And-Precise Switcher) 
 
 ### Enabling the Coarse Group
 
-The key prerequisite (and a contribution of this work) is a viable coarse group steering mechanism. We replace the failed minimum-action approach with **least-squares steering** (or nonlinear progress optimization) over the rank-deficient actuation matrix. Given desired robot headings toward the goal, we solve:
+The key prerequisite (and a contribution of this work) is a viable coarse group steering mechanism. We replace the failed minimum-action approach with steering over the rank-deficient actuation matrix. Both methods are implemented (`CoarseSteering.method`); given desired robot headings toward the goal, we solve either:
 
 ```
-t* = pinv(A_reduced) · dθ_desired       (least-squares heading)
+least_squares:  t* = pinv(A_reduced) · dθ_desired        (closest reachable headings)
+nonlinear:      t* = argmax  Σ_{i∈members} Δdistance_to_goal_i(t)   (location-progress, BFGS)
 ```
 
-or
-
-```
-t*, d* = argmax total_progress(x, t, d)  (nonlinear progress optimization)
-```
-
-This produces meaningful collective motion despite rank deficiency, giving the switcher a coarse control option worth selecting.
+and apply `dθ_actual = A_reduced · t*` to **all** robots. The chosen group's **members** then translate forward by the fixed `move_distance`. `A_reduced` is the artificially rank-2 actuation matrix described in §1 (chosen group's column dropped, plus one random drop). The nonlinear variant is initialised at the least-squares solution; `last_solve_time_s` records the per-call solve time for the LS-vs-nonlinear runtime comparison (Objective 1). This produces meaningful collective motion despite rank deficiency, giving the switcher a coarse control option worth selecting.
 
 ---
 
@@ -144,19 +141,23 @@ Stage 3 — Soft Message Passing              (FREEZE)
   Soft softmax weights computed per-target-node.
   → attn_out : (B·N, 256)
 
-  ── CUT POINT ──────────────────────────────────────────
   self_embed = robot_embed.reshape(B·N, 256)
   _pre_decoder_embedding = cat(self_embed, attn_out)  → (B·N, 512)
-  Stored as self._pre_decoder_embedding (detached) after every forward pass.
-  ── CUT POINT ──────────────────────────────────────────
+  Stored as self._pre_decoder_embedding (detached) — selectable alt tap.
 
-Stage 4 — Decoder / Task Head               (DISCARD for switching)
+Stage 4 — Decoder / Task Head               (USED as switcher input)
   decode_1 : Linear(512 → 512) + LeakyReLU
   decode_2 : Linear(512 → 512) + LeakyReLU
-  → att_embedding : (B·N, 512)   (navigation-optimised)
+  → att_embedding (== attn_out == H) : (B·N, 512)
+  ── CUT POINT (default) ─────────────────────────────────
+  The per-robot decoder output H is the switcher input
+  (embedding_source="decoder").  "pre_decoder" remains a
+  selectable alternative tap for ablation.
+  ── CUT POINT ──────────────────────────────────────────
 
 Policy Head (in ActorObstacle)              (DISCARD for switching)
   3-layer MLP: 512→400→300→action_dim + Tanh
+  (still used to produce the precise-mode navigation actions)
 ```
 
 ### 4.2 Why `_pre_decoder_embedding` Is the Right Cut Point
@@ -166,11 +167,11 @@ Policy Head (in ActorObstacle)              (DISCARD for switching)
 | Node encoder (emb1/2) | Generic per-robot local state | Yes — same input space | **Freeze** |
 | Hard attention (hard_mlp / hard_mlp_obs) | Which neighbors/obstacles are in proximity | **Directly yes** — captures "am I near an obstacle?" | **Freeze** |
 | Soft message passing (q/k/v, attn_score) | Relational importance of neighbors | Yes — spatial context | **Freeze** |
-| `_pre_decoder_embedding` (512-dim) | Self state ⊕ aggregated neighborhood | **Ideal switching signal** | **Freeze & use as input** |
-| Decoder (decode_1/2) | Fuses features optimized for *action prediction* | Navigation-specific, not needed | **Discard** |
-| Policy head | Maps to lin/ang velocity | Navigation-specific | **Discard** |
+| `_pre_decoder_embedding` (512-dim) | Self state ⊕ aggregated neighborhood | Yes — selectable alternative tap | **Freeze; available via `embedding_source="pre_decoder"`** |
+| Decoder output `attn_out`/`H` (512-dim) | Per-robot navigation-context features | **Yes — default switcher input** | **Freeze & use as input (`embedding_source="decoder"`)** |
+| Policy head | Maps to lin/ang velocity | Navigation-specific | **Discard for switching (still used for precise actions)** |
 
-The 512-dim `_pre_decoder_embedding = cat(self_embed[256], attn_out[256])` is **task-agnostic**: it encodes each robot's local state and how spatially constrained it is by neighbors and obstacles — exactly the signal needed to decide coarse vs. precise. The decoder layers on top encode "what action to take for navigation", which is not what the switcher needs.
+> **Note (revised):** the default switcher input is the **per-robot decoder output** `H` (`attn_out`), not the pre-decoder embedding. Because the GAT and TD3 policy were trained *jointly*, neither tap is truly task-agnostic; the decoder output additionally encodes "what the navigation policy wants to do here", which is itself diagnostic of when precise control is needed. `embedding_source` makes the tap configurable for ablation. Crucially, the per-robot embeddings are **kept unpooled** — the switcher head learns its own permutation-invariant aggregation (Deep Sets), because the per-robot navigation embeddings were never trained to be summarizable under a fixed pool.
 
 ### 4.3 Updated CAPSwitcher Architecture
 
@@ -178,40 +179,53 @@ The 512-dim `_pre_decoder_embedding = cat(self_embed[256], attn_out[256])` is **
                         GAT Backbone (ALL FROZEN)
                         ┌─────────────────────────────────────────────────┐
 robot_obs (B,N,11) ────▶│  Node Encoder → Hard Attention → Soft Message  │
-obstacle_obs (B,M,4)    │  Passing → cat(self_embed, attn_out)            │
+obstacle_obs (B,M,4)    │  Passing → decoder (decode_1/2)                 │
                         │                      ↓                          │
-                        │     _pre_decoder_embedding  (B·N, 512)          │
+                        │   decoder output H (attn_out)   (B·N, 512)      │
                         └───────────────────┬─────────────────────────────┘
-                                            │ detach + reshape
+                                            │ detach + reshape (NO pooling)
                                             ▼
-                                     (B, N, 512)
-                                            │
-                                     Mean pool over N
-                                            ▼
-                                      (B, 512)       Switcher Head (TRAINED)
-                                            │  ┌──────────────────────────┐
-                                            └─▶│  MLP: 512→256→128→2      │
-                                               │  → logits {coarse,precise}│
-                                               │  Categorical distribution  │
-                                               └──────────────────────────┘
+                                     (B, N, 512)         Deep Sets Q-Net (TRAINED)
+                                            │  ┌────────────────────────────────┐
+                                            └─▶│  φ per-robot: 512→256→128       │
+                                               │  aggregate: sum ⊕ max  (256)    │
+                                               │  ρ: 256→128→2                   │
+                                               │  → Q(coarse), Q(precise)        │
+                                               │  argmax / ε-greedy  (Double-DQN)│
+                                               └────────────────────────────────┘
                                                           │
-                        ┌─────────────────┐               │  ┌──────────────────────┐
-                        │  Coarse Steering│◀── action=0 ──┘  │  Precise (frozen GAT)│
-                        │  pinv(A)·dθ     │                  │  actor_target forward │
-                        └─────────────────┘    action=1 ────▶└──────────────────────┘
+                        ┌──────────────────────┐          │  ┌────────────────────────────┐
+                        │  Coarse Steering     │◀ action=0┘  │  Precise (frozen GAT)      │
+                        │  rotate (A·t*) + move│   action=1 ▶│  sequential per-robot actor│
+                        │  members; LS / NL    │             │  (others hold still)       │
+                        └──────────────────────┘             └────────────────────────────┘
 ```
 
 ### 4.4 Training Setup (Revised)
 
 | Module | Weights | Updated during switcher training? |
 |---|---|---|
-| `AttentionObstacleOptimized` (all 4 stages) | Pre-trained TD3Obstacle actor | **No — fully frozen** |
+| `AttentionObstacle` (all 4 stages) | Pre-trained TD3Obstacle actor | **No — fully frozen** |
 | `ActorObstacle.policy_head` | Pre-trained TD3Obstacle | **No — used only for precise actions** |
-| Switcher Head MLP (512→256→128→2) | Random init | **Yes — PPO** |
+| `DeepSetsQNet` (φ 512→256→128, sum⊕max, ρ→2) | Random init | **Yes — Double-DQN** |
 
-- `_pre_decoder_embedding` is accessed via `self.actor.attention._pre_decoder_embedding` after each forward pass.
-- The backbone forward pass is run with `torch.no_grad()` during switcher training.
-- Only the **Switcher Head** parameters are passed to the PPO optimizer.
+- The per-robot decoder output `H` is obtained from a single frozen forward (`embedding_utils.extract_embeddings_and_actions`, which returns precise actions **and** `H` together).
+- The backbone forward pass is run with `torch.no_grad()` during switcher training; the env caches it so each distinct state is forwarded at most once.
+- Only the **`DeepSetsQNet`** parameters are passed to the Adam optimizer; training is **off-policy** (replay buffer of per-robot `(N, 512)` observations), chosen over PPO for sample efficiency on this binary decision.
+
+### 4.5 Reward (decision-level)
+
+The reward is computed **once per switcher decision** (one `SwitcherEnv.step`), *not* summed over the sub-steps a mode expands into. This makes it agnostic to how many sim sub-steps a mode consumes (coarse ≈ 10–14, sequential precise = N×5 = 30 for 6 robots), so sub-step count does not bias the value function. From `rl/reward.py` (`SwitcherReward`):
+
+```
+r =  k_p · Σ_i (d_start_i − d_end_i)     # progress, summed over robots (telescoping)
+   − Σ_i (cl_penalty_i + obs_penalty_i)  # robot–robot + obstacle proximity, at decision end
+   + step_penalty(action)                # coarse = −0.5, precise = −3.0
+   + R_collision (−100)  if any collision     # terminal, exclusive of shaping
+   + R_allgoal  (+200)   if all reached        # terminal, exclusive of shaping
+```
+
+Defaults: `k_p=1.0`, `coarse_penalty=−0.5`, `precise_penalty=−3.0`, `r_collision=−100`, `r_allgoal=+200`. Progress telescopes to `initial − final` total distance over a fixed-goal episode, so mode choice is driven by the step penalties and the collision/clearance terms — exactly the physical-efficiency trade-off the switcher should learn. The per-decision proximity penalties come from `MARL_SIM_OBSTACLE.proximity_penalties()`. (The simulator's `reward_phase=6` is used only for backbone state preparation, not for the switcher reward.)
 
 ---
 
@@ -221,67 +235,49 @@ obstacle_obs (B,M,4)    │  Passing → cat(self_embed, attn_out)            �
 robot_nav/models/MARL/capswitcher/
 │
 ├── capswitcher_project_summary.md     # This document
-│
-├── config/
-│   ├── default.yaml                   # Default hyperparameters
-│   ├── env_6robot.yaml                # 6-robot environment config
-│   └── train_capswitcher.yaml         # CAPSwitcher PPO training config
+├── __init__.py                        # Package exports (DQN API)
+├── embedding_utils.py                 # Single frozen forward → (precise actions, H, attn)
+│                                      #   - extract_embeddings_and_actions(..., embedding_source)
 │
 ├── policies/
-│   ├── coarse_steering.py             # Least-squares and nonlinear coarse steering
-│   │                                  #   - pinv(A_reduced) heading optimization
-│   │                                  #   - Nonlinear progress optimization
-│   │                                  #   - Free-space validation utilities
+│   ├── coarse_steering.py             # Two-phase coarse group steering
+│   │                                  #   - rotate all robots: dθ = A_reduced · t*
+│   │                                  #     (least_squares pinv OR nonlinear BFGS)
+│   │                                  #   - move chosen group's MEMBERS by move_distance
+│   │                                  #   - rotation/translation split into sub-step frames
+│   │                                  #   - group-dependent random rank-2 reduction
 │   ├── gat_backbone.py                # GAT backbone wrapper (FROZEN)
-│   │                                  #   - Loads AttentionObstacleOptimized weights
-│   │                                  #   - Freezes all parameters
-│   │                                  #   - Exposes extract_pre_decoder_embedding()
-│   │                                  #     → returns _pre_decoder_embedding (B·N, 512)
-│   │                                  #   - Exposes get_precise_actions()
-│   │                                  #     → runs frozen actor_target for precise mode
-│   └── cap_switcher.py                # CAPSwitcher Switcher Head (TRAINED)
-│                                      #   - Input: _pre_decoder_embedding (B·N, 512)
-│                                      #   - Reshape → (B, N, 512)
-│                                      #   - Mean pool over robots → (B, 512)
-│                                      #   - MLP(512→256→128→2) → logits
-│                                      #   - Categorical → {0=coarse, 1=precise}
+│   │                                  #   - Loads TD3Obstacle actor, freezes all params
+│   │                                  #   - get_embedding_and_actions() → (raw_actions, H)
+│   │                                  #   - embedding_source: "decoder" (default) | "pre_decoder"
+│   ├── deep_sets_head.py              # DeepSetsHead: φ → (sum⊕max) → ρ  (reusable readout)
+│   └── cap_switcher.py                # SwitcherHead — LEGACY mean-pool MLP (unused by DQN)
 │
 ├── rl/
-│   ├── switcher_env.py                # SwitcherEnv: Gym-like wrapper
-│   │                                  #   - reset(): run sim, call GAT backbone,
-│   │                                  #     return _pre_decoder_embedding
-│   │                                  #   - step(action): execute coarse or precise
-│   │                                  #     for selection_interval steps
-│   │                                  #   - Reward: 
-│   ├── switcher_ppo.py                # PPO trainer
-│   │                                  #   - SwitcherActorCritic (actor + value head)
-│   │                                  #   - SwitcherRolloutBuffer
-│   │                                  #   - train(): clipped surrogate + entropy bonus
-│   └── reward.py                      # Reward shaping constants and functions
+│   ├── switcher_env.py                # SwitcherEnv: Gym-like wrapper (DQN)
+│   │                                  #   - obs: per-robot (N, 512) decoder output (unpooled)
+│   │                                  #   - step(action): coarse (group frames) OR precise
+│   │                                  #     (sequential per-robot GAT); budget in DECISIONS
+│   │                                  #   - decision-level reward via SwitcherReward
+│   │                                  #   - forward-pass cache (1 forward / distinct state)
+│   ├── switcher_dqn.py                # Double-DQN trainer
+│   │                                  #   - DeepSetsQNet (per-robot → sum⊕max → Q-values)
+│   │                                  #   - ReplayBuffer of per-robot (N, 512) obs
+│   │                                  #   - ε-greedy, target net, smooth-L1 TD loss
+│   └── reward.py                      # SwitcherReward — decision-level reward (see §4.5)
 │
-├── experiments/
-│   ├── phase1_freespace.py            # Validate coarse steering in free space
-│   │                                  #   - Compare least-squares vs. nonlinear
-│   │                                  #   - Measure forward progress per step
-│   ├── phase2_learned.py              # Trained CAPSwitcher full evaluation
-│
-├── utils/
-│   ├── geometry.py                    # Angle wrapping, circular mean, heading utils
-│   ├── linalg.py                      # Pseudoinverse, rank analysis, null space
-│   └── logging.py                     # Experiment logging and checkpointing
-│
-└── checkpoints/
-    ├── gat_pretrained/                # Pre-trained TD3Obstacle weights (actor + critic)
-    │                                  #   Used by gat_backbone.py (frozen)
-    └── cap_switcher/                  # Trained CAPSwitcher Switcher Head checkpoints
+└── runs/                              # TensorBoard logs
 ```
+
+> Not present (planned in earlier drafts but not in the tree): `config/`, `experiments/`, `utils/`, `checkpoints/`, `rl/switcher_ppo.py`. The training entry point is `robot_nav/marl_train_capswitcher.py`; checkpoints are written under `checkpoints/cap_switcher/` at save time.
 
 ### Key File Responsibilities
 
 | File | Frozen? | What it does |
 |---|---|---|
-| `gat_backbone.py` | Yes (all weights) | Wraps `AttentionObstacleOptimized`; exposes `_pre_decoder_embedding` and precise actions |
-| `cap_switcher.py` | No (trained) | Switcher Head: mean-pool + MLP → {coarse, precise} |
-| `coarse_steering.py` | N/A (no weights) | Least-squares `t* = pinv(A)·dθ` and nonlinear optimizer |
-| `rl/switcher_env.py` | N/A | Environment loop; calls backbone + either coarse or precise executor |
-| `rl/switcher_ppo.py` | No (trained) | PPO update loop for Switcher Head only |
+| `gat_backbone.py` | Yes (all weights) | Wraps the TD3Obstacle actor; `get_embedding_and_actions` returns per-robot decoder output `H` + precise actions |
+| `deep_sets_head.py` | No (trained) | Permutation-invariant readout: per-robot φ → sum⊕max → ρ (reused by `DeepSetsQNet`) |
+| `cap_switcher.py` | No | **Legacy** mean-pool MLP head; superseded by the Deep Sets DQN, kept for reference |
+| `coarse_steering.py` | N/A (no weights) | Two-phase rotate (`A·t*`, LS/nonlinear) + move-members coarse control, split into sub-step frames |
+| `rl/switcher_env.py` | N/A | Environment loop; coarse (group frames) or sequential precise; decision-level reward |
+| `rl/switcher_dqn.py` | No (trained) | Double-DQN update loop for `DeepSetsQNet` only |

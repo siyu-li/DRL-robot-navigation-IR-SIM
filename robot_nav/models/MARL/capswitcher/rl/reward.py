@@ -103,3 +103,73 @@ class SwitcherReward:
             - clearance
             + self.step_penalty[action]
         )
+
+
+class StepPenaltyReward:
+    """
+    Terminal + step-penalty reward for the binary CAPSwitcher.
+
+    A stripped-down alternative to :class:`SwitcherReward`: there is **no
+    progress shaping and no proximity clearance term**.  Per non-terminal
+    decision the reward is purely the constant step penalty for the chosen mode,
+    so the switcher's mode preference is driven entirely by the (large) cost gap
+    between precise and coarse, traded off against the terminal collision /
+    all-reached events.
+
+    Drop-in compatible with :class:`SwitcherReward`: identical ``__call__``
+    signature, so it can be injected via ``SwitcherEnv(reward_fn=...)``.  The
+    ``d_start``, ``d_end``, ``cl_pen`` and ``obs_pen`` arguments are accepted but
+    ignored.
+
+    Args:
+        coarse_penalty:  Constant step penalty for a coarse decision (cheap).
+        precise_penalty: Constant step penalty for a precise decision; make this
+                         much larger in magnitude than ``coarse_penalty`` so the
+                         switcher only pays for precise when it avoids a
+                         collision.
+        r_collision:     Terminal reward when any robot collides.
+        r_allgoal:       Terminal reward when all robots have reached their goals.
+    """
+
+    def __init__(
+        self,
+        coarse_penalty: float = -0.5,
+        precise_penalty: float = -5.0,
+        r_collision: float = -100.0,
+        r_allgoal: float = 200.0,
+    ) -> None:
+        self.step_penalty = {COARSE: coarse_penalty, PRECISE: precise_penalty}
+        self.r_collision = r_collision
+        self.r_allgoal = r_allgoal
+
+    def __call__(
+        self,
+        d_start,
+        d_end,
+        action: int,
+        cl_pen,
+        obs_pen,
+        collision: bool,
+        all_reached: bool,
+    ) -> float:
+        """
+        Compute the scalar reward for one switcher decision.
+
+        Args (matching :class:`SwitcherReward`; shaping inputs are ignored):
+            d_start, d_end, cl_pen, obs_pen: Accepted for signature
+                         compatibility, unused.
+            action:      0 = coarse, 1 = precise.
+            collision:   True if any robot collided during the decision.
+            all_reached: True if all robots reached their goals during the
+                         decision.
+
+        Returns:
+            Scalar reward.
+        """
+        # Terminal events are exclusive of the step penalty (collision wins).
+        if collision:
+            return float(self.r_collision)
+        if all_reached:
+            return float(self.r_allgoal)
+
+        return float(self.step_penalty[action])
