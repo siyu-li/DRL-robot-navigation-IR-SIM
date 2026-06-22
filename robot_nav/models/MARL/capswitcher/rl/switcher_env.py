@@ -166,13 +166,22 @@ class SwitcherEnv:
         return self._get_obs()
 
     def step(
-        self, action: int
+        self,
+        action: int,
+        group: int | None = None,
+        frames: list | None = None,
     ) -> tuple[np.ndarray, float, bool, dict[str, Any]]:
         """
         Execute one switcher decision with the chosen mode.
 
         Args:
             action: 0 = coarse steering, 1 = precise (sequential GAT actor).
+            group:  Optional 1-based coarse group to drive (action 0 only).
+                    Defaults to the legacy uniform-random choice.
+            frames: Optional pre-built coarse frames to execute verbatim
+                    (action 0 only).  Used by the safety shield so the plan that
+                    runs is exactly the plan that was vetted; takes precedence
+                    over ``group`` for the rollout (``group`` is still recorded).
 
         Returns:
             obs:    (N, 512) next observation.
@@ -197,7 +206,7 @@ class SwitcherEnv:
         }
 
         if action == 0:
-            done = self._run_coarse(info)
+            done = self._run_coarse(info, group=group, frames=frames)
         else:
             done = self._run_precise(info)
 
@@ -220,23 +229,35 @@ class SwitcherEnv:
     # Mode rollouts
     # ------------------------------------------------------------------
 
-    def _run_coarse(self, info: dict[str, Any]) -> bool:
+    def _run_coarse(
+        self,
+        info: dict[str, Any],
+        group: int | None = None,
+        frames: list | None = None,
+    ) -> bool:
         """
-        Execute one coarse control of a randomly chosen group.
+        Execute one coarse control.
 
-        The whole control (rotation + translation sub-steps) is computed once
-        from the decision-time state and applied as pre-built frames; no
-        backbone forward is needed during the sub-steps.
+        The group is, in order of precedence: the pre-vetted ``frames`` (run
+        verbatim, e.g. from the safety shield), an explicit ``group`` (frames
+        recomputed for it), or the legacy uniform-random choice.  The whole
+        control (rotation + translation sub-steps) is applied as pre-built
+        frames; no backbone forward is needed during the sub-steps.
 
         Returns:
             done: True if a terminal condition fired during the control.
         """
-        group = int(self._coarse_rng.choice(self.coarse.selectable_groups()))
-        info["group"] = group
-        rotation_frames, translation_frames = self.coarse.compute_actions(
-            self._robot_state, group
-        )
-        coarse_frames = rotation_frames + translation_frames
+        if frames is not None:
+            info["group"] = group
+            coarse_frames = frames
+        else:
+            if group is None:
+                group = int(self._coarse_rng.choice(self.coarse.selectable_groups()))
+            info["group"] = group
+            rotation_frames, translation_frames = self.coarse.compute_actions(
+                self._robot_state, group
+            )
+            coarse_frames = rotation_frames + translation_frames
 
         for sub, frame in enumerate(coarse_frames):
             done = self._apply_substep(frame, info)
