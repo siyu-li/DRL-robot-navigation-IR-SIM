@@ -108,7 +108,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle.yaml",
-        disable_plotting=True,
+        disable_plotting=False,  # True for headless evaluation, False for visualisation
         reward_phase=6,
         per_robot_goal_reset=False,
         obstacle_proximity_threshold=1.5,

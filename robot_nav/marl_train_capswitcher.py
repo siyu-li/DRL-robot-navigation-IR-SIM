@@ -56,7 +56,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle.yaml",
-        disable_plotting=False,
+        disable_plotting=True,
         reward_phase=6,          # only used for backbone state prep, not the
                                  # switcher reward (which is decision-level)
         per_robot_goal_reset=False,  # fixed goals; episode ends when ALL reached
@@ -88,7 +88,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     coarse_steering = CoarseSteering(
         num_robots=sim.num_robots,
-        move_distance=1.5,           # coarse translation length per control (metres)
+        move_distance=1,           # coarse translation length per control (metres)
         method="nonlinear",      # or "nonlinear" (location-progress optimiser)
         step_time=sim.env.step_time,  # realise rotations/translations sub-step-wise
         ang_max=1.0,                 # sim angular-velocity bound
@@ -140,7 +140,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Training loop                                                        #
     # ------------------------------------------------------------------ #
-    total_steps = 200_000   # switcher decisions
+    total_steps = 1_000_000   # switcher decisions
     log_every = 1_000       # env steps between TensorBoard writes
     save_every = 20_000     # env steps between checkpoints
     stats_window = 50       # episodes to average for reporting
