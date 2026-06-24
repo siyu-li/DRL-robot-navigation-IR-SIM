@@ -38,7 +38,7 @@ from robot_nav.models.MARL.capswitcher.policies.gat_backbone import GATBackbone
 from robot_nav.models.MARL.capswitcher.policies.coarse_steering import CoarseSteering
 from robot_nav.models.MARL.capswitcher.rl.switcher_env import SwitcherEnv
 from robot_nav.models.MARL.capswitcher.rl.switcher_dqn import SwitcherDQN
-from robot_nav.models.MARL.capswitcher.rl.reward import StepPenaltyReward
+from robot_nav.models.MARL.capswitcher.rl.reward import PathCostReward
 
 # Suppress irsim logging noise
 logger.disable("irsim")
@@ -75,7 +75,7 @@ def main() -> None:
     gat_backbone = GATBackbone(
         checkpoint_path=Path(
             "robot_nav/models/MARL/marlTD3/checkpoint/"
-            "obstacle_6robots_v4/TD3-MARL-obstacle-6robots-reward6"
+            "Mar.04_obstacle_14robots_partial_inactive/TD3-MARL-obstacle-14robots-partial-inactive_epoch210"
         ),
         num_robots=sim.num_robots,
         num_obstacles=sim.num_obstacles,
@@ -104,7 +104,7 @@ def main() -> None:
         coarse_steering=coarse_steering,
         selection_interval=5,       # sub-steps per robot during precise mode
         max_decisions=60,           # episode budget counted in switcher decisions
-        reward_fn=StepPenaltyReward(),  # terminals + large precise step penalty
+        reward_fn=PathCostReward(),     # minimise executed motion cost to goal
         device=device,
     )
 
@@ -157,11 +157,13 @@ def main() -> None:
     ep_success: deque[float] = deque(maxlen=stats_window)
     ep_collision: deque[float] = deque(maxlen=stats_window)
     ep_coarse_frac: deque[float] = deque(maxlen=stats_window)
+    ep_path_costs: deque[float] = deque(maxlen=stats_window)
 
     obs = env.reset()
     ep_reward = 0.0
     ep_len = 0
     ep_coarse = 0
+    ep_path_cost = 0.0
     last_loss: dict = {}
 
     for step in range(1, total_steps + 1):
@@ -173,6 +175,7 @@ def main() -> None:
 
         ep_reward += reward
         ep_len += 1
+        ep_path_cost += info.get("path_cost", 0.0)
         if action == 0:
             ep_coarse += 1
         obs = next_obs
@@ -192,7 +195,8 @@ def main() -> None:
             ep_success.append(1.0 if info.get("all_reached") else 0.0)
             ep_collision.append(1.0 if info.get("collision") else 0.0)
             ep_coarse_frac.append(ep_coarse / max(ep_len, 1))
-            ep_reward, ep_len, ep_coarse = 0.0, 0, 0
+            ep_path_costs.append(ep_path_cost)
+            ep_reward, ep_len, ep_coarse, ep_path_cost = 0.0, 0, 0, 0.0
             obs = env.reset()
 
         # ---- Logging ---------------------------------------------------
@@ -200,6 +204,7 @@ def main() -> None:
             log_stats = {
                 "rollout/mean_reward":    float(np.mean(ep_rewards)),
                 "rollout/mean_ep_length": float(np.mean(ep_lengths)),
+                "rollout/mean_path_cost": float(np.mean(ep_path_costs)),
                 "switcher/frac_coarse":   float(np.mean(ep_coarse_frac)),
                 "episode/success_rate":   float(np.mean(ep_success)),
                 "episode/collision_rate": float(np.mean(ep_collision)),
@@ -210,6 +215,7 @@ def main() -> None:
             print(
                 f"Step {step:7d}/{total_steps} | "
                 f"Reward: {log_stats['rollout/mean_reward']:+7.2f} | "
+                f"PathCost: {log_stats['rollout/mean_path_cost']:6.2f} | "
                 f"Coarse%: {log_stats['switcher/frac_coarse']*100:5.1f}% | "
                 f"Success: {log_stats['episode/success_rate']*100:5.1f}% | "
                 f"Collision: {log_stats['episode/collision_rate']*100:5.1f}% | "

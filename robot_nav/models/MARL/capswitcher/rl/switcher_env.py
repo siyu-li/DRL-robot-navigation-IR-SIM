@@ -205,6 +205,7 @@ class SwitcherEnv:
             "mode":        action,
             "group":       None,
             "steps_taken": 0,
+            "path_cost":   0.0,
         }
 
         if action == 0:
@@ -218,11 +219,29 @@ class SwitcherEnv:
             done = True
 
         # ---- Decision-level reward ------------------------------------------
+        # Executed coarse path length: the chosen group's members each advance
+        # by the fixed move_distance, so the motion cost is
+        # n_members_moved · move_distance.  Zero for precise (which carries its
+        # own fixed cost inside the reward function).
+        coarse_cost = 0.0
+        if action == 0 and info["group"] is not None:
+            n_moved = int(self.coarse.members_of(info["group"]).size)
+            coarse_cost = n_moved * self.coarse.move_distance
+
+        # Executed motion cost of this decision, exposed for monitoring: coarse
+        # = n_members_moved · move_distance, precise = the reward's fixed cost
+        # (11.7 by default).  This mirrors what PathCostReward penalises.
+        if action == 0:
+            info["path_cost"] = float(coarse_cost)
+        else:
+            info["path_cost"] = float(getattr(self.reward_fn, "precise_cost", 11.7))
+
         d_end = self._last_distances
         cl_pen, obs_pen = self.sim.proximity_penalties()
         reward = self.reward_fn(
             d_start, d_end, action, cl_pen, obs_pen,
             info["collision"], info["all_reached"],
+            coarse_cost=coarse_cost, oob=info["oob"],
         )
 
         return self._get_obs(), reward, done, info
