@@ -96,7 +96,7 @@ class SwitcherEnv:
         backbone,
         coarse_steering,
         selection_interval: int = 5,
-        max_decisions: int = 60,
+        max_decisions: int = 80,
         reward_fn: SwitcherReward | StepPenaltyReward | None = None,
         device: torch.device = torch.device("cpu"),
         terminate_on_oob: bool = True,

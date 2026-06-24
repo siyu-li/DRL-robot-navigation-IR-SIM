@@ -53,7 +53,7 @@ def build_env(device: torch.device) -> tuple[SwitcherEnv, CoarseSteering, MARL_S
     backbone = GATBackbone(
         checkpoint_path=Path(
             "robot_nav/models/MARL/marlTD3/checkpoint/"
-            "Mar.15_obstacle_14robot_reward8/TD3-MARL-obstacle-14robots"
+            "Mar.04_obstacle_14robots_partial_inactive/TD3-MARL-obstacle-14robots-partial-inactive_epoch210"
         ),
         num_robots=sim.num_robots,
         num_obstacles=sim.num_obstacles,
@@ -75,6 +75,7 @@ def build_env(device: torch.device) -> tuple[SwitcherEnv, CoarseSteering, MARL_S
         selection_interval=5,
         max_decisions=60,
         device=device,
+        terminate_on_oob=False,      # OOB is logged but does NOT end the episode
     )
     return env, coarse, sim
 
@@ -88,7 +89,7 @@ def run_policy(
     c_precise: float,
 ) -> dict:
     """Run ``policy`` for ``episodes`` paired (seeded) episodes, collect stats."""
-    n = {"success": 0, "collision": 0, "timeout": 0, "oob": 0}
+    n = {"success": 0, "collision": 0, "timeout": 0}
     coarse_dec = precise_dec = total_dec = 0
     safe_available = coarse_breach = 0
     costs, lengths = [], []
@@ -127,8 +128,6 @@ def run_policy(
             n["collision"] += 1
         if info.get("timeout"):
             n["timeout"] += 1
-        if info.get("oob"):
-            n["oob"] += 1
         costs.append(ep_cost)
         lengths.append(ep_len)
 
@@ -137,7 +136,6 @@ def run_policy(
         "success_rate": n["success"] / episodes,
         "collision_rate": n["collision"] / episodes,
         "timeout_rate": n["timeout"] / episodes,
-        "oob_rate": n["oob"] / episodes,
         "avg_decisions": float(np.mean(lengths)),
         "avg_cost": float(np.mean(costs)),
         "coarse_frac": coarse_dec / max(total_dec, 1),
@@ -154,7 +152,6 @@ def print_table(results: dict[str, dict]) -> None:
         ("success rate",        "success_rate",    "{:.1%}"),
         ("collision rate",      "collision_rate",  "{:.1%}"),
         ("timeout rate",        "timeout_rate",    "{:.1%}"),
-        ("oob rate",            "oob_rate",         "{:.1%}"),
         ("avg decisions/ep",    "avg_decisions",   "{:.1f}"),
         ("avg control cost/ep", "avg_cost",        "{:.1f}"),
         ("coarse fraction",     "coarse_frac",     "{:.1%}"),

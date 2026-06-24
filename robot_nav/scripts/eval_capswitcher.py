@@ -124,9 +124,13 @@ def main() -> None:
     # Frozen GAT backbone                                                  #
     # ------------------------------------------------------------------ #
     gat_backbone = GATBackbone(
+        # checkpoint_path=Path(
+        #     "robot_nav/models/MARL/marlTD3/checkpoint/"
+        #     "Mar.15_obstacle_14robot_reward8/TD3-MARL-obstacle-14robots",
+        # ),
         checkpoint_path=Path(
             "robot_nav/models/MARL/marlTD3/checkpoint/"
-            "Mar.15_obstacle_14robot_reward8/TD3-MARL-obstacle-14robots"
+            "Mar.04_obstacle_14robots_partial_inactive/TD3-MARL-obstacle-14robots-partial-inactive_epoch210"
         ),
         num_robots=sim.num_robots,
         num_obstacles=sim.num_obstacles,
