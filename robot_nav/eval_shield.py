@@ -53,7 +53,7 @@ def build_env(device: torch.device) -> tuple[SwitcherEnv, CoarseSteering, MARL_S
     backbone = GATBackbone(
         checkpoint_path=Path(
             "robot_nav/models/MARL/marlTD3/checkpoint/"
-            "obstacle_6robots_v4/TD3-MARL-obstacle-6robots-reward6"
+            "Mar.15_obstacle_14robot_reward8/TD3-MARL-obstacle-14robots"
         ),
         num_robots=sim.num_robots,
         num_obstacles=sim.num_obstacles,

@@ -627,10 +627,10 @@ class TD3Obstacle:
 
     def load(self, filename, directory):
         """Load model parameters from files."""
-        self.actor.load_state_dict(torch.load(f"{directory}/{filename}_actor.pth", map_location=self.device))
-        self.actor_target.load_state_dict(torch.load(f"{directory}/{filename}_actor_target.pth", map_location=self.device))
-        self.critic.load_state_dict(torch.load(f"{directory}/{filename}_critic.pth", map_location=self.device))
-        self.critic_target.load_state_dict(torch.load(f"{directory}/{filename}_critic_target.pth", map_location=self.device))
+        self.actor.load_state_dict(torch.load(f"{directory}/{filename}_actor.pth", map_location=self.device), strict=False)
+        self.actor_target.load_state_dict(torch.load(f"{directory}/{filename}_actor_target.pth", map_location=self.device), strict=False)
+        self.critic.load_state_dict(torch.load(f"{directory}/{filename}_critic.pth", map_location=self.device), strict=False)
+        self.critic_target.load_state_dict(torch.load(f"{directory}/{filename}_critic_target.pth", map_location=self.device), strict=False)
         print(f"Loaded weights from: {directory}")
 
     def prepare_state(

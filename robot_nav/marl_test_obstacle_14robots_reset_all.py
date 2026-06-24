@@ -64,7 +64,7 @@ def main(args=None):
         load_model=True,
         model_name="TD3-MARL-obstacle-14robots",
         load_model_name="TD3-MARL-obstacle-14robots",
-        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Mar.02_obstacle_14robot_reward8"),
+        load_directory=Path("robot_nav/models/MARL/marlTD3/checkpoint/Mar.15_obstacle_14robot"),
 
         # model_name="TD3-MARL-obstacle-14robots-gpu",
         # load_model_name="TD3-MARL-obstacle-14robots-gpu_epoch800",

@@ -1,11 +1,12 @@
 """
-Visual test script for CAPSwitcher — renders one episode with a chosen mode.
+Batch evaluation script for CAPSwitcher — runs N headless episodes and reports
+collision rate, success rate, and average steps per episode.
 
 Usage
 -----
-    python -m robot_nav.scripts.test_capswitcher --mode switcher
-    python -m robot_nav.scripts.test_capswitcher --mode coarse
-    python -m robot_nav.scripts.test_capswitcher --mode precise
+    python -m robot_nav.scripts.eval_capswitcher --mode switcher --num-runs 50
+    python -m robot_nav.scripts.eval_capswitcher --mode coarse   --num-runs 50
+    python -m robot_nav.scripts.eval_capswitcher --mode precise  --num-runs 50
 
 Modes
 -----
@@ -13,8 +14,15 @@ switcher  Load the trained DQN checkpoint and select mode greedily (ε = 0).
 coarse    Always choose action 0 — every decision is a coarse group control.
 precise   Always choose action 1 — every decision is precise sequential GAT.
 
-Plotting is enabled so you can watch the simulation render live.
-No statistics are computed; print output shows every decision.
+Metrics
+-------
+- Success rate    : fraction of episodes where all robots reached their goals.
+- Collision rate  : fraction of episodes that ended in a robot collision.
+- Timeout rate    : fraction of episodes that exhausted the decision budget.
+- OOB events      : total number of sub-steps where any robot left world bounds
+                    (OOB no longer terminates an episode — robots keep running).
+- Avg sim steps   : mean total simulator sub-steps per episode.
+- Avg decisions   : mean number of switcher decisions taken per episode.
 """
 
 from __future__ import annotations
@@ -47,13 +55,13 @@ _DEFAULT_CKPT = Path(
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Visual episode test for CAPSwitcher (rendering enabled)."
+        description="Batch evaluation for CAPSwitcher (plotting disabled)."
     )
     p.add_argument(
         "--mode",
         choices=["switcher", "coarse", "precise"],
         default="switcher",
-        help="Control mode to run (default: switcher)",
+        help="Control mode to evaluate (default: switcher)",
     )
     p.add_argument(
         "--checkpoint",
@@ -62,10 +70,16 @@ def _parse_args() -> argparse.Namespace:
         help=f"DQN checkpoint .pth used in switcher mode (default: {_DEFAULT_CKPT})",
     )
     p.add_argument(
+        "--num-runs",
+        type=int,
+        default=50,
+        help="Number of evaluation episodes to run (default: 50)",
+    )
+    p.add_argument(
         "--max-decisions",
         type=int,
-        default=60,
-        help="Episode budget in switcher decisions (default: 60)",
+        default=80,
+        help="Episode budget in switcher decisions (default: 80)",
     )
     p.add_argument(
         "--selection-interval",
@@ -85,15 +99,16 @@ def main() -> None:
     device = torch.device("cpu")
 
     print(f"\n{'='*60}")
-    print(f"  CAPSwitcher visual test  |  mode: {args.mode.upper()}")
+    print(f"  CAPSwitcher evaluation  |  mode: {args.mode.upper()}")
+    print(f"  Runs: {args.num_runs}  |  Max decisions/episode: {args.max_decisions}")
     print(f"{'='*60}\n")
 
     # ------------------------------------------------------------------ #
-    # Simulation (plotting ON for visual test)                            #
+    # Simulation (plotting DISABLED for batch evaluation)                 #
     # ------------------------------------------------------------------ #
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle.yaml",
-        disable_plotting=False,          # <-- live rendering
+        disable_plotting=True,
         reward_phase=6,
         per_robot_goal_reset=False,
         obstacle_proximity_threshold=1.5,
@@ -102,7 +117,7 @@ def main() -> None:
     print(
         f"Environment: {sim.num_robots} robots, "
         f"{sim.num_obstacles} obstacles, "
-        f"world x={sim.x_range} y={sim.y_range}"
+        f"world x={sim.x_range} y={sim.y_range}\n"
     )
 
     # ------------------------------------------------------------------ #
@@ -111,10 +126,7 @@ def main() -> None:
     gat_backbone = GATBackbone(
         checkpoint_path=Path(
             "robot_nav/models/MARL/marlTD3/checkpoint/"
-            # "obstacle_6robots_v4/TD3-MARL-obstacle-6robots-reward6"
-            # "Mar.15_obstacle_14robot_woact/TD3-MARL-obstacle-14robots-woact"
             "Mar.15_obstacle_14robot_reward8/TD3-MARL-obstacle-14robots"
-            # "Mar.02_obstacle_14robot_reward8/TD3-MARL-obstacle-14robots"
         ),
         num_robots=sim.num_robots,
         num_obstacles=sim.num_obstacles,
@@ -144,11 +156,11 @@ def main() -> None:
         selection_interval=args.selection_interval,
         max_decisions=args.max_decisions,
         device=device,
+        terminate_on_oob=False,      # OOB is logged but does NOT end the episode
     )
 
     # ------------------------------------------------------------------ #
     # Q-network (only loaded for switcher mode)                           #
-    # Using DeepSetsQNet directly avoids allocating a large replay buffer #
     # ------------------------------------------------------------------ #
     q_net: DeepSetsQNet | None = None
     if args.mode == "switcher":
@@ -165,58 +177,103 @@ def main() -> None:
         print(f"Loaded DQN checkpoint: {args.checkpoint}\n")
 
     # ------------------------------------------------------------------ #
-    # Episode rollout                                                      #
+    # Per-episode trackers                                                 #
     # ------------------------------------------------------------------ #
-    obs = env.reset()
-    done = False
-    decision = 0
+    n_success   = 0
+    n_collision = 0
+    n_timeout   = 0
+    n_oob_episodes = 0   # episodes that had at least one OOB event
 
-    print(f"Running episode (max {args.max_decisions} decisions) ...\n")
+    total_sim_steps  = 0   # sum of env._step_count across all episodes
+    total_decisions  = 0   # sum of env._decision_count across all episodes
+
+    coarse_decisions_total  = 0
+    precise_decisions_total = 0
+
+    # ------------------------------------------------------------------ #
+    # Per-run table header                                                 #
+    # ------------------------------------------------------------------ #
     print(
-        f"  {'Decision':>8}  {'Mode':>7}  {'Reward':>9}  "
-        f"{'SubSteps':>8}  {'Collision':>9}  {'AllReached':>10}"
+        f"  {'Run':>5}  {'Result':>10}  {'SimSteps':>9}  "
+        f"{'Decisions':>9}  {'Coarse%':>8}"
     )
-    print(f"  {'-'*60}")
+    print(f"  {'-'*52}")
 
-    while not done:
-        decision += 1
+    for run in range(1, args.num_runs + 1):
+        obs  = env.reset()
+        done = False
 
-        # ---- Action selection -------------------------------------------
-        if args.mode == "switcher":
-            with torch.no_grad():
-                obs_t = torch.as_tensor(
-                    obs, dtype=torch.float32, device=device
-                ).unsqueeze(0)   # (1, N, 512)
-                action = int(q_net(obs_t).argmax(dim=1).item())
-        elif args.mode == "coarse":
-            action = 0
-        else:   # precise
-            action = 1
+        run_coarse  = 0
+        run_precise = 0
 
-        obs, reward, done, info = env.step(action)
+        while not done:
+            # ---- Action selection ---------------------------------------
+            if args.mode == "switcher":
+                with torch.no_grad():
+                    obs_t  = torch.as_tensor(
+                        obs, dtype=torch.float32, device=device
+                    ).unsqueeze(0)            # (1, N, 512)
+                    action = int(q_net(obs_t).argmax(dim=1).item())
+            elif args.mode == "coarse":
+                action = 0
+            else:   # precise
+                action = 1
 
-        mode_label = "COARSE " if action == 0 else "PRECISE"
+            obs, reward, done, info = env.step(action)
+
+            if action == 0:
+                run_coarse  += 1
+            else:
+                run_precise += 1
+
+        # ---- Accumulate stats -------------------------------------------
+        sim_steps = env._step_count
+        decisions = env._decision_count
+
+        total_sim_steps += sim_steps
+        total_decisions += decisions
+        coarse_decisions_total  += run_coarse
+        precise_decisions_total += run_precise
+
+        if info["all_reached"]:
+            n_success += 1
+            result = "SUCCESS"
+        elif info["collision"]:
+            n_collision += 1
+            result = "COLLISION"
+        else:   # timeout
+            n_timeout += 1
+            result = "TIMEOUT"
+
+        if info.get("oob"):
+            n_oob_episodes += 1
+
+        coarse_pct = 100.0 * run_coarse / decisions if decisions > 0 else 0.0
         print(
-            f"  {decision:>8d}  {mode_label}  {reward:>+9.3f}  "
-            f"{info['steps_taken']:>8d}  {str(info['collision']):>9}  "
-            f"{str(info['all_reached']):>10}"
+            f"  {run:>5d}  {result:>10}  {sim_steps:>9d}  "
+            f"{decisions:>9d}  {coarse_pct:>7.1f}%"
         )
 
     # ------------------------------------------------------------------ #
     # Summary                                                              #
     # ------------------------------------------------------------------ #
+    N = args.num_runs
     print(f"\n{'='*60}")
-    print(f"  Episode ended after {decision} decisions.")
-    if info["all_reached"]:
-        print("  Result: ALL GOALS REACHED ✓")
-    elif info["collision"]:
-        print("  Result: COLLISION ✗")
-    elif info.get("timeout"):
-        print("  Result: TIMEOUT (decision budget exhausted)")
-    elif info.get("oob"):
-        print("  Result: OUT OF BOUNDS")
-    else:
-        print("  Result: (unknown termination)")
+    print(f"  EVALUATION SUMMARY — {args.mode.upper()} mode ({N} runs)")
+    print(f"{'='*60}")
+    print(f"  Success   rate : {n_success  / N * 100:6.1f}%  ({n_success}/{N})")
+    print(f"  Collision rate : {n_collision / N * 100:6.1f}%  ({n_collision}/{N})")
+    print(f"  Timeout   rate : {n_timeout   / N * 100:6.1f}%  ({n_timeout}/{N})")
+    print(f"  OOB events     : {n_oob_episodes} episode(s) had at least one OOB sub-step (non-terminal)")
+    print(f"  Avg sim steps  : {total_sim_steps / N:8.1f}")
+    print(f"  Avg decisions  : {total_decisions / N:8.1f}")
+    if args.mode == "switcher":
+        total_dec = coarse_decisions_total + precise_decisions_total
+        if total_dec > 0:
+            print(
+                f"  Coarse share   : {coarse_decisions_total  / total_dec * 100:6.1f}%"
+                f"  Precise share  : {precise_decisions_total / total_dec * 100:6.1f}%"
+            )
     print(f"{'='*60}\n")
 
 

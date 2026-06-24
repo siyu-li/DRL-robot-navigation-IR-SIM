@@ -99,6 +99,7 @@ class SwitcherEnv:
         max_decisions: int = 60,
         reward_fn: SwitcherReward | StepPenaltyReward | None = None,
         device: torch.device = torch.device("cpu"),
+        terminate_on_oob: bool = True,
     ) -> None:
         self.sim = sim
         self.backbone = backbone
@@ -107,6 +108,7 @@ class SwitcherEnv:
         self.max_decisions = max_decisions
         self.reward_fn = reward_fn if reward_fn is not None else SwitcherReward()
         self.device = device
+        self.terminate_on_oob = terminate_on_oob
 
         self._step_count: int = 0          # sim sub-steps (diagnostic only)
         self._decision_count: int = 0      # switcher decisions (episode budget)
@@ -342,7 +344,8 @@ class SwitcherEnv:
             done = True
         if _outside_bounds(poses, self.sim):
             info["oob"] = True
-            done = True
+            if self.terminate_on_oob:
+                done = True
         return done
 
     # ------------------------------------------------------------------
