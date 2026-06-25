@@ -228,13 +228,15 @@ class SwitcherEnv:
             n_moved = int(self.coarse.members_of(info["group"]).size)
             coarse_cost = n_moved * self.coarse.move_distance
 
-        # Executed motion cost of this decision, exposed for monitoring: coarse
-        # = n_members_moved · move_distance, precise = the reward's fixed cost
-        # (11.7 by default).  This mirrors what PathCostReward penalises.
+        # Executed travel distance of this decision, summed over robots and
+        # exposed for monitoring: coarse = n_members_moved · move_distance,
+        # precise = per-robot fixed cost (11.7) · num_robots (every robot is
+        # actuated under the precise mechanism).
         if action == 0:
             info["path_cost"] = float(coarse_cost)
         else:
-            info["path_cost"] = float(getattr(self.reward_fn, "precise_cost", 11.7))
+            precise_cost = float(getattr(self.reward_fn, "precise_cost", 11.7))
+            info["path_cost"] = precise_cost * self.sim.num_robots
 
         d_end = self._last_distances
         cl_pen, obs_pen = self.sim.proximity_penalties()
