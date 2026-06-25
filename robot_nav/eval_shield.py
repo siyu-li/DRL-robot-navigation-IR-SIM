@@ -6,7 +6,7 @@ of the hard safety shield and reports the metrics that answer "is there a
 sequential efficiency trade-off worth RL?":
 
   * success / collision / timeout rates,
-  * coarse vs precise usage and a control-cost proxy,
+  * coarse vs precise usage and travel distance (path length, all robots),
   * shield availability (fraction of decisions with >=1 safe coarse group),
   * shield integrity (collisions that occurred *during* a coarse decision — these
     should be ~0; any non-zero count means d_safe / geometry is miscalibrated).
@@ -85,10 +85,15 @@ def run_policy(
     policy: ShieldedSwitcher,
     episodes: int,
     base_seed: int,
-    c_coarse: float,
-    c_precise: float,
 ) -> dict:
-    """Run ``policy`` for ``episodes`` paired (seeded) episodes, collect stats."""
+    """Run ``policy`` for ``episodes`` paired (seeded) episodes, collect stats.
+
+    The per-episode cost reported is **travel distance** (path length), summed
+    over all robots and accumulated over the episode: precise = 11.7 fixed per
+    decision, coarse = n_members_moved * move_distance.  This is exactly the
+    quantity ``SwitcherEnv`` exposes as ``info["path_cost"]`` and the same one
+    ``PathCostReward`` penalises during CAPSwitcher training.
+    """
     n = {"success": 0, "collision": 0, "timeout": 0}
     coarse_dec = precise_dec = total_dec = 0
     safe_available = coarse_breach = 0
@@ -113,14 +118,13 @@ def run_policy(
             )
             ep_len += 1
             total_dec += 1
+            ep_cost += float(info["path_cost"])  # travel distance, all robots
             if decision["mode"] == COARSE:
                 coarse_dec += 1
-                ep_cost += c_coarse
                 if info["collision"]:
                     coarse_breach += 1  # shield should make this impossible
             else:
                 precise_dec += 1
-                ep_cost += c_precise
 
         if info.get("all_reached"):
             n["success"] += 1
@@ -153,7 +157,7 @@ def print_table(results: dict[str, dict]) -> None:
         ("collision rate",      "collision_rate",  "{:.1%}"),
         ("timeout rate",        "timeout_rate",    "{:.1%}"),
         ("avg decisions/ep",    "avg_decisions",   "{:.1f}"),
-        ("avg control cost/ep", "avg_cost",        "{:.1f}"),
+        ("avg path length/ep",  "avg_cost",        "{:.1f}"),
         ("coarse fraction",     "coarse_frac",     "{:.1%}"),
         ("safe-coarse avail.",  "safe_avail_frac", "{:.1%}"),
         ("coarse breaches (!)", "coarse_breach",   "{:d}"),
@@ -176,8 +180,6 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=1000)
     ap.add_argument("--d-safe", type=float, default=0.3)
     ap.add_argument("--progress-threshold", type=float, default=0.05)
-    ap.add_argument("--c-coarse", type=float, default=1.0)
-    ap.add_argument("--c-precise", type=float, default=6.0)
     args = ap.parse_args()
 
     device = torch.device("cpu")
@@ -194,9 +196,7 @@ def main() -> None:
             d_safe=args.d_safe, progress_threshold=args.progress_threshold,
         )
         print(f"\nRunning {mode} for {args.episodes} episodes ...")
-        results[mode] = run_policy(
-            env, policy, args.episodes, args.seed, args.c_coarse, args.c_precise
-        )
+        results[mode] = run_policy(env, policy, args.episodes, args.seed)
 
     print_table(results)
     if any(r["coarse_breach"] > 0 for r in results.values()):
