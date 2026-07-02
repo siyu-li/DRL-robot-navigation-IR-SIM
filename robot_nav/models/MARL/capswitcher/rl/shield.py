@@ -194,15 +194,20 @@ def evaluate_coarse_group(
     group: int,
     geom: ShieldGeometry,
     d_safe: float,
+    seed: int | None = None,
 ) -> CoarseCandidate:
     """
     Build the coarse frames for ``group`` and vet them with the lookahead.
 
     The returned ``frames`` are exactly the ones that must be executed (the
     primitive's column drop is random, so re-generating would vet a different
-    plan than the one run).
+    plan than the one run).  Pass ``seed`` to make the drop deterministic given
+    (state, group) — the MPC lookahead uses this so the plan it scores at a node
+    is the same plan it would execute there.
     """
-    rotation_frames, translation_frames = coarse.compute_actions(robot_state, group)
+    rotation_frames, translation_frames = coarse.compute_actions(
+        robot_state, group, seed=seed
+    )
     samples = swept_positions(
         robot_state, rotation_frames, translation_frames, coarse.step_time
     )

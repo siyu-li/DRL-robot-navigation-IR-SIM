@@ -1,22 +1,21 @@
 """
-Ablation harness for the shielded switcher policies P0 and P1.
+Evaluation harness for the fixed-depth receding-horizon MPC switcher.
 
-Runs each rule-based policy (no learning) over a matched set of episodes on top
-of the hard safety shield and reports the metrics that answer "is there a
-sequential efficiency trade-off worth RL?":
+Runs the MPC switcher at several lookahead depths against the two mode-only
+baselines (precise-only, coarse-only) over a matched set of seeded episodes on
+6 robots / 3 coarse groups, and reports the metrics that answer "does sequential
+lookahead help?":
 
   * success / collision / timeout rates,
   * coarse vs precise usage and travel distance (path length, all robots),
   * shield availability (fraction of decisions with >=1 safe coarse group),
-  * shield integrity (collisions that occurred *during* a coarse decision — these
-    should be ~0; any non-zero count means d_safe / geometry is miscalibrated).
+  * shield integrity (collisions *during* a coarse decision — should be ~0).
 
-Read the comparison as:
-  P0 ~= P1            -> the steerability/progress axis does not matter; ship P0.
-  P1 better than P0   -> "coarse only when productive" helps (build P2 = RL next).
+Decision gate: if MPC-d2/d3 does not beat MPC-d1 on precise fraction at equal
+success, sequential lookahead adds nothing here (stop before AlphaZero).
 
 Usage (run on the GPU box — local irsim step crashes; see project memory):
-    python -m robot_nav.eval_shield --episodes 100
+    python -m robot_nav.eval_mpc --episodes 100 --depths 1 2 3
 """
 
 from __future__ import annotations
@@ -32,16 +31,19 @@ from loguru import logger
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 from robot_nav.models.MARL.capswitcher.policies.gat_backbone import GATBackbone
 from robot_nav.models.MARL.capswitcher.policies.coarse_steering import CoarseSteering
+from robot_nav.models.MARL.capswitcher.rl.reward import PathCostReward
 from robot_nav.models.MARL.capswitcher.rl.switcher_env import SwitcherEnv
-from robot_nav.models.MARL.capswitcher.rl.shielded_policy import ShieldedSwitcher
+from robot_nav.models.MARL.capswitcher.rl.mpc.mpc_switcher import MPCSwitcher
 
 logger.disable("irsim")
 
 COARSE, PRECISE = 0, 1
 
 
-def build_env(device: torch.device) -> tuple[SwitcherEnv, CoarseSteering, MARL_SIM_OBSTACLE]:
-    """Construct sim + backbone + coarse + env to match the training script."""
+def build_env(
+    device: torch.device, move_distance: float
+) -> tuple[SwitcherEnv, CoarseSteering, MARL_SIM_OBSTACLE]:
+    """Construct sim + backbone + coarse + env (mirrors eval_shield.build_env)."""
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle.yaml",
         disable_plotting=True,
@@ -53,7 +55,8 @@ def build_env(device: torch.device) -> tuple[SwitcherEnv, CoarseSteering, MARL_S
     backbone = GATBackbone(
         checkpoint_path=Path(
             "robot_nav/models/MARL/marlTD3/checkpoint/"
-            "Mar.04_obstacle_14robots_partial_inactive/TD3-MARL-obstacle-14robots-partial-inactive_epoch210"
+            "Mar.04_obstacle_14robots_partial_inactive/"
+            "TD3-MARL-obstacle-14robots-partial-inactive_epoch210"
         ),
         num_robots=sim.num_robots,
         num_obstacles=sim.num_obstacles,
@@ -62,7 +65,7 @@ def build_env(device: torch.device) -> tuple[SwitcherEnv, CoarseSteering, MARL_S
     )
     coarse = CoarseSteering(
         num_robots=sim.num_robots,
-        move_distance=1.5,
+        move_distance=move_distance,
         method="nonlinear",
         step_time=sim.env.step_time,
         ang_max=1.0,
@@ -74,25 +77,20 @@ def build_env(device: torch.device) -> tuple[SwitcherEnv, CoarseSteering, MARL_S
         coarse_steering=coarse,
         selection_interval=5,
         max_decisions=60,
+        reward_fn=PathCostReward(),
         device=device,
-        terminate_on_oob=False,      # OOB is logged but does NOT end the episode
+        terminate_on_oob=False,
     )
     return env, coarse, sim
 
 
-def run_policy(
-    env: SwitcherEnv,
-    policy: ShieldedSwitcher,
-    episodes: int,
-    base_seed: int,
-) -> dict:
-    """Run ``policy`` for ``episodes`` paired (seeded) episodes, collect stats.
+def run(env: SwitcherEnv, decide_fn, episodes: int, base_seed: int) -> dict:
+    """
+    Run ``decide_fn`` for ``episodes`` seeded episodes and collect stats.
 
-    The per-episode cost reported is **travel distance** (path length), summed
-    over all robots and accumulated over the episode: precise = 11.7 fixed per
-    decision, coarse = n_members_moved * move_distance.  This is exactly the
-    quantity ``SwitcherEnv`` exposes as ``info["path_cost"]`` and the same one
-    ``PathCostReward`` penalises during CAPSwitcher training.
+    ``decide_fn(env) -> {"mode", "group", "frames", "candidates"}``.  Per-episode
+    cost is travel distance (``info["path_cost"]``), summed over robots and the
+    episode — the same quantity ``PathCostReward`` penalises during training.
     """
     n = {"success": 0, "collision": 0, "timeout": 0}
     coarse_dec = precise_dec = total_dec = 0
@@ -104,13 +102,16 @@ def run_policy(
         random.seed(seed)
         np.random.seed(seed)
         env.coarse.rng = np.random.default_rng(seed)
+        env._coarse_rng = np.random.default_rng(seed)  # coarse-only group choice
 
-        obs = env.reset()  # noqa: F841 (shield reads env._robot_state directly)
+        env.reset()
         done = False
         ep_cost, ep_len = 0.0, 0
+        info: dict = {}
         while not done:
-            decision = policy.decide(env._robot_state)
-            if any(c.safe for c in decision["candidates"]):
+            decision = decide_fn(env)
+            cands = decision.get("candidates") or []
+            if any(getattr(c, "safe", False) for c in cands):
                 safe_available += 1
 
             _, _, done, info = env.step(
@@ -118,11 +119,11 @@ def run_policy(
             )
             ep_len += 1
             total_dec += 1
-            ep_cost += float(info["path_cost"])  # travel distance, all robots
+            ep_cost += float(info["path_cost"])
             if decision["mode"] == COARSE:
                 coarse_dec += 1
                 if info["collision"]:
-                    coarse_breach += 1  # shield should make this impossible
+                    coarse_breach += 1
             else:
                 precise_dec += 1
 
@@ -143,21 +144,39 @@ def run_policy(
         "avg_decisions": float(np.mean(lengths)),
         "avg_cost": float(np.mean(costs)),
         "coarse_frac": coarse_dec / max(total_dec, 1),
-        "coarse_dec": coarse_dec,
-        "precise_dec": precise_dec,
+        "precise_frac": precise_dec / max(total_dec, 1),
         "safe_avail_frac": safe_available / max(total_dec, 1),
         "coarse_breach": coarse_breach,
     }
 
 
+# ---- decision sources -----------------------------------------------------
+
+def _precise_only(env: SwitcherEnv) -> dict:
+    return {"mode": PRECISE, "group": None, "frames": None, "candidates": []}
+
+
+def _coarse_only(env: SwitcherEnv) -> dict:
+    # group=None → SwitcherEnv picks a uniform-random selectable group.
+    return {"mode": COARSE, "group": None, "frames": None, "candidates": []}
+
+
+def _mpc_decider(policy: MPCSwitcher):
+    def decide(env: SwitcherEnv) -> dict:
+        return policy.decide(env._robot_state)
+
+    return decide
+
+
 def print_table(results: dict[str, dict]) -> None:
-    """Print a side-by-side comparison of the policy result dicts."""
+    """Side-by-side comparison of the result dicts."""
     rows = [
         ("success rate",        "success_rate",    "{:.1%}"),
         ("collision rate",      "collision_rate",  "{:.1%}"),
         ("timeout rate",        "timeout_rate",    "{:.1%}"),
         ("avg decisions/ep",    "avg_decisions",   "{:.1f}"),
         ("avg path length/ep",  "avg_cost",        "{:.1f}"),
+        ("precise fraction",    "precise_frac",    "{:.1%}"),
         ("coarse fraction",     "coarse_frac",     "{:.1%}"),
         ("safe-coarse avail.",  "safe_avail_frac", "{:.1%}"),
         ("coarse breaches (!)", "coarse_breach",   "{:d}"),
@@ -178,25 +197,46 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--episodes", type=int, default=100)
     ap.add_argument("--seed", type=int, default=1000)
+    ap.add_argument("--depths", type=int, nargs="+", default=[1, 2, 3])
     ap.add_argument("--d-safe", type=float, default=0.3)
-    ap.add_argument("--progress-threshold", type=float, default=0.05)
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="cost-to-go slope; default precise_cost/(lin_max·step_time)")
+    ap.add_argument("--move-distance", type=float, default=1.5)
+    ap.add_argument("--goal-threshold", type=float, default=0.3)
+    ap.add_argument("--baselines", action="store_true",
+                    help="also run precise-only and coarse-only baselines")
     args = ap.parse_args()
 
     device = torch.device("cpu")
-    env, coarse, sim = build_env(device)
+    env, coarse, sim = build_env(device, move_distance=args.move_distance)
     print(
         f"Env: {sim.num_robots} robots, {sim.num_obstacles} obstacles, "
-        f"move_distance={coarse.move_distance}, d_safe={args.d_safe}"
+        f"move_distance={coarse.move_distance}, d_safe={args.d_safe}, "
+        f"alpha={args.alpha}, depths={args.depths}"
     )
 
-    results = {}
-    for mode in ("P0", "P1"):
-        policy = ShieldedSwitcher(
-            coarse, sim, mode=mode,
-            d_safe=args.d_safe, progress_threshold=args.progress_threshold,
+    results: dict[str, dict] = {}
+
+    if args.baselines:
+        print(f"\nRunning precise-only for {args.episodes} episodes ...")
+        results["precise"] = run(env, _precise_only, args.episodes, args.seed)
+        print(f"Running coarse-only for {args.episodes} episodes ...")
+        results["coarse"] = run(env, _coarse_only, args.episodes, args.seed)
+
+    for d in args.depths:
+        policy = MPCSwitcher(
+            backbone=env.backbone,
+            coarse=coarse,
+            sim=sim,
+            depth=d,
+            d_safe=args.d_safe,
+            alpha=args.alpha,
+            selection_interval=env.selection_interval,
+            goal_threshold=args.goal_threshold,
+            reward_fn=env.reward_fn,
         )
-        print(f"\nRunning {mode} for {args.episodes} episodes ...")
-        results[mode] = run_policy(env, policy, args.episodes, args.seed)
+        print(f"\nRunning MPC-d{d} for {args.episodes} episodes ...")
+        results[f"MPC-d{d}"] = run(env, _mpc_decider(policy), args.episodes, args.seed)
 
     print_table(results)
     if any(r["coarse_breach"] > 0 for r in results.values()):

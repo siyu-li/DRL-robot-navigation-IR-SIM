@@ -169,7 +169,9 @@ class CoarseSteering:
 
     # ------------------------------------------------------------------
 
-    def _reduce_A(self, group: int) -> np.ndarray:
+    def _reduce_A(
+        self, group: int, rng: np.random.Generator | None = None
+    ) -> np.ndarray:
         """
         Build the rank-2 reduced actuation matrix for the chosen group.
 
@@ -178,13 +180,19 @@ class CoarseSteering:
 
         Args:
             group: 1-based chosen group id.
+            rng:   Optional RNG for the random column drop.  When ``None`` the
+                   instance RNG ``self.rng`` is used (the legacy behaviour);
+                   passing a seeded generator makes the drop — and therefore the
+                   whole coarse control — deterministic given (state, group),
+                   which the MPC lookahead relies on.
 
         Returns:
             A_reduced: (N, 2) actuation matrix.
         """
+        r = rng if rng is not None else self.rng
         g = group - 1
         remaining = [c for c in range(_NUM_GROUPS) if c != g]  # 3 columns
-        drop = int(self.rng.choice(remaining))
+        drop = int(r.choice(remaining))
         keep = [c for c in remaining if c != drop]  # 2 columns
         return self.A_full[:, keep]
 
@@ -250,7 +258,7 @@ class CoarseSteering:
     # ------------------------------------------------------------------
 
     def compute_actions(
-        self, robot_state: np.ndarray, group: int
+        self, robot_state: np.ndarray, group: int, seed: int | None = None
     ) -> tuple[list[list[list[float]]], list[list[float]]]:
         """
         Compute the sim-input action frames for one coarse control of ``group``.
@@ -266,6 +274,10 @@ class CoarseSteering:
                     9, 10 : gx, gy       — goal position
             group: 1-based id of the activated coarse group (must be selectable;
                 see :meth:`selectable_groups`).
+            seed: Optional seed for the random rank-2 column drop.  When ``None``
+                the instance RNG is used (legacy stochastic behaviour); passing a
+                seed makes the control deterministic given (state, group) so the
+                MPC lookahead vets exactly the plan it will later execute.
 
         Returns:
             rotation_frames: list of ``n_rot`` frames, each a list of N
@@ -294,7 +306,8 @@ class CoarseSteering:
         d_theta_desired = _angle_wrap(theta_desired - theta_current)  # (N,)
 
         members = self._members[group - 1]
-        A_reduced = self._reduce_A(group)
+        rng = np.random.default_rng(seed) if seed is not None else None
+        A_reduced = self._reduce_A(group, rng=rng)
 
         d_theta_actual = self._solve_rotation(
             A_reduced, theta_current, d_theta_desired, px, py, gx, gy, members

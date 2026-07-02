@@ -51,10 +51,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from robot_nav.models.MARL.capswitcher.rl.reward import (
-    StepPenaltyReward,
-    SwitcherReward,
-)
+from robot_nav.models.MARL.capswitcher.rl.reward import PathCostReward
 
 
 def _outside_bounds(poses: list, sim) -> bool:
@@ -97,7 +94,7 @@ class SwitcherEnv:
         coarse_steering,
         selection_interval: int = 5,
         max_decisions: int = 80,
-        reward_fn: SwitcherReward | StepPenaltyReward | None = None,
+        reward_fn: PathCostReward | None = None,
         device: torch.device = torch.device("cpu"),
         terminate_on_oob: bool = True,
     ) -> None:
@@ -106,7 +103,7 @@ class SwitcherEnv:
         self.coarse = coarse_steering
         self.selection_interval = selection_interval
         self.max_decisions = max_decisions
-        self.reward_fn = reward_fn if reward_fn is not None else SwitcherReward()
+        self.reward_fn = reward_fn if reward_fn is not None else PathCostReward()
         self.device = device
         self.terminate_on_oob = terminate_on_oob
 
