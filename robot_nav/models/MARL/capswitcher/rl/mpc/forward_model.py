@@ -98,6 +98,10 @@ class ForwardModel:
         goal_threshold:     Per-robot goal-arrival radius (m) for ``all_reached``.
         reward_fn:          ``PathCostReward`` supplying the per-decision motion cost
                             (defaults to the eval configuration).
+        leaf_value:         Optional learned leaf evaluator ``(model, ms) -> float``
+                            (e.g. :class:`LearnedCostToGo`).  When set,
+                            :meth:`cost_to_go` dispatches to it instead of the
+                            crude analytic heuristic.
     """
 
     def __init__(
@@ -113,6 +117,7 @@ class ForwardModel:
         d_safe: float = 0.3,
         goal_threshold: float = 0.3,
         reward_fn: PathCostReward | None = None,
+        leaf_value=None,
     ) -> None:
         self.backbone = backbone
         self.coarse = coarse
@@ -125,6 +130,7 @@ class ForwardModel:
         self.d_safe = float(d_safe)
         self.goal_threshold = float(goal_threshold)
         self.reward_fn = reward_fn if reward_fn is not None else PathCostReward()
+        self.leaf_value = leaf_value
 
         self.N = self.goals.shape[0]
 
@@ -346,12 +352,19 @@ class ForwardModel:
 
     def cost_to_go(self, ms: ModelState, alpha: float | None = None) -> float:
         """
-        Heuristic cost-to-go: finish precisely, one robot at a time.
+        Leaf cost-to-go.
+
+        With a configured ``leaf_value`` (learned per-robot precise cost-to-go,
+        summed over unreached robots) that evaluator is used and ``alpha`` is
+        ignored.  Otherwise the crude analytic heuristic — finish precisely, one
+        robot at a time:
 
         ``H(x) = α · Σ_i ‖p_i − goal_i‖`` with default
         ``α = precise_cost / (lin_max · step_time)`` — ``precise_cost`` charged per
         sub-step, one sub-step advancing a robot ``lin_max · step_time`` metres.
         """
+        if self.leaf_value is not None:
+            return float(self.leaf_value(self, ms))
         if alpha is None:
             alpha = self.reward_fn.precise_cost / (self.lin_max * self.step_time)
         return float(alpha) * float(np.sum(self.goal_distances(ms)))

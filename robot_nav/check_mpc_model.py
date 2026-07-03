@@ -60,38 +60,43 @@ def main() -> None:
     precise_xy = precise_th = 0.0
     n_coarse = n_precise = 0
 
+    # Drive with a SAFE policy — coarse only when the shield vets a group safe,
+    # else precise — so executed steps don't collide (a collision ends the episode
+    # before anything is measured).  Alternate the preference so both modes get
+    # sampled.  For each executed step, predict end-poses from the model at the
+    # decision state, execute the *same* action, and compare.
     for ep in range(args.episodes):
         np.random.seed(args.seed + ep)
         env.coarse.rng = np.random.default_rng(args.seed + ep)
         env.reset()
 
-        for _ in range(20):
+        prefer_coarse = True
+        for _ in range(40):
             rs = env._robot_state
             model = switcher._build_model(rs)
             ms = ForwardModel.state_from_robot_state(rs)
 
-            # --- Coarse: pick a selectable group, predict, execute exact frames ---
-            group = int(coarse.selectable_groups()[0])
-            move = model.coarse_moves(ms)[group]
-            pred = move.next_state.poses.copy()
-            _, _, done, info = env.step(0, group=group, frames=move.candidate.frames)
-            if not (info["collision"] or info["oob"]):
-                dxy, dth = _pose_err(pred, _sim_poses(env))
-                coarse_xy = max(coarse_xy, dxy); coarse_th = max(coarse_th, dth)
-                n_coarse += 1
-            if done:
-                break
+            safe = [m for m in model.coarse_moves(ms).values() if m.candidate.safe]
+            use_coarse = prefer_coarse and len(safe) > 0
+            prefer_coarse = not prefer_coarse
 
-            # --- Precise: predict all-robots rollout, execute, compare ---
-            rs = env._robot_state
-            model = switcher._build_model(rs)
-            ms = ForwardModel.state_from_robot_state(rs)
-            pred = model.precise_next(ms).poses.copy()
-            _, _, done, info = env.step(1)
-            if not (info["collision"] or info["oob"]):
-                dxy, dth = _pose_err(pred, _sim_poses(env))
-                precise_xy = max(precise_xy, dxy); precise_th = max(precise_th, dth)
-                n_precise += 1
+            if use_coarse:
+                move = safe[0]
+                pred = move.next_state.poses.copy()
+                _, _, done, info = env.step(
+                    0, group=move.candidate.group, frames=move.candidate.frames
+                )
+                if not (info["collision"] or info["oob"]):
+                    dxy, dth = _pose_err(pred, _sim_poses(env))
+                    coarse_xy = max(coarse_xy, dxy); coarse_th = max(coarse_th, dth)
+                    n_coarse += 1
+            else:
+                pred = model.precise_next(ms).poses.copy()
+                _, _, done, info = env.step(1)
+                if not (info["collision"] or info["oob"]):
+                    dxy, dth = _pose_err(pred, _sim_poses(env))
+                    precise_xy = max(precise_xy, dxy); precise_th = max(precise_th, dth)
+                    n_precise += 1
             if done:
                 break
 

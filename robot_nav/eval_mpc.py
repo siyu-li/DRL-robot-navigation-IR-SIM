@@ -205,6 +205,9 @@ def main() -> None:
     ap.add_argument("--goal-threshold", type=float, default=0.3)
     ap.add_argument("--baselines", action="store_true",
                     help="also run precise-only and coarse-only baselines")
+    ap.add_argument("--value-model", type=str, default=None,
+                    help="learned cost-to-go checkpoint (train_value.py); when set, "
+                         "each depth also runs with the learned leaf (rows MPC-d*+v)")
     args = ap.parse_args()
 
     device = torch.device("cpu")
@@ -212,8 +215,16 @@ def main() -> None:
     print(
         f"Env: {sim.num_robots} robots, {sim.num_obstacles} obstacles, "
         f"move_distance={coarse.move_distance}, d_safe={args.d_safe}, "
-        f"alpha={args.alpha}, depths={args.depths}"
+        f"alpha={args.alpha}, depths={args.depths}, value_model={args.value_model}"
     )
+
+    leaf_value = None
+    if args.value_model:
+        from robot_nav.models.MARL.capswitcher.rl.value_net import LearnedCostToGo
+
+        leaf_value = LearnedCostToGo(args.value_model, device=device)
+        print(f"Learned leaf: feature={leaf_value.feature}, "
+              f"precise_cost={leaf_value.precise_cost}")
 
     results: dict[str, dict] = {}
 
@@ -224,19 +235,23 @@ def main() -> None:
         results["coarse"] = run(env, _coarse_only, args.episodes, args.seed)
 
     for d in args.depths:
-        policy = MPCSwitcher(
-            backbone=env.backbone,
-            coarse=coarse,
-            sim=sim,
-            depth=d,
-            d_safe=args.d_safe,
-            alpha=args.alpha,
-            selection_interval=env.selection_interval,
-            goal_threshold=args.goal_threshold,
-            reward_fn=env.reward_fn,
-        )
-        print(f"\nRunning MPC-d{d} for {args.episodes} episodes ...")
-        results[f"MPC-d{d}"] = run(env, _mpc_decider(policy), args.episodes, args.seed)
+        variants = [("", None)] + ([("+v", leaf_value)] if leaf_value else [])
+        for tag, leaf in variants:
+            policy = MPCSwitcher(
+                backbone=env.backbone,
+                coarse=coarse,
+                sim=sim,
+                depth=d,
+                d_safe=args.d_safe,
+                alpha=args.alpha,
+                selection_interval=env.selection_interval,
+                goal_threshold=args.goal_threshold,
+                reward_fn=env.reward_fn,
+                leaf_value=leaf,
+            )
+            name = f"MPC-d{d}{tag}"
+            print(f"\nRunning {name} for {args.episodes} episodes ...")
+            results[name] = run(env, _mpc_decider(policy), args.episodes, args.seed)
 
     print_table(results)
     if any(r["coarse_breach"] > 0 for r in results.values()):

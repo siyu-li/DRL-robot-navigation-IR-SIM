@@ -80,29 +80,9 @@ and apply `dθ_actual = A_reduced · t*` to **all** robots. The chosen group's *
 ### Primary Goal
 Demonstrate that a learned CAPSwitcher, choosing between least-squares coarse steering and a GAT-based precise policy, produces more physically efficient multi-robot navigation than either control mode alone.
 
-### Specific Objectives
-
-1. **Validate coarse steering.** Show that least-squares (or nonlinear-optimized) steering over a rank-deficient actuation matrix produces meaningful forward progress in free space. Compare least-squares heading optimization vs. nonlinear progress optimization.
-
-2. **Train the CAPSwitcher.** Train an RL-based switcher that takes state information (via frozen GAT embeddings with a learned projection) and outputs a binary decision: coarse or precise. The reward must capture both goal-reaching and physical efficiency.
-
-3. **Demonstrate emergent coarse-to-fine behavior.** Show that the switcher learns to use coarse control in open space and transitions to precise control near obstacles and the goal, without this behavior being hard-coded.
-
-4. **Quantify efficiency gains.** Compare against baselines on total physical distance traveled, success rate, and planning time.
-
-### Baselines
-- **Baseline 1 — Precise only:** Always use the GAT individual policy. Expected: high success rate, high physical waste.
-- **Baseline 2 — Coarse only:** Always use least-squares coarse steering. Expected: efficient in open space, fails near obstacles.
-- **Baseline 3 — Heuristic switcher:** Clearance-threshold switching (coarse if clearance > threshold, else precise). Expected: reasonable performance, but rigid boundary.
-
-### Evaluation Metrics
-- **Success rate:** fraction of episodes where all robots reach their goals.
-- **Physical efficiency:** total distance traveled by all robots / sum of straight-line distances to goals.
-- **Switching profile:** visualization of when/where the switcher selects coarse vs. precise control.
-
 ---
 
-## 4. GAT Backbone Analysis & CAPSwitcher Architecture
+## 4. GAT Backbone Analysis 
 
 ### 4.1 GAT Backbone Layer-by-Layer Summary
 
@@ -173,111 +153,35 @@ Policy Head (in ActorObstacle)              (DISCARD for switching)
 
 > **Note (revised):** the default switcher input is the **per-robot decoder output** `H` (`attn_out`), not the pre-decoder embedding. Because the GAT and TD3 policy were trained *jointly*, neither tap is truly task-agnostic; the decoder output additionally encodes "what the navigation policy wants to do here", which is itself diagnostic of when precise control is needed. `embedding_source` makes the tap configurable for ablation. Crucially, the per-robot embeddings are **kept unpooled** — the switcher head learns its own permutation-invariant aggregation (Deep Sets), because the per-robot navigation embeddings were never trained to be summarizable under a fixed pool.
 
-### 4.3 Updated CAPSwitcher Architecture
+### 5 capswitcher-direction
 
-```
-                        GAT Backbone (ALL FROZEN)
-                        ┌─────────────────────────────────────────────────┐
-robot_obs (B,N,11) ────▶│  Node Encoder → Hard Attention → Soft Message  │
-obstacle_obs (B,M,4)    │  Passing → decoder (decode_1/2)                 │
-                        │                      ↓                          │
-                        │   decoder output H (attn_out)   (B·N, 512)      │
-                        └───────────────────┬─────────────────────────────┘
-                                            │ detach + reshape (NO pooling)
-                                            ▼
-                                     (B, N, 512)         Deep Sets Q-Net (TRAINED)
-                                            │  ┌────────────────────────────────┐
-                                            └─▶│  φ per-robot: 512→256→128       │
-                                               │  aggregate: sum ⊕ max  (256)    │
-                                               │  ρ: 256→128→2                   │
-                                               │  → Q(coarse), Q(precise)        │
-                                               │  argmax / ε-greedy  (Double-DQN)│
-                                               └────────────────────────────────┘
-                                                          │
-                        ┌──────────────────────┐          │  ┌────────────────────────────┐
-                        │  Coarse Steering     │◀ action=0┘  │  Precise (frozen GAT)      │
-                        │  rotate (A·t*) + move│   action=1 ▶│  sequential per-robot actor│
-                        │  members; LS / NL    │             │  (others hold still)       │
-                        └──────────────────────┘             └────────────────────────────┘
-```
+CAPSwitcher = learned switcher between **coarse** (efficient, rank-deficient/unsteerable group
+control) and **precise** (frozen GAT per-robot navigation, expensive) for a coupled unicycle
+swarm. Objective: minimize precise usage / physical cost subject to safety. 6 robots, 3 coarse groups.
 
-### 4.4 Training Setup (Revised)
+The DQN switcher failed (collapsed to precise). Direction now **decouples** the problem:
+- **Safety** = local, exact via forward-sim shield (`rl/shield.py`) → scales to large swarms.
+- **Efficiency** = global sequential planning.
 
-| Module | Weights | Updated during switcher training? |
-|---|---|---|
-| `AttentionObstacle` (all 4 stages) | Pre-trained TD3Obstacle actor | **No — fully frozen** |
-| `ActorObstacle.policy_head` | Pre-trained TD3Obstacle | **No — used only for precise actions** |
-| `DeepSetsQNet` (φ 512→256→128, sum⊕max, ρ→2) | Random init | **Yes — Double-DQN** |
+**Done (2026-07 branch `CAPSwitcher`):** a fixed-depth receding-horizon MPC baseline (minimin
+lookahead over an analytic pose-model, since the irsim sim can't be branched). New code in
+`robot_nav/models/MARL/capswitcher/rl/mpc/` + `robot_nav/eval_mpc.py` + `robot_nav/check_mpc_model.py`.
+Result (100 eps): MPC-d3 beats precise-only — path 935 vs 1502 (−38%), success 94% vs 88%, monotone
+in depth; shield gives 0 coarse breaches (residual ~3% collisions are precise-policy artifacts).
+Decision gate passed: lookahead helps → proceed to learned value / AlphaZero.
 
-- The per-robot decoder output `H` is obtained from a single frozen forward (`embedding_utils.extract_embeddings_and_actions`, which returns precise actions **and** `H` together).
-- The backbone forward pass is run with `torch.no_grad()` during switcher training; the env caches it so each distinct state is forwarded at most once.
-- Only the **`DeepSetsQNet`** parameters are passed to the Adam optimizer; training is **off-policy** (replay buffer of per-robot `(N, 512)` observations), chosen over PPO for sample efficiency on this binary decision.
+**Next (chosen direction): value decomposition.** Replace the crude leaf heuristic
+`ĥ = α·Σ‖p−goal‖` with a learned value. Step 1 = supervised **per-robot precise cost-to-go**
+`v_ψ(s_i)` collected from 6-robot rollouts with **3 robots held static** and **3 driven by the
+precise policy** (3 labeled trajectories/run; static robots act as neighbors so `e_i` reflects
+multi-robot attention) — MC returns.
+Then `ĥ_precise = pool_i v_ψ(e_i)` (DeepSets sum⊕max) as leaf value; then optional residual
+`V_θ` (per-robot / per-group / whole-swarm) for coupling + coarse savings; then AlphaZero.
 
-### 4.5 Reward (decision-level)
+Key insights: safety is **local** (scales); efficiency/value is **global + coarse-group-structure
+dependent** (does NOT zero-shot transfer). Decomposition base scales; residual is the small
+non-scalable optional part. GAT embedding `e_i` fits the per-robot term (its home turf), not a
+global summary. Precise-all cost ≈ bottleneck/**max** not sum → current `ĥ=Σ` is mis-modeled; let
+DeepSets learn the pool. `v_ψ` is an upper bound (ignores coarse); residual ≤0 = coarse savings.
 
-The reward is computed **once per switcher decision** (one `SwitcherEnv.step`), *not* summed over the sub-steps a mode expands into. This makes it agnostic to how many sim sub-steps a mode consumes (coarse ≈ 10–14, sequential precise = N×5 = 30 for 6 robots), so sub-step count does not bias the value function. From `rl/reward.py` (`SwitcherReward`):
-
-```
-r =  k_p · Σ_i (d_start_i − d_end_i)     # progress, summed over robots (telescoping)
-   − Σ_i (cl_penalty_i + obs_penalty_i)  # robot–robot + obstacle proximity, at decision end
-   + step_penalty(action)                # coarse = −0.5, precise = −3.0
-   + R_collision (−100)  if any collision     # terminal, exclusive of shaping
-   + R_allgoal  (+200)   if all reached        # terminal, exclusive of shaping
-```
-
-Defaults: `k_p=1.0`, `coarse_penalty=−0.5`, `precise_penalty=−3.0`, `r_collision=−100`, `r_allgoal=+200`. Progress telescopes to `initial − final` total distance over a fixed-goal episode, so mode choice is driven by the step penalties and the collision/clearance terms — exactly the physical-efficiency trade-off the switcher should learn. The per-decision proximity penalties come from `MARL_SIM_OBSTACLE.proximity_penalties()`. (The simulator's `reward_phase=6` is used only for backbone state preparation, not for the switcher reward.)
-
----
-
-## 5. Workspace Architecture
-
-```
-robot_nav/models/MARL/capswitcher/
-│
-├── capswitcher_project_summary.md     # This document
-├── __init__.py                        # Package exports (DQN API)
-├── embedding_utils.py                 # Single frozen forward → (precise actions, H, attn)
-│                                      #   - extract_embeddings_and_actions(..., embedding_source)
-│
-├── policies/
-│   ├── coarse_steering.py             # Two-phase coarse group steering
-│   │                                  #   - rotate all robots: dθ = A_reduced · t*
-│   │                                  #     (least_squares pinv OR nonlinear BFGS)
-│   │                                  #   - move chosen group's MEMBERS by move_distance
-│   │                                  #   - rotation/translation split into sub-step frames
-│   │                                  #   - group-dependent random rank-2 reduction
-│   ├── gat_backbone.py                # GAT backbone wrapper (FROZEN)
-│   │                                  #   - Loads TD3Obstacle actor, freezes all params
-│   │                                  #   - get_embedding_and_actions() → (raw_actions, H)
-│   │                                  #   - embedding_source: "decoder" (default) | "pre_decoder"
-│   ├── deep_sets_head.py              # DeepSetsHead: φ → (sum⊕max) → ρ  (reusable readout)
-│   └── cap_switcher.py                # SwitcherHead — LEGACY mean-pool MLP (unused by DQN)
-│
-├── rl/
-│   ├── switcher_env.py                # SwitcherEnv: Gym-like wrapper (DQN)
-│   │                                  #   - obs: per-robot (N, 512) decoder output (unpooled)
-│   │                                  #   - step(action): coarse (group frames) OR precise
-│   │                                  #     (sequential per-robot GAT); budget in DECISIONS
-│   │                                  #   - decision-level reward via SwitcherReward
-│   │                                  #   - forward-pass cache (1 forward / distinct state)
-│   ├── switcher_dqn.py                # Double-DQN trainer
-│   │                                  #   - DeepSetsQNet (per-robot → sum⊕max → Q-values)
-│   │                                  #   - ReplayBuffer of per-robot (N, 512) obs
-│   │                                  #   - ε-greedy, target net, smooth-L1 TD loss
-│   └── reward.py                      # SwitcherReward — decision-level reward (see §4.5)
-│
-└── runs/                              # TensorBoard logs
-```
-
-> Not present (planned in earlier drafts but not in the tree): `config/`, `experiments/`, `utils/`, `checkpoints/`, `rl/switcher_ppo.py`. The training entry point is `robot_nav/marl_train_capswitcher.py`; checkpoints are written under `checkpoints/cap_switcher/` at save time.
-
-### Key File Responsibilities
-
-| File | Frozen? | What it does |
-|---|---|---|
-| `gat_backbone.py` | Yes (all weights) | Wraps the TD3Obstacle actor; `get_embedding_and_actions` returns per-robot decoder output `H` + precise actions |
-| `deep_sets_head.py` | No (trained) | Permutation-invariant readout: per-robot φ → sum⊕max → ρ (reused by `DeepSetsQNet`) |
-| `cap_switcher.py` | No | **Legacy** mean-pool MLP head; superseded by the Deep Sets DQN, kept for reference |
-| `coarse_steering.py` | N/A (no weights) | Two-phase rotate (`A·t*`, LS/nonlinear) + move-members coarse control, split into sub-step frames |
-| `rl/switcher_env.py` | N/A | Environment loop; coarse (group frames) or sequential precise; decision-level reward |
-| `rl/switcher_dqn.py` | No (trained) | Double-DQN update loop for `DeepSetsQNet` only |
+Plan file: `/Users/siyuli/.claude/plans/i-would-like-to-quirky-sutton.md`. See [[run-environment]].

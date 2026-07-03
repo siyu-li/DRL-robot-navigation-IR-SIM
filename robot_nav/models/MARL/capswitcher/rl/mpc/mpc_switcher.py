@@ -44,6 +44,9 @@ class MPCSwitcher:
         reward_fn:          ``PathCostReward`` supplying the motion cost (defaults
                             to the eval configuration).
         default_rho:        Fallback robot radius if the sim does not expose one.
+        leaf_value:         Optional learned leaf evaluator ``(model, ms) -> float``
+                            (e.g. ``LearnedCostToGo``); replaces the crude
+                            cost-to-go heuristic at the horizon.
     """
 
     def __init__(
@@ -58,6 +61,7 @@ class MPCSwitcher:
         goal_threshold: float = 0.3,
         reward_fn: PathCostReward | None = None,
         default_rho: float = 0.2,
+        leaf_value=None,
     ) -> None:
         self.backbone = backbone
         self.coarse = coarse
@@ -69,6 +73,7 @@ class MPCSwitcher:
         self.goal_threshold = float(goal_threshold)
         self.reward_fn = reward_fn if reward_fn is not None else PathCostReward()
         self.default_rho = float(default_rho)
+        self.leaf_value = leaf_value
 
     def _build_model(self, robot_state: np.ndarray) -> ForwardModel:
         """Rebuild the forward model from the current sim + passed root state."""
@@ -86,6 +91,7 @@ class MPCSwitcher:
             d_safe=self.d_safe,
             goal_threshold=self.goal_threshold,
             reward_fn=self.reward_fn,
+            leaf_value=self.leaf_value,
         )
 
     def decide(self, robot_state: np.ndarray) -> dict:
