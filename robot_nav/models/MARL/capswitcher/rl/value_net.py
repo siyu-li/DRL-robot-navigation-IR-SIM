@@ -49,12 +49,15 @@ class PerRobotValue(nn.Module):
     :class:`LearnedCostToGo` (and learned pooling is a later step).
     """
 
-    def __init__(self, in_dim: int = 512, hidden: Sequence[int] = (256, 128)) -> None:
+    def __init__(self, in_dim: int = 512, hidden: Sequence[int] = (256, 128),
+                 dropout: float = 0.0) -> None:
         super().__init__()
         layers: list[nn.Module] = []
         d = in_dim
         for h in hidden:
             layers += [nn.Linear(d, h), nn.ReLU()]
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
             d = h
         layers += [nn.Linear(d, 1)]
         self.net = nn.Sequential(*layers)

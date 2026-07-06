@@ -85,9 +85,14 @@ def train_one(
     xv = torch.as_tensor((x_va - x_mean) / x_std, dtype=torch.float32, device=device)
     yv = torch.as_tensor(y_va, dtype=torch.float32, device=device)
 
-    net = PerRobotValue(in_dim=x.shape[1], hidden=_HIDDEN[feature]).to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
+    net = PerRobotValue(in_dim=x.shape[1], hidden=_HIDDEN[feature],
+                        dropout=args.dropout).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = nn.MSELoss()
+
+    best_mse   = float("inf")
+    best_state = None
+    best_epoch = 0
 
     n = xt.shape[0]
     for epoch in range(1, args.epochs + 1):
@@ -105,8 +110,16 @@ def train_one(
                 pred = net(xv).clamp_min(0.0)
                 mse = float(loss_fn(pred, yv))
                 mae = float((pred - yv).abs().mean())
-            print(f"  [{feature}] epoch {epoch:3d}: val MSE={mse:.4f}  MAE={mae:.3f} decisions")
+            marker = ""
+            if mse < best_mse:
+                best_mse   = mse
+                best_epoch = epoch
+                best_state = {k: v.cpu().clone() for k, v in net.state_dict().items()}
+                marker = "  *"
+            print(f"  [{feature}] epoch {epoch:3d}: val MSE={mse:.4f}  MAE={mae:.3f} decisions{marker}")
 
+    print(f"  [{feature}] best val MSE={best_mse:.4f} at epoch {best_epoch} — restoring")
+    net.load_state_dict(best_state)
     net.eval()
     with torch.no_grad():
         pred = net(xv).clamp_min(0.0)
@@ -114,6 +127,7 @@ def train_one(
             "val_mae_decisions": float((pred - yv).abs().mean()),
             "val_rmse_decisions": float(((pred - yv) ** 2).mean().sqrt()),
             "val_samples": int(yv.shape[0]),
+            "best_epoch": best_epoch,
         }
     save_value_checkpoint(
         Path(args.out_dir) / f"value_{feature}.pt",
@@ -144,6 +158,10 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--weight-decay", type=float, default=1e-4,
+                    help="L2 regularisation for Adam (counters embedding overfitting)")
+    ap.add_argument("--dropout", type=float, default=0.1,
+                    help="dropout rate after each hidden layer (0 = disabled)")
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--split-seed", type=int, default=0)
     ap.add_argument("--max-label", type=int, default=None,
