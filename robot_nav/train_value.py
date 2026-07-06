@@ -146,6 +146,10 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--split-seed", type=int, default=0)
+    ap.add_argument("--max-label", type=int, default=None,
+                    help="discard samples with label > this many decisions "
+                         "(local embedding can only see a limited view; "
+                         "long-horizon labels are not predictable from local features)")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -153,7 +157,21 @@ def main() -> None:
     meta = data["meta"]
     precise_cost = meta["precise_cost"]
     y = data["label"] / precise_cost                     # train in decision units
+
+    # episode-level split on the FULL data first, then apply label filter —
+    # this preserves the episode-level non-overlap guarantee.
     val_mask = episode_split(data["episode"], args.val_frac, args.split_seed)
+
+    if args.max_label is not None:
+        keep = y <= args.max_label
+        dropped = int((~keep).sum())
+        y        = y[keep]
+        val_mask = val_mask[keep]
+        for k in ("emb", "geo"):
+            data[k] = data[k][keep]
+        print(f"Label filter: keeping y <= {args.max_label} decisions "
+              f"({int(keep.sum())} kept, {dropped} dropped)")
+
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     print(
         f"Train/val: {int((~val_mask).sum())}/{int(val_mask.sum())} samples "
