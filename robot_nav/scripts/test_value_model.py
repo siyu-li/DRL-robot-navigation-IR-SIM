@@ -78,7 +78,7 @@ def straight_line_pred(geo: np.ndarray, meta: dict) -> np.ndarray:
 
 
 def predict(ckpt_path: Path, geo: np.ndarray, emb: np.ndarray,
-            device: torch.device) -> tuple[str, np.ndarray]:
+            device: torch.device) -> tuple[str, np.ndarray, dict]:
     net, ckpt = load_value_checkpoint(ckpt_path, device=device)
     x_mean = ckpt["x_mean"]
     x_std  = ckpt["x_std"]
@@ -88,7 +88,7 @@ def predict(ckpt_path: Path, geo: np.ndarray, emb: np.ndarray,
     xt = torch.as_tensor(x_norm, dtype=torch.float32, device=device)
     with torch.no_grad():
         pred = net(xt).clamp_min(0.0).cpu().numpy()
-    return feature, pred
+    return feature, pred, ckpt
 
 
 def print_table(y: np.ndarray, preds: dict[str, np.ndarray], bin_idx: np.ndarray) -> None:
@@ -178,10 +178,30 @@ def main() -> None:
     preds["straight"] = straight_line_pred(geo_val, meta)
 
     # learned checkpoints
+    ckpt_infos: list[str] = []
     for ckpt_path in args.ckpt:
-        feature, pred = predict(Path(ckpt_path), geo_val, emb_val, device)
+        feature, pred, ckpt = predict(Path(ckpt_path), geo_val, emb_val, device)
         label = f"learned_{feature}"
         preds[label] = pred
+        m = ckpt.get("meta", {})
+        info_parts = [
+            f"feature={feature}",
+            f"in_dim={ckpt['in_dim']}",
+            f"hidden={ckpt['hidden']}",
+            f"dropout={ckpt.get('dropout', 0.0)}",
+        ]
+        if "best_epoch" in m:
+            info_parts.append(f"best_epoch={int(m['best_epoch'])}")
+        if "epochs" in m:
+            info_parts.append(f"trained_epochs={int(m['epochs'])}")
+        if "max_label" in m:
+            info_parts.append(f"max_label={m['max_label']}")
+        ckpt_infos.append(f"  {Path(ckpt_path).name}: " + ", ".join(info_parts))
+
+    print("Checkpoint info:")
+    for line in ckpt_infos:
+        print(line)
+    print()
 
     print(f"\nValue model stratified error — {split_desc}")
     print(f"precise_cost={precise_cost}, selection_interval={meta['selection_interval']}\n")

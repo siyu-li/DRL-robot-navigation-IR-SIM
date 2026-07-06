@@ -132,6 +132,7 @@ def train_one(
     save_value_checkpoint(
         Path(args.out_dir) / f"value_{feature}.pt",
         net, feature, x.shape[1], _HIDDEN[feature], x_mean, x_std, precise_cost,
+        dropout=args.dropout,
         meta={**meta, **report, "epochs": args.epochs},
     )
     return net, report

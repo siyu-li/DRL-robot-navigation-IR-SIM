@@ -76,6 +76,7 @@ def save_value_checkpoint(
     x_mean: np.ndarray,
     x_std: np.ndarray,
     precise_cost: float,
+    dropout: float = 0.0,
     meta: dict | None = None,
 ) -> None:
     """Save the regressor with everything needed to run it standalone."""
@@ -87,6 +88,7 @@ def save_value_checkpoint(
             "feature": feature,
             "in_dim": int(in_dim),
             "hidden": list(hidden),
+            "dropout": float(dropout),
             "x_mean": np.asarray(x_mean, dtype=np.float32),
             "x_std": np.asarray(x_std, dtype=np.float32),
             "precise_cost": float(precise_cost),
@@ -101,7 +103,8 @@ def load_value_checkpoint(
 ) -> tuple[PerRobotValue, dict]:
     """Load a checkpoint saved by :func:`save_value_checkpoint`."""
     ckpt = torch.load(Path(path), map_location=device, weights_only=False)
-    net = PerRobotValue(in_dim=ckpt["in_dim"], hidden=ckpt["hidden"])
+    net = PerRobotValue(in_dim=ckpt["in_dim"], hidden=ckpt["hidden"],
+                        dropout=ckpt.get("dropout", 0.0))
     net.load_state_dict(ckpt["state_dict"])
     net.to(device).eval()
     for p in net.parameters():
