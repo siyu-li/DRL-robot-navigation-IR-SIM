@@ -103,8 +103,20 @@ def load_value_checkpoint(
 ) -> tuple[PerRobotValue, dict]:
     """Load a checkpoint saved by :func:`save_value_checkpoint`."""
     ckpt = torch.load(Path(path), map_location=device, weights_only=False)
-    net = PerRobotValue(in_dim=ckpt["in_dim"], hidden=ckpt["hidden"],
-                        dropout=ckpt.get("dropout", 0.0))
+    # Infer dropout from state_dict key indices when not explicitly stored.
+    # Without dropout each hidden block occupies 2 indices (Linear + ReLU);
+    # with dropout it occupies 3 (Linear + ReLU + Dropout).  The last Linear
+    # sits at index 2*N (no dropout) or 3*N (with dropout) where N=len(hidden).
+    dropout = ckpt.get("dropout", None)
+    if dropout is None:
+        max_idx = max(
+            int(k.split(".")[1])
+            for k in ckpt["state_dict"]
+            if k.split(".")[1].isdigit()
+        )
+        n_hidden = len(ckpt["hidden"])
+        dropout = 0.1 if max_idx == n_hidden * 3 else 0.0
+    net = PerRobotValue(in_dim=ckpt["in_dim"], hidden=ckpt["hidden"], dropout=dropout)
     net.load_state_dict(ckpt["state_dict"])
     net.to(device).eval()
     for p in net.parameters():
