@@ -18,12 +18,9 @@ from __future__ import annotations
 import numpy as np
 
 from robot_nav.models.MARL.capswitcher.rl.reward import PathCostReward
-from robot_nav.models.MARL.capswitcher.rl.shield import ShieldGeometry
 from robot_nav.models.MARL.capswitcher.rl.mpc.forward_model import ForwardModel
 from robot_nav.models.MARL.capswitcher.rl.mpc.search import plan_decision
-
-# robot_state goal columns (see CoarseSteering.compute_actions docstring).
-_GX, _GY = 9, 10
+from robot_nav.models.MARL.capswitcher.rl.search.common import build_forward_model
 
 
 class MPCSwitcher:
@@ -74,23 +71,21 @@ class MPCSwitcher:
         self.reward_fn = reward_fn if reward_fn is not None else PathCostReward()
         self.default_rho = float(default_rho)
         self.leaf_value = leaf_value
+        # Per-decision node-expansion counts (budget accounting for eval).
+        self.decision_expansions: list[int] = []
 
     def _build_model(self, robot_state: np.ndarray) -> ForwardModel:
         """Rebuild the forward model from the current sim + passed root state."""
-        s = np.asarray(robot_state, dtype=np.float64)
-        goals = s[:, [_GX, _GY]]
-        return ForwardModel(
-            backbone=self.backbone,
-            coarse=self.coarse,
-            goals=goals,
-            obstacle_states=self.sim.get_obstacle_states(),
-            geom=ShieldGeometry.from_sim(self.sim, default_rho=self.default_rho),
-            step_time=self.coarse.step_time,
-            selection_interval=self.selection_interval,
-            lin_max=self.coarse.lin_max,
+        return build_forward_model(
+            self.backbone,
+            self.coarse,
+            self.sim,
+            robot_state,
             d_safe=self.d_safe,
+            selection_interval=self.selection_interval,
             goal_threshold=self.goal_threshold,
             reward_fn=self.reward_fn,
+            default_rho=self.default_rho,
             leaf_value=self.leaf_value,
         )
 
@@ -106,6 +101,7 @@ class MPCSwitcher:
         model = self._build_model(robot_state)
         ms = ForwardModel.state_from_robot_state(robot_state)
         decision = plan_decision(model, ms, depth=self.depth, alpha=self.alpha)
+        self.decision_expansions.append(model.n_precise_expansions)
         return {
             "mode": decision["mode"],
             "group": decision["group"],

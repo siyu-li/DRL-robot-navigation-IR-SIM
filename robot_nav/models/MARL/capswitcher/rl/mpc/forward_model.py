@@ -134,6 +134,12 @@ class ForwardModel:
 
         self.N = self.goals.shape[0]
 
+        # Expansion counters for budget accounting across search algorithms.
+        # A node expansion runs coarse_moves + precise_next exactly once each,
+        # so ``n_precise_expansions`` equals the number of expanded nodes.
+        self.n_precise_expansions = 0
+        self.n_coarse_vets = 0
+
     # ------------------------------------------------------------------
     # State construction
     # ------------------------------------------------------------------
@@ -233,6 +239,7 @@ class ForwardModel:
         (clearance/progress/safe + the exact seeded frames to execute) and the
         deterministic next state the move leads to.
         """
+        self.n_coarse_vets += 1
         rs = self.robot_state(ms)
         moves: dict[int, CoarseMove] = {}
         for group in self.coarse.selectable_groups():
@@ -292,6 +299,7 @@ class ForwardModel:
         by its frozen GAT action for ``selection_interval`` sub-steps while the
         others hold still (receive ``[0, 0]``), integrating unicycle dynamics.
         """
+        self.n_precise_expansions += 1
         poses = ms.poses.copy()
         last = ms.last_actions.copy()
         for r in range(self.N):

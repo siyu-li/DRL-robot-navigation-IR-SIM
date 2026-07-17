@@ -18,63 +18,20 @@ still always having a defined value.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-from robot_nav.models.MARL.capswitcher.rl.reward import COARSE, PRECISE
 from robot_nav.models.MARL.capswitcher.rl.mpc.forward_model import (
     ForwardModel,
     ModelState,
 )
 
-# Dominating cost for a transition into a predicted collision — larger than any
-# realistic cost-to-go, so the search shuns it without ever pruning to "no option".
-COLLISION_COST: float = 1e9
+# Expansion machinery shared with the MCTS / Gumbel searches — re-exported here
+# so existing imports of ``search.Branch`` / ``search.COLLISION_COST`` keep working.
+from robot_nav.models.MARL.capswitcher.rl.search.common import (  # noqa: F401
+    COLLISION_COST,
+    Branch,
+    expand,
+)
 
-
-@dataclass
-class Branch:
-    """One expanded action edge from a node."""
-
-    mode: int                 # COARSE (0) or PRECISE (1)
-    group: int | None         # coarse group id, else None
-    frames: list | None       # exact vetted coarse frames to execute, else None
-    child: ModelState         # deterministic next state
-    step_cost: float          # per-decision motion cost of taking this action
-
-
-def _expand(model: ForwardModel, ms: ModelState) -> tuple[list[Branch], list]:
-    """
-    Expand ``ms`` into its allowed action edges and return the coarse candidates.
-
-    Coarse edges are included only for shield-safe groups; the precise-all edge is
-    always included.  The candidate list (all selectable groups, safe or not) is
-    returned for the decision dict / availability metrics.
-    """
-    moves = model.coarse_moves(ms)
-    candidates = [mv.candidate for mv in moves.values()]
-
-    branches: list[Branch] = []
-    for group, mv in moves.items():
-        if mv.candidate.safe:
-            branches.append(
-                Branch(
-                    mode=COARSE,
-                    group=group,
-                    frames=mv.candidate.frames,
-                    child=mv.next_state,
-                    step_cost=model.step_cost(COARSE, group),
-                )
-            )
-    branches.append(
-        Branch(
-            mode=PRECISE,
-            group=None,
-            frames=None,
-            child=model.precise_next(ms),
-            step_cost=model.step_cost(PRECISE),
-        )
-    )
-    return branches, candidates
+_expand = expand
 
 
 def _branch_value(
