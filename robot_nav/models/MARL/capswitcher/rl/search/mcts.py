@@ -5,7 +5,7 @@ No rollout runs anywhere — a leaf's evaluation is ``model.cost_to_go`` (with a
 configured ``leaf_value`` that is the learned per-robot precise cost-to-go,
 summed over unreached robots).  With Bellman backup and a budget large enough to
 expand every reachable node, the root decision equals the exhaustive minimin of
-``rl/mpc/search.py``; smaller budgets spend expansions *asymmetrically* along
+``rl/search/minimin.py``; smaller budgets spend expansions *asymmetrically* along
 promising lines — that adaptivity vs. uniform-depth MPC is exactly what the
 budget-matched comparison measures.
 
@@ -20,9 +20,9 @@ import math
 
 import numpy as np
 
-from robot_nav.models.MARL.capswitcher.rl.mpc.forward_model import ForwardModel
-from robot_nav.models.MARL.capswitcher.rl.mpc.mpc_switcher import MPCSwitcher
+from robot_nav.models.MARL.capswitcher.rl.forward_model import ForwardModel
 from robot_nav.models.MARL.capswitcher.rl.search.common import QNormalizer
+from robot_nav.models.MARL.capswitcher.rl.search.minimin import MPCSwitcher
 from robot_nav.models.MARL.capswitcher.rl.search.tree import (
     Node,
     decision_dict,

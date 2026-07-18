@@ -87,20 +87,22 @@ read it before touching this subtree. The current research direction
   exact swept geometry of a coarse move from its frames and vets clearance
   `>= d_safe` at every sub-step *before* committing — so unsafe coarse moves are
   never executed. This is local and scales to large swarms.
-- **Efficiency = global sequential planning.** `rl/mpc/` runs a fixed-depth
-  **receding-horizon minimin lookahead** because IR-SIM cannot be branched:
-  - `forward_model.py` — deterministic analytic pose-model (`ModelState`,
-    unicycle forward-Euler for precise, exact reconstruction for coarse); its
-    `cost_to_go` is the search leaf.
-  - `search.py` — depth-limited min-cost recursion (`plan_decision`); each node
-    expands to shield-safe coarse groups ∪ precise-all.
-  - `mpc_switcher.py` — `MPCSwitcher.decide(robot_state)` rebuilds the model
-    from the live sim each real decision and returns the same
-    `{mode, group, frames, candidates}` dict the env consumes.
-- **Budgeted tree searches** (`rl/search/`) share the model, expansion machinery
-  (`common.py::expand` — also used by `rl/mpc/search.py`), leaf value and decide
-  contract with MPC; the resource is **node expansions per decision** (measured
-  by `ForwardModel.n_precise_expansions`; exhaustive depth-d ≤ (4^d−1)/3):
+- **Efficiency = global sequential planning.** `rl/forward_model.py` is the
+  deterministic analytic pose-model every planner searches over, because IR-SIM
+  cannot be branched (`ModelState`, unicycle forward-Euler for precise, exact
+  reconstruction for coarse; `cost_to_go` is the search leaf;
+  `build_forward_model` rebuilds it from the live sim each real decision).
+  All planners live in `rl/search/`, share that model, the expansion machinery
+  (`common.py::expand` — shield-safe coarse groups ∪ precise-all), leaf value and
+  the `decide(robot_state) → {mode, group, frames, candidates}` dict contract;
+  the resource is **node expansions per decision** (measured by
+  `ForwardModel.n_precise_expansions`; exhaustive depth-d ≤ (4^d−1)/3).
+  Layering is strictly one-directional:
+  `reward/shield → search/common → forward_model → tree/minimin → mcts/gumbel`
+  (keep it that way — `common.py` must stay a dependency leaf):
+  - `minimin.py` — exhaustive fixed-depth min-cost recursion (`plan_decision`,
+    the MPC baseline) + `MPCSwitcher`, the receding-horizon switcher and base
+    class of the budgeted switchers.
   - `tree.py` — shared Node/backup: **Bellman value replacement** default
     (`"mean"` ablation), **certificates** `U` (exact in-model cost of a found
     complete plan) stored separately from estimates `q̂`, effective value

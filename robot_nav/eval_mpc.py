@@ -37,7 +37,7 @@ from robot_nav.models.MARL.capswitcher.policies.gat_backbone import GATBackbone
 from robot_nav.models.MARL.capswitcher.policies.coarse_steering import CoarseSteering
 from robot_nav.models.MARL.capswitcher.rl.reward import PathCostReward
 from robot_nav.models.MARL.capswitcher.rl.switcher_env import SwitcherEnv
-from robot_nav.models.MARL.capswitcher.rl.mpc.mpc_switcher import MPCSwitcher
+from robot_nav.models.MARL.capswitcher.rl.search.minimin import MPCSwitcher
 from robot_nav.models.MARL.capswitcher.rl.search.mcts import MCTSSwitcher
 from robot_nav.models.MARL.capswitcher.rl.search.gumbel import GumbelSwitcher
 from robot_nav.models.MARL.capswitcher.rl.search.priors import HeuristicPrior

@@ -31,8 +31,8 @@ is the leaf cost-to-go estimate (the learned ``v_psi`` or the analytic
   such edges (unless nothing else is left).
 
 With full expansion the Bellman-backed root value equals the minimin recursion of
-``rl/mpc/search.py`` exactly — the budgeted searches differ only in *which* nodes
-they choose to expand.
+``rl/search/minimin.py`` exactly — the budgeted searches differ only in *which*
+nodes they choose to expand.
 """
 
 from __future__ import annotations

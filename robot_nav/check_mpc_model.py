@@ -1,7 +1,7 @@
 """
 Model-vs-sim fidelity check for the MPC analytic forward model (Task 6, blocking).
 
-The depth-d lookahead runs on the analytic pose-model in ``rl/mpc/forward_model.py``
+The depth-d lookahead runs on the analytic pose-model in ``rl/forward_model.py``
 instead of the (un-branchable) simulator.  This script verifies the model's one-step
 predictions against the real ``SwitcherEnv.step`` so the planner ranks actions on
 faithful transitions:
@@ -26,11 +26,11 @@ import numpy as np
 import torch
 
 from robot_nav.eval_mpc import build_env
-from robot_nav.models.MARL.capswitcher.rl.mpc.forward_model import (
+from robot_nav.models.MARL.capswitcher.rl.forward_model import (
     ForwardModel,
     _state_group_seed,
 )
-from robot_nav.models.MARL.capswitcher.rl.mpc.mpc_switcher import MPCSwitcher
+from robot_nav.models.MARL.capswitcher.rl.search.minimin import MPCSwitcher
 
 
 def _sim_poses(env) -> np.ndarray:

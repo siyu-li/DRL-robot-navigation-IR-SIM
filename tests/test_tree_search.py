@@ -15,8 +15,8 @@ import pytest
 
 from robot_nav.models.MARL.capswitcher.rl.reward import COARSE, PRECISE
 from robot_nav.models.MARL.capswitcher.rl.shield import CoarseCandidate
-from robot_nav.models.MARL.capswitcher.rl.mpc.forward_model import CoarseMove
-from robot_nav.models.MARL.capswitcher.rl.mpc.search import plan_decision
+from robot_nav.models.MARL.capswitcher.rl.forward_model import CoarseMove
+from robot_nav.models.MARL.capswitcher.rl.search.minimin import plan_decision
 from robot_nav.models.MARL.capswitcher.rl.search.common import (
     COLLISION_COST,
     Branch,

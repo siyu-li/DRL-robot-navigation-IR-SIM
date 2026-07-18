@@ -165,7 +165,9 @@ The DQN switcher failed (collapsed to precise). Direction now **decouples** the 
 
 **Done (2026-07 branch `CAPSwitcher`):** a fixed-depth receding-horizon MPC baseline (minimin
 lookahead over an analytic pose-model, since the irsim sim can't be branched). New code in
-`robot_nav/models/MARL/capswitcher/rl/mpc/` + `robot_nav/eval_mpc.py` + `robot_nav/check_mpc_model.py`.
+`robot_nav/models/MARL/capswitcher/rl/forward_model.py` +
+`robot_nav/models/MARL/capswitcher/rl/search/minimin.py` (formerly `rl/mpc/`) +
+`robot_nav/eval_mpc.py` + `robot_nav/check_mpc_model.py`.
 Result (100 eps): MPC-d3 beats precise-only — path 935 vs 1502 (−38%), success 94% vs 88%, monotone
 in depth; shield gives 0 coarse breaches (residual ~3% collisions are precise-policy artifacts).
 Decision gate passed: lookahead helps → proceed to learned value / AlphaZero.

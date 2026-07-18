@@ -46,12 +46,12 @@ import math
 
 import numpy as np
 
-from robot_nav.models.MARL.capswitcher.rl.mpc.forward_model import (
+from robot_nav.models.MARL.capswitcher.rl.forward_model import (
     ForwardModel,
     _state_group_seed,
 )
-from robot_nav.models.MARL.capswitcher.rl.mpc.mpc_switcher import MPCSwitcher
 from robot_nav.models.MARL.capswitcher.rl.search.common import QNormalizer
+from robot_nav.models.MARL.capswitcher.rl.search.minimin import MPCSwitcher
 from robot_nav.models.MARL.capswitcher.rl.search.priors import HeuristicPrior
 from robot_nav.models.MARL.capswitcher.rl.search.tree import (
     Node,

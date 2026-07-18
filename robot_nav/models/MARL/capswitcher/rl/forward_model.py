@@ -1,9 +1,10 @@
 """
-Analytic forward model for the MPC switcher (no ``sim.step`` in the tree).
+Analytic forward model shared by every planner (no ``sim.step`` in the tree).
 
 The simulator cannot be branched (irsim's internal collision tree / ``_world`` /
-``step_status`` are opaque and un-cloneable), so the depth-d lookahead runs on this
-standalone pose-model and only the *chosen first action* is executed on the real
+``step_status`` are opaque and un-cloneable), so every lookahead — the minimin
+MPC and the budgeted tree searches in ``rl/search/`` — runs on this standalone
+pose-model and only the *chosen first action* is executed on the real
 ``SwitcherEnv.step``.  Two facts make the model exact/faithful enough to rank actions:
 
   * within one decision **obstacles are frozen**, so obstacle geometry is a constant;
@@ -376,3 +377,45 @@ class ForwardModel:
         if alpha is None:
             alpha = self.reward_fn.precise_cost / (self.lin_max * self.step_time)
         return float(alpha) * float(np.sum(self.goal_distances(ms)))
+
+
+# robot_state goal columns (see CoarseSteering.compute_actions docstring).
+_GX, _GY = 9, 10
+
+
+def build_forward_model(
+    backbone,
+    coarse,
+    sim,
+    robot_state: np.ndarray,
+    *,
+    d_safe: float,
+    selection_interval: int,
+    goal_threshold: float,
+    reward_fn: PathCostReward,
+    default_rho: float,
+    leaf_value=None,
+) -> ForwardModel:
+    """
+    Rebuild the deterministic forward model from the live sim + root state.
+
+    The one place a switcher turns (backbone, coarse, live sim, root
+    robot_state) into a :class:`ForwardModel` — shared by ``MPCSwitcher`` and
+    the tree-search switchers so they all plan over identical models.
+    """
+    s = np.asarray(robot_state, dtype=np.float64)
+    goals = s[:, [_GX, _GY]]
+    return ForwardModel(
+        backbone=backbone,
+        coarse=coarse,
+        goals=goals,
+        obstacle_states=sim.get_obstacle_states(),
+        geom=ShieldGeometry.from_sim(sim, default_rho=default_rho),
+        step_time=coarse.step_time,
+        selection_interval=selection_interval,
+        lin_max=coarse.lin_max,
+        d_safe=d_safe,
+        goal_threshold=goal_threshold,
+        reward_fn=reward_fn,
+        leaf_value=leaf_value,
+    )

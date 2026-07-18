@@ -1,41 +1,30 @@
 """
 Shared expansion machinery for every tree search over the analytic forward model.
 
-The minimin MPC (``rl/mpc/search.py``), the MCTS switcher (``rl/search/mcts.py``)
-and the Gumbel AlphaZero switcher (``rl/search/gumbel.py``) all expand nodes the
-same way: shield-safe coarse groups ∪ {precise-all}, with the precise edge always
-present.  :class:`Branch` / :func:`expand` live here so the three searches rank
-exactly the same action edges.
+The minimin MPC (``rl/search/minimin.py``), the MCTS switcher
+(``rl/search/mcts.py``) and the Gumbel AlphaZero switcher (``rl/search/gumbel.py``)
+all expand nodes the same way: shield-safe coarse groups U {precise-all}, with the
+precise edge always present.  :class:`Branch` / :func:`expand` live here so the
+three searches rank exactly the same action edges.
 
-Also here:
+Also here: :class:`QNormalizer` — running min–max normalisation of edge costs
+into a higher-is-better q ∈ [0, 1] (the MuZero/Gumbel trick; both UCT and the
+Gumbel ``σ`` transform need value scales to be budget-independent).
 
-* :class:`QNormalizer` — running min–max normalisation of edge costs into a
-  higher-is-better q ∈ [0, 1] (the MuZero/Gumbel trick; both UCT and the Gumbel
-  ``σ`` transform need value scales to be budget-independent).
-* :func:`build_forward_model` — the one place a switcher turns (backbone, coarse,
-  live sim, root robot_state) into a :class:`ForwardModel`, shared by
-  ``MPCSwitcher`` and the tree-search switchers.
+This module is deliberately a dependency leaf (only ``reward``): ``Branch.child``
+stays a string annotation so no model import is needed, and the model factory
+lives with the model in ``rl/forward_model.py::build_forward_model``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
-
-from robot_nav.models.MARL.capswitcher.rl.reward import COARSE, PRECISE, PathCostReward
-from robot_nav.models.MARL.capswitcher.rl.shield import ShieldGeometry
-
-# NOTE: ``ForwardModel`` / ``ModelState`` are only type annotations here; importing
-# them at module level would be circular (mpc.search re-exports from this module),
-# so ``build_forward_model`` imports ForwardModel lazily.
+from robot_nav.models.MARL.capswitcher.rl.reward import COARSE, PRECISE
 
 # Dominating cost for a transition into a predicted collision — larger than any
 # realistic cost-to-go, so a search shuns it without ever pruning to "no option".
 COLLISION_COST: float = 1e9
-
-# robot_state goal columns (see CoarseSteering.compute_actions docstring).
-_GX, _GY = 9, 10
 
 
 @dataclass
@@ -114,37 +103,3 @@ class QNormalizer:
             return 0.5
         q = (self.vmax - cost) / (self.vmax - self.vmin)
         return float(min(max(q, 0.0), 1.0))
-
-
-def build_forward_model(
-    backbone,
-    coarse,
-    sim,
-    robot_state: np.ndarray,
-    *,
-    d_safe: float,
-    selection_interval: int,
-    goal_threshold: float,
-    reward_fn: PathCostReward,
-    default_rho: float,
-    leaf_value=None,
-):
-    """Rebuild the deterministic forward model from the live sim + root state."""
-    from robot_nav.models.MARL.capswitcher.rl.mpc.forward_model import ForwardModel
-
-    s = np.asarray(robot_state, dtype=np.float64)
-    goals = s[:, [_GX, _GY]]
-    return ForwardModel(
-        backbone=backbone,
-        coarse=coarse,
-        goals=goals,
-        obstacle_states=sim.get_obstacle_states(),
-        geom=ShieldGeometry.from_sim(sim, default_rho=default_rho),
-        step_time=coarse.step_time,
-        selection_interval=selection_interval,
-        lin_max=coarse.lin_max,
-        d_safe=d_safe,
-        goal_threshold=goal_threshold,
-        reward_fn=reward_fn,
-        leaf_value=leaf_value,
-    )
