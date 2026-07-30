@@ -18,8 +18,11 @@ Gumbel rows can additionally log the improved root policy ``pi'`` per decision
 
 Usage (run on the GPU box — local irsim step crashes; see project memory):
     python -m robot_nav.eval_mpc --episodes 100 --depths 1 2 3 --baselines
-    python -m robot_nav.eval_mpc --algos mpc mcts gumbel --budgets 5 21 \
-        --value-model <ckpt> --log-pi-targets data/pi_targets
+    python -m robot_nav.eval_mpc --episodes 200 --algos mpc mcts gumbel --budgets 5 21 \
+        --value-model robot_nav/models/MARL/capswitcher/checkpoint/value_local/value_geometry.pt --log-pi-targets data/pi_targets
+
+    python -m robot_nav.eval_mpc --episodes 100 --depths 1 2 3 4 5 \
+    --baselines --value-model robot_nav/models/MARL/capswitcher/checkpoint/value_local/value_geometry.pt
 """
 
 from __future__ import annotations
