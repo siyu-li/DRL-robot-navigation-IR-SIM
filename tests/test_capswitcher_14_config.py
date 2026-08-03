@@ -102,7 +102,7 @@ def test_translation_realises_move_distance_for_members_only():
     for frame in trans:
         total += np.array([pair[0] for pair in frame]) * cs.step_time
     members = cs.members_of(group)
-    assert np.allclose(total[members], cs.move_distance)
+    assert np.allclose(total[members], cs.move_distances[group])
     non_members = np.setdiff1d(np.arange(N_ROBOTS), members)
     assert np.allclose(total[non_members], 0.0)
 

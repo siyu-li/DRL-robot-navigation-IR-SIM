@@ -37,7 +37,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from robot_nav.models.MARL.capswitcher.rl.reward import COARSE, PRECISE, PathCostReward
+from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
+from robot_nav.models.MARL.capswitcher.rl.reward import COARSE
 from robot_nav.models.MARL.capswitcher.rl.shield import (
     CoarseCandidate,
     ShieldGeometry,
@@ -97,8 +98,8 @@ class ForwardModel:
         lin_max:            Max linear velocity (m/s) — used by the cost-to-go α.
         d_safe:             Clearance margin (m) a coarse move must keep to be safe.
         goal_threshold:     Per-robot goal-arrival radius (m) for ``all_reached``.
-        reward_fn:          ``PathCostReward`` supplying the per-decision motion cost
-                            (defaults to the eval configuration).
+        cost:               :class:`SwitcherCost` decision-pricing table (load with
+                            ``SwitcherCost.from_yaml``).
         leaf_value:         Optional learned leaf evaluator ``(model, ms) -> float``
                             (e.g. :class:`LearnedCostToGo`).  When set,
                             :meth:`cost_to_go` dispatches to it instead of the
@@ -117,9 +118,14 @@ class ForwardModel:
         lin_max: float = 0.5,
         d_safe: float = 0.3,
         goal_threshold: float = 0.3,
-        reward_fn: PathCostReward | None = None,
+        cost: SwitcherCost | None = None,
         leaf_value=None,
     ) -> None:
+        if cost is None:
+            raise ValueError(
+                "ForwardModel requires a SwitcherCost (load the system's "
+                "cost YAML with SwitcherCost.from_yaml)"
+            )
         self.backbone = backbone
         self.coarse = coarse
         self.goals = np.asarray(goals, dtype=np.float64)          # (N, 2)
@@ -130,7 +136,7 @@ class ForwardModel:
         self.lin_max = float(lin_max)
         self.d_safe = float(d_safe)
         self.goal_threshold = float(goal_threshold)
-        self.reward_fn = reward_fn if reward_fn is not None else PathCostReward()
+        self.cost = cost
         self.leaf_value = leaf_value
 
         self.N = self.goals.shape[0]
@@ -303,7 +309,11 @@ class ForwardModel:
         self.n_precise_expansions += 1
         poses = ms.poses.copy()
         last = ms.last_actions.copy()
-        for r in range(self.N):
+        # Robots already at goal are skipped (mirrors the env; they are also
+        # not charged by the precise pricing).  Membership is frozen at entry —
+        # a robot arriving mid-decision still finishes its own sub-steps.
+        unreached = np.flatnonzero(self.goal_distances(ms) > self.goal_threshold)
+        for r in unreached:
             for _ in range(self.selection_interval):
                 rs = self.robot_state(ModelState(poses=poses, last_actions=last))
                 raw, _ = self.backbone.get_embedding_and_actions(
@@ -339,25 +349,25 @@ class ForwardModel:
     # Cost
     # ------------------------------------------------------------------
 
-    def step_cost(self, action: int, group: int | None = None) -> float:
-        """
-        Per-decision motion cost = ``−PathCostReward`` for a non-terminal decision,
-        so the planner minimises exactly the eval objective.
+    def n_unreached(self, ms: ModelState) -> int:
+        """Number of robots still outside ``goal_threshold`` at ``ms``."""
+        return int(np.sum(self.goal_distances(ms) > self.goal_threshold))
 
-        Coarse ⇒ ``n_members(group) · move_distance``; precise ⇒ flat ``precise_cost``.
+    def step_cost(self, action: int, ms: ModelState, group: int | None = None) -> float:
+        """
+        Per-decision motion cost from the :class:`SwitcherCost` table, so the
+        planner minimises exactly the eval objective.
+
+        Coarse ⇒ the group's configured constant.  Precise ⇒
+        ``precise_unit × n_unreached(ms) × selection_interval`` — the nominal
+        price of the rollout that skips reached robots (the env charges the
+        sub-steps actually executed; they differ only on terminal truncation).
         """
         if action == COARSE:
-            n_moved = int(self.coarse.members_of(group).size)
-            coarse_cost = n_moved * self.coarse.move_distance
-            reward = self.reward_fn(
-                None, None, COARSE, None, None, False, False,
-                coarse_cost=coarse_cost, oob=False,
-            )
-        else:
-            reward = self.reward_fn(
-                None, None, PRECISE, None, None, False, False,
-            )
-        return -float(reward)
+            return float(self.cost.coarse_cost(group))
+        return float(
+            self.cost.precise_cost(self.n_unreached(ms), self.selection_interval)
+        )
 
     def cost_to_go(self, ms: ModelState, alpha: float | None = None) -> float:
         """
@@ -368,15 +378,18 @@ class ForwardModel:
         ignored.  Otherwise the crude analytic heuristic — finish precisely, one
         robot at a time:
 
-        ``H(x) = α · Σ_i ‖p_i − goal_i‖`` with default
-        ``α = precise_cost / (lin_max · step_time)`` — ``precise_cost`` charged per
-        sub-step, one sub-step advancing a robot ``lin_max · step_time`` metres.
+        ``H(x) = α · Σ_{i unreached} ‖p_i − goal_i‖`` with default
+        ``α = precise_unit / (lin_max · step_time)`` — ``precise_unit`` charged
+        per robot per sub-step, one sub-step advancing a robot
+        ``lin_max · step_time`` metres.  Reached robots contribute 0 (they are
+        skipped and never charged).
         """
         if self.leaf_value is not None:
             return float(self.leaf_value(self, ms))
         if alpha is None:
-            alpha = self.reward_fn.precise_cost / (self.lin_max * self.step_time)
-        return float(alpha) * float(np.sum(self.goal_distances(ms)))
+            alpha = self.cost.precise_unit / (self.lin_max * self.step_time)
+        dist = self.goal_distances(ms)
+        return float(alpha) * float(np.sum(dist[dist > self.goal_threshold]))
 
 
 # robot_state goal columns (see CoarseSteering.compute_actions docstring).
@@ -392,7 +405,7 @@ def build_forward_model(
     d_safe: float,
     selection_interval: int,
     goal_threshold: float,
-    reward_fn: PathCostReward,
+    cost: SwitcherCost,
     default_rho: float,
     leaf_value=None,
 ) -> ForwardModel:
@@ -416,6 +429,6 @@ def build_forward_model(
         lin_max=coarse.lin_max,
         d_safe=d_safe,
         goal_threshold=goal_threshold,
-        reward_fn=reward_fn,
+        cost=cost,
         leaf_value=leaf_value,
     )

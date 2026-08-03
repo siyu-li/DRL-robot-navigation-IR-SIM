@@ -38,7 +38,7 @@ from loguru import logger
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 from robot_nav.models.MARL.capswitcher.policies.gat_backbone import GATBackbone
 from robot_nav.models.MARL.capswitcher.policies.coarse_steering import CoarseSteering
-from robot_nav.models.MARL.capswitcher.rl.reward import PathCostReward
+from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
 from robot_nav.models.MARL.capswitcher.rl.switcher_env import SwitcherEnv
 from robot_nav.models.MARL.capswitcher.rl.search.minimin import MPCSwitcher
 from robot_nav.models.MARL.capswitcher.rl.search.mcts import MCTSSwitcher
@@ -50,8 +50,11 @@ logger.disable("irsim")
 COARSE, PRECISE = 0, 1
 
 
+DEFAULT_COST_CONFIG = "robot_nav/models/MARL/capswitcher/cost_6robots.yaml"
+
+
 def build_env(
-    device: torch.device, move_distance: float
+    device: torch.device, cost: SwitcherCost, goal_threshold: float
 ) -> tuple[SwitcherEnv, CoarseSteering, MARL_SIM_OBSTACLE]:
     """Construct sim + backbone + coarse + env (mirrors eval_shield.build_env)."""
     sim = MARL_SIM_OBSTACLE(
@@ -75,11 +78,15 @@ def build_env(
     )
     coarse = CoarseSteering(
         num_robots=sim.num_robots,
-        move_distance=move_distance,
+        move_distance=cost.move_distances,
         method="nonlinear",
         step_time=sim.env.step_time,
         ang_max=1.0,
         lin_max=0.5,
+    )
+    # Fail loudly if the cost YAML's group table drifted from the algebra.
+    cost.validate_members(
+        {g: cost_members(coarse, g) for g in coarse.selectable_groups()}
     )
     env = SwitcherEnv(
         sim=sim,
@@ -87,11 +94,17 @@ def build_env(
         coarse_steering=coarse,
         selection_interval=5,
         max_decisions=60,
-        reward_fn=PathCostReward(),
+        cost=cost,
+        goal_threshold=goal_threshold,
         device=device,
         terminate_on_oob=False,
     )
     return env, coarse, sim
+
+
+def cost_members(coarse, group: int) -> list[int]:
+    """Member list of ``group`` as plain ints (for YAML validation)."""
+    return [int(i) for i in coarse.members_of(group)]
 
 
 def run(
@@ -101,8 +114,8 @@ def run(
     Run ``decide_fn`` for ``episodes`` seeded episodes and collect stats.
 
     ``decide_fn(env) -> {"mode", "group", "frames", "candidates"}``.  Per-episode
-    cost is travel distance (``info["path_cost"]``), summed over robots and the
-    episode — the same quantity ``PathCostReward`` penalises during training.
+    cost is executed decision cost (``info["path_cost"]``, SwitcherCost units)
+    summed over the episode — exactly what the planner minimises.
     ``policy`` (a switcher) supplies per-decision node-expansion counts for the
     budget-matched comparison; baselines pass None (0 expansions).
     """
@@ -279,8 +292,10 @@ def main() -> None:
                          "(future learned-prior training data)")
     ap.add_argument("--d-safe", type=float, default=0.3)
     ap.add_argument("--alpha", type=float, default=None,
-                    help="cost-to-go slope; default precise_cost/(lin_max·step_time)")
-    ap.add_argument("--move-distance", type=float, default=1.5)
+                    help="cost-to-go slope; default precise_unit/(lin_max·step_time)")
+    ap.add_argument("--cost-config", type=str, default=DEFAULT_COST_CONFIG,
+                    help="SwitcherCost YAML (per-group move_distance + cost, "
+                         "precise_unit)")
     ap.add_argument("--goal-threshold", type=float, default=0.3)
     ap.add_argument("--baselines", action="store_true",
                     help="also run precise-only and coarse-only baselines")
@@ -290,12 +305,16 @@ def main() -> None:
     args = ap.parse_args()
 
     device = torch.device("cpu")
-    env, coarse, sim = build_env(device, move_distance=args.move_distance)
+    cost = SwitcherCost.from_yaml(args.cost_config)
+    env, coarse, sim = build_env(
+        device, cost=cost, goal_threshold=args.goal_threshold
+    )
     print(
         f"Env: {sim.num_robots} robots, {sim.num_obstacles} obstacles, "
-        f"move_distance={coarse.move_distance}, d_safe={args.d_safe}, "
-        f"alpha={args.alpha}, algos={args.algos}, depths={args.depths}, "
-        f"budgets={args.budgets}, value_model={args.value_model}"
+        f"cost_config={args.cost_config}, precise_unit={cost.precise_unit}, "
+        f"d_safe={args.d_safe}, alpha={args.alpha}, algos={args.algos}, "
+        f"depths={args.depths}, budgets={args.budgets}, "
+        f"value_model={args.value_model}"
     )
 
     leaf_value = None
@@ -321,7 +340,7 @@ def main() -> None:
         d_safe=args.d_safe,
         selection_interval=env.selection_interval,
         goal_threshold=args.goal_threshold,
-        reward_fn=env.reward_fn,
+        cost=env.cost,
     )
     variants = [("", None)] + ([("+v", leaf_value)] if leaf_value else [])
 

@@ -22,17 +22,18 @@ Action space
 ------------
 Discrete(2):  0 = coarse,  1 = precise.
 
-Reward
-------
-Computed **once per decision** by :class:`SwitcherReward` (see reward.py), not
-summed over sub-steps:
+Cost (reward = −cost)
+---------------------
+Priced **once per decision** from the :class:`SwitcherCost` table (see
+``rl/cost.py``); there are no terminal bonuses — collision / all-reached /
+out-of-bounds are ``done`` flags in ``info``, not reward terms:
 
-    r = k_p · Σ_i Δdistance_i  −  Σ_i (cl_pen_i + obs_pen_i)  +  step_penalty
-        (+ terminal collision / all-reached bonuses)
+    coarse  : cost.coarse_cost(group)          (configured per-group constant)
+    precise : precise_unit × (precise sub-steps actually executed)
 
-Progress is the summed goal-distance reduction over the whole decision; the
-clearance/obstacle penalties are evaluated once at decision end.  This is
-agnostic to how many sub-steps a mode consumes.
+One robot moves per precise sub-step, so the executed sub-step count *is*
+robots × sub-steps; robots already within ``goal_threshold`` are skipped by
+the rollout and never charged.
 
 Episode termination
 -------------------
@@ -51,7 +52,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from robot_nav.models.MARL.capswitcher.rl.reward import PathCostReward
+from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
 
 
 def _outside_bounds(poses: list, sim) -> bool:
@@ -78,9 +79,11 @@ class SwitcherEnv:
         max_decisions:      Maximum number of switcher decisions per episode
                             (episode budget counted in decisions, not sub-steps).
                             Default 60.
-        reward_fn:          Optional reward callable (:class:`SwitcherReward` or
-                            :class:`StepPenaltyReward`). Defaults to a
-                            :class:`SwitcherReward` with the agreed constants.
+        cost:               :class:`SwitcherCost` decision-pricing table (load
+                            with ``SwitcherCost.from_yaml``).
+        goal_threshold:     Distance (m) below which a robot counts as reached —
+                            the precise rollout skips (and never charges) such
+                            robots. Default 0.3.
         device:             Torch device used by the backbone.
     """
 
@@ -94,16 +97,23 @@ class SwitcherEnv:
         coarse_steering,
         selection_interval: int = 5,
         max_decisions: int = 80,
-        reward_fn: PathCostReward | None = None,
+        cost: SwitcherCost | None = None,
+        goal_threshold: float = 0.3,
         device: torch.device = torch.device("cpu"),
         terminate_on_oob: bool = True,
     ) -> None:
+        if cost is None:
+            raise ValueError(
+                "SwitcherEnv requires a SwitcherCost (load the system's "
+                "cost YAML with SwitcherCost.from_yaml)"
+            )
         self.sim = sim
         self.backbone = backbone
         self.coarse = coarse_steering
         self.selection_interval = selection_interval
         self.max_decisions = max_decisions
-        self.reward_fn = reward_fn if reward_fn is not None else PathCostReward()
+        self.cost = cost
+        self.goal_threshold = float(goal_threshold)
         self.device = device
         self.terminate_on_oob = terminate_on_oob
 
@@ -184,25 +194,26 @@ class SwitcherEnv:
 
         Returns:
             obs:    (N, 512) next observation.
-            reward: Scalar decision-level reward (see :class:`SwitcherReward`).
+            reward: ``−path_cost`` of the decision (no terminal bonuses).
             done:   Episode termination flag.
             info:   Dict with diagnostic keys:
                     ``collision``, ``all_reached``, ``timeout``, ``oob``,
-                    ``mode``, ``group``, ``steps_taken``.
+                    ``mode``, ``group``, ``steps_taken``, ``robots_moved``,
+                    ``path_cost``.
         """
         self._decision_count += 1
-        d_start = self._last_distances.copy()
 
         done = False
         info: dict[str, Any] = {
-            "collision":   False,
-            "all_reached": False,
-            "timeout":     False,
-            "oob":         False,
-            "mode":        action,
-            "group":       None,
-            "steps_taken": 0,
-            "path_cost":   0.0,
+            "collision":    False,
+            "all_reached":  False,
+            "timeout":      False,
+            "oob":          False,
+            "mode":         action,
+            "group":        None,
+            "steps_taken":  0,
+            "robots_moved": 0,
+            "path_cost":    0.0,
         }
 
         if action == 0:
@@ -215,34 +226,22 @@ class SwitcherEnv:
             info["timeout"] = True
             done = True
 
-        # ---- Decision-level reward ------------------------------------------
-        # Executed coarse path length: the chosen group's members each advance
-        # by the fixed move_distance, so the motion cost is
-        # n_members_moved · move_distance.  Zero for precise (which carries its
-        # own fixed cost inside the reward function).
-        coarse_cost = 0.0
-        if action == 0 and info["group"] is not None:
-            n_moved = int(self.coarse.members_of(info["group"]).size)
-            coarse_cost = n_moved * self.coarse.move_distance
-
-        # Executed travel distance of this decision, summed over robots and
-        # exposed for monitoring: coarse = n_members_moved · move_distance,
-        # precise = per-robot fixed cost (11.7) · num_robots (every robot is
-        # actuated under the precise mechanism).
+        # ---- Decision cost (reward = −cost, no terminal bonuses) ------------
+        # Coarse: the chosen group's configured constant from the cost table.
+        # Precise: one robot moves per executed sub-step, so the sub-step count
+        # is robots × sub-steps; reached robots were skipped and cost nothing.
         if action == 0:
-            info["path_cost"] = float(coarse_cost)
+            if info["group"] is not None:
+                info["path_cost"] = float(self.cost.coarse_cost(info["group"]))
+                info["robots_moved"] = int(
+                    self.coarse.members_of(info["group"]).size
+                )
         else:
-            precise_cost = float(getattr(self.reward_fn, "precise_cost", 11.7))
-            info["path_cost"] = precise_cost * self.sim.num_robots
+            info["path_cost"] = float(
+                self.cost.precise_substep_cost(info["steps_taken"])
+            )
 
-        d_end = self._last_distances
-        cl_pen, obs_pen = self.sim.proximity_penalties()
-        reward = self.reward_fn(
-            d_start, d_end, action, cl_pen, obs_pen,
-            info["collision"], info["all_reached"],
-            coarse_cost=coarse_cost, oob=info["oob"],
-        )
-
+        reward = -info["path_cost"]
         return self._get_obs(), reward, done, info
 
     # ------------------------------------------------------------------
@@ -295,7 +294,9 @@ class SwitcherEnv:
 
         Each robot is driven for ``selection_interval`` sub-steps while the
         others hold still; its action is recomputed every sub-step (state
-        dependent) from a full-graph backbone forward.
+        dependent) from a full-graph backbone forward.  Robots already within
+        ``goal_threshold`` of their goal are skipped entirely — they neither
+        move nor add cost-bearing sub-steps.
 
         Returns:
             done: True if a terminal condition fired during the rollout.
@@ -303,6 +304,9 @@ class SwitcherEnv:
         n = self.sim.num_robots
         steps = 0
         for r in range(n):
+            if float(self._last_distances[r]) <= self.goal_threshold:
+                continue
+            info["robots_moved"] += 1
             for _ in range(self.selection_interval):
                 # Fresh actions for the current state (lazy: one forward/state).
                 if not self._cache_valid:

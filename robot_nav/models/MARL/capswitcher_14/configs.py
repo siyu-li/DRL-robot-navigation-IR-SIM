@@ -53,7 +53,7 @@ N_MOVE_GROUPS: int = len(MOVE_GROUPS)  # 22
 
 
 def make_coarse_steering(
-    move_distance: float = 0.5,
+    move_distance: float | dict = 0.5,
     method: str = "least_squares",
     step_time: float = 0.3,
     ang_max: float = 1.0,

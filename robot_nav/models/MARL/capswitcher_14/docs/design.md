@@ -101,12 +101,35 @@ codes 1..14 (`policies/group_generator.py`).
   the 6-robot system: rotation no longer depends on the chosen group; groups
   differ in *who translates* (and in the nonlinear solve's member objective).
 * **Coarse actions**: all **22** subgroups of size 3/4/7 (6 + 12 + 4), sorted
-  by (size, indices); list position = action id everywhere.  Size prices
-  itself through `step_cost = n_members · move_distance`.  Group size is
+  by (size, indices); list position = action id everywhere.  Group size is
   orthogonal to rank deficiency — size decides who moves, rank constrains the
   rotation subspace.
-* **Precise**: the frozen 14-robot GAT, one robot at a time (unchanged
-  semantics, `SwitcherEnv` reused as-is).
+* **Precise**: the frozen 14-robot GAT, one robot at a time.  Robots already
+  within `goal_threshold` are **skipped** — they neither move nor cost.
+
+## 4b. Decision costs (`cost_14robots.yaml`)
+
+Pricing is data, not code: `SwitcherCost` (`capswitcher/rl/cost.py`, shared by
+both instantiations) loads a YAML listing, per coarse action id, the group's
+`members`, its `move_distance` and its `cost`.  Costs are **free constants**,
+no longer derived from `n_members · move_distance` (`cost: auto` still means
+that product).  The listed members are validated against the live group
+algebra at construction, so a reordering fails loudly instead of silently
+mispricing.  Per-group `move_distance` also drives the primitive itself —
+`CoarseSteering14` takes the whole `{group: distance}` table.
+
+Precise is priced per robot **per sub-step**:
+
+    precise cost = precise_unit × (robots driven) × (sub-steps each)
+
+The planner charges the nominal `precise_unit · n_unreached(ms) ·
+selection_interval` (so the precise edge gets cheaper as robots finish); the
+environment charges the sub-steps actually executed.  The two differ only when
+a terminal event truncates a rollout.  The leaf heuristic follows the same
+unit: `α = precise_unit / (lin_max · step_time)` over *unreached* robots only.
+
+There is no reward-shaping layer left: the environment's reward is `−path_cost`
+and collision / all-reached / out-of-bounds are `done` flags, not bonuses.
 
 ## 5. Phase 0 → distill loop
 
@@ -128,6 +151,7 @@ Certificates give upper bounds only; no optimality claims (settled).
 
 ```
 configs.py                     A_FULL, MOVE_GROUPS (22), make_coarse_steering
+cost_14robots.yaml             per-group members/move_distance/cost, precise_unit
 policies/group_generator.py    binary group algebra (moved from capswitcher)
 policies/coarse_steering.py    CoarseSteering14: full-A rotation, no drop RNG
 rl/forward_model.py            ForwardModel14: coarse_move (single edge),
@@ -143,7 +167,8 @@ robot_nav/train_prior.py       distillation training (sim-free, local OK)
 tests/test_capswitcher_14_config.py   pinned group lists, A_FULL, determinism
 tests/test_tree_search_14.py          lazy search semantics + minimin anchor
 tests/test_prior_net_14.py            features/net shapes, prior contract
+tests/test_switcher_cost.py           cost formulas, drift validation, YAMLs
 ```
 
 Reused from `capswitcher` (imported, not forked): shield sweep geometry,
-`PathCostReward`, `GATBackbone`, `SwitcherEnv`, `LearnedCostToGo`.
+`SwitcherCost`, `GATBackbone`, `SwitcherEnv`, `LearnedCostToGo`.

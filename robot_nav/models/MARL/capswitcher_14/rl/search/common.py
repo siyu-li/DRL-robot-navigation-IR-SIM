@@ -9,8 +9,9 @@ known without touching the model — and its transition is materialised only whe
 the search actually descends the edge.  Contrast ``capswitcher.rl.search.common``,
 whose eager ``expand`` vets every group and rolls out precise at every node.
 
-Step costs are exact at stub creation (member count × move distance / flat
-precise cost), so selection can price edges before buying their transitions.
+Step costs are exact at stub creation (the group's configured constant from the
+``SwitcherCost`` table / ``precise_unit × n_unreached × selection_interval``),
+so selection can price edges before buying their transitions.
 
 A shield-refuted coarse edge is an *illegal action discovered late*: it is
 pruned from the node's legal set — no Q value, no collision penalty.  The
@@ -53,10 +54,12 @@ def expand_stubs(model, ms) -> list[Branch]:
     the cheap half of an expansion; the prior forward pass is the other half.
     """
     branches = [
-        Branch(mode=COARSE, group=g, step_cost=model.step_cost(COARSE, g))
+        Branch(mode=COARSE, group=g, step_cost=model.step_cost(COARSE, ms, g))
         for g in model.coarse.selectable_groups()
     ]
-    branches.append(Branch(mode=PRECISE, group=None, step_cost=model.step_cost(PRECISE)))
+    branches.append(
+        Branch(mode=PRECISE, group=None, step_cost=model.step_cost(PRECISE, ms))
+    )
     return branches
 
 

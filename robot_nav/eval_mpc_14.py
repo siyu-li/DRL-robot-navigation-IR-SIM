@@ -15,7 +15,7 @@ with the default uniform prior (high-budget teacher).  Iteration t trains a
 prior with ``train_prior.py`` and re-collects with ``--prior-model <ckpt>``.
 
 Usage (run on the GPU box — local irsim step crashes; see project memory):
-    python -m robot_nav.eval_mpc_14 --episodes 100 --budgets 100 --baselines \
+    python -m robot_nav.eval_mpc_14 --episodes 100 --budgets 100  \
         --log-pi-targets data/pi_targets_14
     python -m robot_nav.eval_mpc_14 --episodes 100 --budgets 40 100 \
         --prior-model <ckpt> --value-model <ckpt>
@@ -33,7 +33,7 @@ from loguru import logger
 
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 from robot_nav.models.MARL.capswitcher.policies.gat_backbone import GATBackbone
-from robot_nav.models.MARL.capswitcher.rl.reward import PathCostReward
+from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
 from robot_nav.models.MARL.capswitcher.rl.switcher_env import SwitcherEnv
 from robot_nav.models.MARL.capswitcher_14.configs import (
     MOVE_GROUPS,
@@ -58,8 +58,19 @@ DEFAULT_BACKBONE_CKPT = (
 )
 
 
+def resolve_device(name: str) -> torch.device:
+    """Resolve ``--device``; ``"auto"`` picks cuda when available, else cpu."""
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
+DEFAULT_COST_CONFIG = "robot_nav/models/MARL/capswitcher_14/cost_14robots.yaml"
+
+
 def build_env(
-    device: torch.device, move_distance: float, backbone_ckpt: str
+    device: torch.device, cost: SwitcherCost, goal_threshold: float,
+    backbone_ckpt: str,
 ) -> tuple[SwitcherEnv, CoarseSteering14, MARL_SIM_OBSTACLE]:
     """Construct 14-robot sim + backbone + coarse primitive + switcher env."""
     sim = MARL_SIM_OBSTACLE(
@@ -79,11 +90,16 @@ def build_env(
         embedding_source="decoder",
     )
     coarse = make_coarse_steering(
-        move_distance=move_distance,
+        move_distance=cost.move_distances,
         method="nonlinear",
         step_time=sim.env.step_time,
         ang_max=1.0,
         lin_max=0.5,
+    )
+    # Fail loudly if the cost YAML's group table drifted from the algebra.
+    cost.validate_members(
+        {g: [int(i) for i in coarse.members_of(g)]
+         for g in coarse.selectable_groups()}
     )
     env = SwitcherEnv(
         sim=sim,
@@ -91,7 +107,8 @@ def build_env(
         coarse_steering=coarse,
         selection_interval=5,
         max_decisions=120,
-        reward_fn=PathCostReward(),
+        cost=cost,
+        goal_threshold=goal_threshold,
         device=device,
         terminate_on_oob=False,
     )
@@ -274,9 +291,14 @@ def main() -> None:
     ap.add_argument("--c-visit", type=float, default=50.0)
     ap.add_argument("--c-scale", type=float, default=1.0)
     ap.add_argument("--d-safe", type=float, default=0.3)
-    ap.add_argument("--move-distance", type=float, default=1.5)
+    ap.add_argument("--cost-config", type=str, default=DEFAULT_COST_CONFIG,
+                    help="SwitcherCost YAML (per-group move_distance + cost, "
+                         "precise_unit)")
     ap.add_argument("--goal-threshold", type=float, default=0.3)
     ap.add_argument("--backbone-ckpt", type=str, default=DEFAULT_BACKBONE_CKPT)
+    ap.add_argument("--device", type=str, default="auto",
+                    help="torch device for the backbone / prior / value nets "
+                         "('auto' = cuda when available, else cpu)")
     ap.add_argument("--baselines", action="store_true",
                     help="also run precise-only and coarse-only baselines")
     ap.add_argument("--prior-model", type=str, default=None,
@@ -288,18 +310,21 @@ def main() -> None:
     ap.add_argument("--value-model", type=str, default=None,
                     help="learned cost-to-go checkpoint (train_value.py)")
     ap.add_argument("--log-pi-targets", type=str, default=None,
-                    help="directory for per-decision prior-training shards")
+                    help="directory for harvests the training data for learning prior")
     args = ap.parse_args()
 
-    device = torch.device("cpu")
+    device = resolve_device(args.device)
+    cost = SwitcherCost.from_yaml(args.cost_config)
     env, coarse, sim = build_env(
-        device, move_distance=args.move_distance, backbone_ckpt=args.backbone_ckpt
+        device, cost=cost, goal_threshold=args.goal_threshold,
+        backbone_ckpt=args.backbone_ckpt,
     )
     print(
         f"Env: {sim.num_robots} robots, {sim.num_obstacles} obstacles, "
-        f"{len(MOVE_GROUPS)} coarse groups, move_distance={coarse.move_distance}, "
-        f"d_safe={args.d_safe}, budgets={args.budgets}, "
-        f"prior={args.prior_model or 'uniform'}"
+        f"{len(MOVE_GROUPS)} coarse groups, cost_config={args.cost_config}, "
+        f"precise_unit={cost.precise_unit}, d_safe={args.d_safe}, "
+        f"budgets={args.budgets}, prior={args.prior_model or 'uniform'}, "
+        f"device={device}"
     )
 
     leaf_value = None
@@ -320,9 +345,10 @@ def main() -> None:
         )
 
         prior = LearnedPrior(
-            PriorNet.load(args.prior_model),
+            PriorNet.load(args.prior_model, map_location=device),
             feature_builder,
             feas_margin=args.feas_margin,
+            device=device,
         )
         print(f"Learned prior: {args.prior_model} (feas_margin={args.feas_margin})")
 
@@ -349,7 +375,7 @@ def main() -> None:
             d_safe=args.d_safe,
             selection_interval=env.selection_interval,
             goal_threshold=args.goal_threshold,
-            reward_fn=env.reward_fn,
+            cost=env.cost,
             leaf_value=leaf_value,
             feature_builder=feature_builder,
         )

@@ -6,9 +6,10 @@ of remaining precise decisions until that robot reaches its goal (trained by
 Monte-Carlo supervised learning on rollouts of the frozen precise GAT policy —
 see ``robot_nav/collect_value_data.py`` / ``robot_nav/train_value.py``).  The
 leaf evaluator sums the per-robot predictions over unreached robots and scales
-by ``precise_cost``:
+by the per-robot decision price from the live cost table:
 
-    h_precise(x) = precise_cost * sum_i  v_psi(feature_i),   i unreached
+    h_precise(x) = precise_unit * selection_interval
+                   * sum_i  v_psi(feature_i),   i unreached
 
 which plugs into :meth:`ForwardModel.cost_to_go` as a selectable replacement for
 the crude analytic heuristic ``alpha * sum_i ||p_i - goal_i||``.
@@ -128,7 +129,15 @@ class LearnedCostToGo:
     """
     Selectable leaf evaluator for :meth:`ForwardModel.cost_to_go`:
 
-        h_precise(x) = precise_cost * sum_{i unreached}  v_psi(feature_i)
+        h_precise(x) = (precise_unit * selection_interval)
+                       * sum_{i unreached}  v_psi(feature_i)
+
+    ``v_psi`` predicts remaining precise *decisions* per robot; one decision
+    drives one robot for ``selection_interval`` sub-steps at ``precise_unit``
+    cost per sub-step, so the per-decision price comes from the **model's
+    live cost table** (``model.cost.precise_unit * model.selection_interval``)
+    — not from the checkpoint, which stores only the legacy ``precise_cost``
+    metadata of its training run.
 
     Robots already within ``goal_threshold`` contribute 0 (cost-to-go 0 at
     goal); predictions are clamped at 0.  The sum pool is the project's chosen
@@ -142,6 +151,8 @@ class LearnedCostToGo:
         self.device = torch.device(device)
         self.net, ckpt = load_value_checkpoint(checkpoint_path, device=self.device)
         self.feature: str = ckpt["feature"]
+        # Legacy metadata (training-time constant); pricing now comes from the
+        # model's SwitcherCost at call time.
         self.precise_cost: float = float(ckpt["precise_cost"])
         self.x_mean = torch.as_tensor(ckpt["x_mean"], dtype=torch.float32, device=self.device)
         self.x_std = torch.as_tensor(ckpt["x_std"], dtype=torch.float32, device=self.device)
@@ -163,4 +174,5 @@ class LearnedCostToGo:
         with torch.no_grad():
             v = self.net(x).clamp_min(0.0)             # (N,) decisions
         mask = torch.as_tensor(unreached, device=self.device)
-        return float(self.precise_cost * v[mask].sum().item())
+        per_decision = model.cost.precise_unit * model.selection_interval
+        return float(per_decision * v[mask].sum().item())

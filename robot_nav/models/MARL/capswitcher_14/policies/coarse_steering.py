@@ -19,7 +19,8 @@ A single coarse control of move-group ``g`` has two physical parts:
    and apply ``dθ_actual = A @ t*`` to every robot.
 
 2. **Move.** Only the *members* of the chosen move-group advance forward by the
-   fixed translation length ``move_distance``; non-members hold still.
+   group's configured translation length ``move_distances[group]``; non-members
+   hold still.
 
 Move-groups vs actuation columns
 --------------------------------
@@ -57,7 +58,10 @@ class CoarseSteering14:
                        never reduced.
         move_groups:   List of member index arrays — the selectable coarse
                        move-groups (0-based ids are positions in this list).
-        move_distance: Coarse translation length (metres) per control. Default 0.5.
+        move_distance: Coarse translation length (metres) per control — a scalar
+                       applied to every group, or a ``{group_id: distance}``
+                       mapping covering every selectable group (e.g.
+                       ``SwitcherCost.move_distances``). Default 0.5.
         method:        ``"least_squares"`` (pinv heading) or ``"nonlinear"``
                        (maximise members' distance-to-goal reduction).
         step_time:     Simulator step duration (s). Default 0.3.
@@ -69,7 +73,7 @@ class CoarseSteering14:
         self,
         A_full: np.ndarray,
         move_groups: list,
-        move_distance: float = 0.5,
+        move_distance: float | dict = 0.5,
         method: str = "least_squares",
         step_time: float = 0.3,
         ang_max: float = 1.0,
@@ -93,7 +97,16 @@ class CoarseSteering14:
             if g.min() < 0 or g.max() >= self.num_robots:
                 raise ValueError(f"move-group {g.tolist()} out of range for N={self.num_robots}.")
 
-        self.move_distance = float(move_distance)
+        group_ids = range(len(self._members))
+        if isinstance(move_distance, dict):
+            missing = [g for g in group_ids if g not in move_distance]
+            if missing:
+                raise ValueError(f"move_distance mapping missing groups {missing}")
+            self.move_distances = {g: float(move_distance[g]) for g in group_ids}
+        else:
+            self.move_distances = {g: float(move_distance) for g in group_ids}
+        if any(d < 0.0 for d in self.move_distances.values()):
+            raise ValueError("move_distance must be non-negative")
         self.method = method
         self.step_time = float(step_time)
         self.ang_max = float(ang_max)
@@ -125,6 +138,7 @@ class CoarseSteering14:
         gx: np.ndarray,
         gy: np.ndarray,
         members: np.ndarray,
+        move_distance: float,
     ) -> np.ndarray:
         """
         Solve for the per-robot rotation ``dθ_actual = A @ t*`` (full matrix).
@@ -138,7 +152,7 @@ class CoarseSteering14:
         if self.method == "least_squares":
             t_star = t_ls
         else:
-            d = self.move_distance
+            d = move_distance
             pm = np.stack([px[members], py[members]], axis=1)        # (Nm, 2)
             gm = np.stack([gx[members], gy[members]], axis=1)        # (Nm, 2)
             theta_m = theta_current[members]                          # (Nm,)
@@ -196,8 +210,9 @@ class CoarseSteering14:
         d_theta_desired = _angle_wrap(theta_desired - theta_current)  # (N,)
 
         members = self._members[group]
+        move_distance = self.move_distances[group]
         d_theta_actual = self._solve_rotation(
-            theta_current, d_theta_desired, px, py, gx, gy, members
+            theta_current, d_theta_desired, px, py, gx, gy, members, move_distance
         )
 
         # ---- Rotation sub-steps (split to respect ang_max) ----------------
@@ -215,9 +230,9 @@ class CoarseSteering14:
         member_set = set(int(i) for i in members)
         max_per_step_lin = self.lin_max * self.step_time
         translation_frames: list[list[list[float]]] = []
-        if self.move_distance > 1e-9:
-            n_trans = int(np.ceil(self.move_distance / max_per_step_lin))
-            lin_cmd = self.move_distance / (n_trans * self.step_time)
+        if move_distance > 1e-9:
+            n_trans = int(np.ceil(move_distance / max_per_step_lin))
+            lin_cmd = move_distance / (n_trans * self.step_time)
             lin_cmd = min(lin_cmd, self.lin_max)
             frame = [
                 [lin_cmd if i in member_set else 0.0, 0.0]

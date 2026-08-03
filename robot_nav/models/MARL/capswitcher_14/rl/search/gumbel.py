@@ -43,7 +43,7 @@ import math
 
 import numpy as np
 
-from robot_nav.models.MARL.capswitcher.rl.reward import PathCostReward
+from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
 from robot_nav.models.MARL.capswitcher_14.rl.forward_model import (
     ForwardModel14,
     build_forward_model,
@@ -252,11 +252,16 @@ class GumbelSwitcher14:
         d_safe: float = 0.3,
         selection_interval: int = 5,
         goal_threshold: float = 0.3,
-        reward_fn: PathCostReward | None = None,
+        cost: SwitcherCost | None = None,
         default_rho: float = 0.2,
         leaf_value=None,
         feature_builder=None,
     ) -> None:
+        if cost is None:
+            raise ValueError(
+                "GumbelSwitcher14 requires a SwitcherCost (load "
+                "cost_14robots.yaml with SwitcherCost.from_yaml)"
+            )
         self.backbone = backbone
         self.coarse = coarse
         self.sim = sim
@@ -266,7 +271,7 @@ class GumbelSwitcher14:
         self.d_safe = float(d_safe)
         self.selection_interval = int(selection_interval)
         self.goal_threshold = float(goal_threshold)
-        self.reward_fn = reward_fn if reward_fn is not None else PathCostReward()
+        self.cost = cost
         self.default_rho = float(default_rho)
         self.leaf_value = leaf_value
         self.search = GumbelAlphaZero14(
@@ -286,7 +291,7 @@ class GumbelSwitcher14:
             d_safe=self.d_safe,
             selection_interval=self.selection_interval,
             goal_threshold=self.goal_threshold,
-            reward_fn=self.reward_fn,
+            cost=self.cost,
             default_rho=self.default_rho,
             leaf_value=self.leaf_value,
         )

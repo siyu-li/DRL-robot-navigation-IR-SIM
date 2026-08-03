@@ -22,14 +22,15 @@ and backfill the label at episode end:
     label_i(t) = (R_i + 1 - t) * precise_cost
 
 where ``R_i`` is the (0-based) decision during which robot i first came within
-``goal_threshold`` of its goal.  This is the Monte-Carlo realized remaining
-precise cost in PathCostReward units: the reward charges a flat
-``precise_cost`` per precise decision, and a robot receives exactly
-``selection_interval`` GAT sub-steps per decision both here (3 controlled
-robots take turns) and in precise-all (6 robots take turns), so per-robot
-decision counts transfer.  Labeling stops at first arrival (cost-to-go 0 at
-goal); robots that never arrive (collision / decision cap) are CENSORED and
-discarded — the other controlled robots of the same episode are kept.
+``goal_threshold`` of its goal, and ``precise_cost = precise_unit *
+selection_interval`` is the per-robot price of one precise decision from the
+:class:`SwitcherCost` table.  This is the Monte-Carlo realized remaining
+precise cost: a robot receives exactly ``selection_interval`` GAT sub-steps
+per decision both here (3 controlled robots take turns) and in precise-all
+(6 robots take turns), so per-robot decision counts transfer.  Labeling stops
+at first arrival (cost-to-go 0 at goal); robots that never arrive (collision /
+decision cap) are CENSORED and discarded — the other controlled robots of the
+same episode are kept.
 
 Caveat carried by the data: the neighbors are STATIC, so the label is a
 cost-to-go treating them as fixed — a partial-congestion model, not
@@ -49,7 +50,8 @@ import numpy as np
 import torch
 from loguru import logger
 
-from robot_nav.eval_mpc import build_env
+from robot_nav.eval_mpc import DEFAULT_COST_CONFIG, build_env
+from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
 from robot_nav.models.MARL.capswitcher.rl.switcher_env import SwitcherEnv
 
 logger.disable("irsim")
@@ -178,13 +180,18 @@ def main() -> None:
     ap.add_argument("--goal-threshold", type=float, default=0.3)
     ap.add_argument("--shard-episodes", type=int, default=200,
                     help="episodes per .npz shard")
-    ap.add_argument("--move-distance", type=float, default=1.5,
-                    help="only affects env construction; coarse mode is unused here")
+    ap.add_argument("--cost-config", type=str, default=DEFAULT_COST_CONFIG,
+                    help="SwitcherCost YAML; only precise_unit matters here "
+                         "(coarse mode is unused)")
     args = ap.parse_args()
 
     device = torch.device("cpu")
-    env, coarse, sim = build_env(device, move_distance=args.move_distance)
-    precise_cost = float(env.reward_fn.precise_cost)
+    cost = SwitcherCost.from_yaml(args.cost_config)
+    env, coarse, sim = build_env(
+        device, cost=cost, goal_threshold=args.goal_threshold
+    )
+    # Per-robot price of one precise decision — the label unit.
+    precise_cost = float(cost.precise_unit * env.selection_interval)
     meta = {
         "precise_cost": precise_cost,
         "selection_interval": env.selection_interval,

@@ -133,7 +133,9 @@ class StubModel:
     def cost_to_go(self, ms: StubState) -> float:
         return float(self._h.get(ms.name, 0.0))
 
-    def step_cost(self, mode: int, group: int | None = None) -> float:
+    def step_cost(
+        self, mode: int, ms: StubState, group: int | None = None
+    ) -> float:
         if mode == COARSE:
             return self._coarse_costs[group]
         return self._precise_cost

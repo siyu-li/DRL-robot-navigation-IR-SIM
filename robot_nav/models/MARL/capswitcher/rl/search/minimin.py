@@ -31,7 +31,7 @@ from robot_nav.models.MARL.capswitcher.rl.forward_model import (
     ModelState,
     build_forward_model,
 )
-from robot_nav.models.MARL.capswitcher.rl.reward import PathCostReward
+from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
 
 # Expansion machinery shared with the MCTS / Gumbel searches.
 from robot_nav.models.MARL.capswitcher.rl.search.common import (
@@ -126,12 +126,12 @@ class MPCSwitcher:
         depth:              Lookahead depth in decisions (1 = myopic).
         d_safe:             Clearance margin (m) for the coarse safety mask.
         alpha:              Cost-to-go slope; ``None`` uses
-                            ``precise_cost / (lin_max · step_time)``.
+                            ``precise_unit / (lin_max · step_time)``.
         selection_interval: Sub-steps per robot in a precise decision (match env).
         goal_threshold:     Per-robot goal-arrival radius (m) for the model's
                             ``all_reached`` terminal.
-        reward_fn:          ``PathCostReward`` supplying the motion cost (defaults
-                            to the eval configuration).
+        cost:               :class:`SwitcherCost` decision-pricing table (load
+                            with ``SwitcherCost.from_yaml``).
         default_rho:        Fallback robot radius if the sim does not expose one.
         leaf_value:         Optional learned leaf evaluator ``(model, ms) -> float``
                             (e.g. ``LearnedCostToGo``); replaces the crude
@@ -148,10 +148,15 @@ class MPCSwitcher:
         alpha: float | None = None,
         selection_interval: int = 5,
         goal_threshold: float = 0.3,
-        reward_fn: PathCostReward | None = None,
+        cost: SwitcherCost | None = None,
         default_rho: float = 0.2,
         leaf_value=None,
     ) -> None:
+        if cost is None:
+            raise ValueError(
+                "MPCSwitcher requires a SwitcherCost (load the system's "
+                "cost YAML with SwitcherCost.from_yaml)"
+            )
         self.backbone = backbone
         self.coarse = coarse
         self.sim = sim
@@ -160,7 +165,7 @@ class MPCSwitcher:
         self.alpha = alpha
         self.selection_interval = int(selection_interval)
         self.goal_threshold = float(goal_threshold)
-        self.reward_fn = reward_fn if reward_fn is not None else PathCostReward()
+        self.cost = cost
         self.default_rho = float(default_rho)
         self.leaf_value = leaf_value
         # Per-decision node-expansion counts (budget accounting for eval).
@@ -176,7 +181,7 @@ class MPCSwitcher:
             d_safe=self.d_safe,
             selection_interval=self.selection_interval,
             goal_threshold=self.goal_threshold,
-            reward_fn=self.reward_fn,
+            cost=self.cost,
             default_rho=self.default_rho,
             leaf_value=self.leaf_value,
         )

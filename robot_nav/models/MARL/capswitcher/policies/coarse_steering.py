@@ -103,8 +103,10 @@ class CoarseSteering:
     Args:
         num_robots:    Number of robots (must be 6 for the default matrix).
         move_distance: Coarse translation length (metres): how far the chosen
-                       group's members advance per coarse control. Independent of
-                       the simulator velocity cap — large values are split across
+                       group's members advance per coarse control — a scalar for
+                       every group, or a ``{group_id: distance}`` mapping (1-based
+                       ids) covering every selectable group. Independent of the
+                       simulator velocity cap — large values are split across
                        several sub-steps. Default 0.5.
         method:        ``"least_squares"`` (pinv heading) or ``"nonlinear"``
                        (maximise members' distance-to-goal reduction). Default
@@ -122,7 +124,7 @@ class CoarseSteering:
     def __init__(
         self,
         num_robots: int = 6,
-        move_distance: float = 0.5,
+        move_distance: float | dict = 0.5,
         method: str = "least_squares",
         step_time: float = 0.3,
         ang_max: float = 1.0,
@@ -139,7 +141,6 @@ class CoarseSteering:
                 f"method must be 'least_squares' or 'nonlinear' (got {method!r})."
             )
         self.num_robots = num_robots
-        self.move_distance = move_distance
         self.method = method
         self.step_time = step_time
         self.ang_max = ang_max
@@ -151,6 +152,18 @@ class CoarseSteering:
         self._members = [
             np.flatnonzero(self.A_full[:, g] == 0) for g in range(_NUM_GROUPS)
         ]
+
+        # Per-group translation lengths, keyed by 1-based selectable group id.
+        selectable = [g + 1 for g in range(_NUM_GROUPS) if self._members[g].size > 0]
+        if isinstance(move_distance, dict):
+            missing = [g for g in selectable if g not in move_distance]
+            if missing:
+                raise ValueError(f"move_distance mapping missing groups {missing}")
+            self.move_distances = {g: float(move_distance[g]) for g in selectable}
+        else:
+            self.move_distances = {g: float(move_distance) for g in selectable}
+        if any(d < 0.0 for d in self.move_distances.values()):
+            raise ValueError("move_distance must be non-negative")
 
         # Wall-clock seconds spent in the most recent rotation solve (the
         # least-squares projection or the nonlinear optimisation). Used for the
@@ -206,6 +219,7 @@ class CoarseSteering:
         gx: np.ndarray,
         gy: np.ndarray,
         members: np.ndarray,
+        move_distance: float,
     ) -> np.ndarray:
         """
         Solve for per-robot actual rotation ``dθ_actual = A_reduced @ t*``.
@@ -233,7 +247,7 @@ class CoarseSteering:
             t_star = t_ls
         else:
             # Fixed translation length (only members actually translate).
-            d = self.move_distance
+            d = move_distance
             pm = np.stack([px[members], py[members]], axis=1)        # (Nm, 2)
             gm = np.stack([gx[members], gy[members]], axis=1)        # (Nm, 2)
             theta_m = theta_current[members]                          # (Nm,)
@@ -306,11 +320,13 @@ class CoarseSteering:
         d_theta_desired = _angle_wrap(theta_desired - theta_current)  # (N,)
 
         members = self._members[group - 1]
+        move_distance = self.move_distances[group]
         rng = np.random.default_rng(seed) if seed is not None else None
         A_reduced = self._reduce_A(group, rng=rng)
 
         d_theta_actual = self._solve_rotation(
-            A_reduced, theta_current, d_theta_desired, px, py, gx, gy, members
+            A_reduced, theta_current, d_theta_desired, px, py, gx, gy, members,
+            move_distance,
         )
 
         # ---- Rotation sub-steps -------------------------------------------
@@ -335,9 +351,9 @@ class CoarseSteering:
         member_set = set(int(i) for i in members)
         max_per_step_lin = self.lin_max * self.step_time  # metres realisable per step
         translation_frames: list[list[list[float]]] = []
-        if self.move_distance > 1e-9:
-            n_trans = int(np.ceil(self.move_distance / max_per_step_lin))
-            lin_cmd = self.move_distance / (n_trans * self.step_time)  # ≤ lin_max
+        if move_distance > 1e-9:
+            n_trans = int(np.ceil(move_distance / max_per_step_lin))
+            lin_cmd = move_distance / (n_trans * self.step_time)  # ≤ lin_max
             lin_cmd = min(lin_cmd, self.lin_max)
             frame = [
                 [lin_cmd if i in member_set else 0.0, 0.0]

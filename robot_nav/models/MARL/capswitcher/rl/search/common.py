@@ -59,7 +59,7 @@ def expand(model, ms) -> tuple[list[Branch], list]:
                     group=group,
                     frames=mv.candidate.frames,
                     child=mv.next_state,
-                    step_cost=model.step_cost(COARSE, group),
+                    step_cost=model.step_cost(COARSE, ms, group),
                     candidate=mv.candidate,
                 )
             )
@@ -69,7 +69,7 @@ def expand(model, ms) -> tuple[list[Branch], list]:
             group=None,
             frames=None,
             child=model.precise_next(ms),
-            step_cost=model.step_cost(PRECISE),
+            step_cost=model.step_cost(PRECISE, ms),
         )
     )
     return branches, candidates

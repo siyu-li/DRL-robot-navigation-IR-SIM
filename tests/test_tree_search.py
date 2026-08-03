@@ -91,7 +91,7 @@ class StubModel:
         self.n_precise_expansions += 1
         return self.state(self._precise[ms.name])
 
-    def step_cost(self, action, group=None):
+    def step_cost(self, action, ms, group=None):
         if action == COARSE:
             return self.coarse_costs[group]
         return self.precise_cost

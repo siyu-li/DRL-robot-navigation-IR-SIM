@@ -25,7 +25,8 @@ import argparse
 import numpy as np
 import torch
 
-from robot_nav.eval_mpc import build_env
+from robot_nav.eval_mpc import DEFAULT_COST_CONFIG, build_env
+from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
 from robot_nav.models.MARL.capswitcher.rl.forward_model import (
     ForwardModel,
     _state_group_seed,
@@ -49,12 +50,17 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--episodes", type=int, default=5)
     ap.add_argument("--seed", type=int, default=2000)
-    ap.add_argument("--move-distance", type=float, default=1.5)
+    ap.add_argument("--cost-config", type=str, default=DEFAULT_COST_CONFIG,
+                    help="SwitcherCost YAML")
+    ap.add_argument("--goal-threshold", type=float, default=0.3)
     args = ap.parse_args()
 
     device = torch.device("cpu")
-    env, coarse, sim = build_env(device, move_distance=args.move_distance)
-    switcher = MPCSwitcher(env.backbone, coarse, sim, depth=1)
+    cost = SwitcherCost.from_yaml(args.cost_config)
+    env, coarse, sim = build_env(
+        device, cost=cost, goal_threshold=args.goal_threshold
+    )
+    switcher = MPCSwitcher(env.backbone, coarse, sim, depth=1, cost=cost)
 
     coarse_xy = coarse_th = 0.0
     precise_xy = precise_th = 0.0
