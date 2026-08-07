@@ -54,6 +54,7 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         goal_dwell_min: int = 0,
         goal_respawn_prob: float = 1.0,
         station_keeping_reward: float = 1.0,
+        save_ani: bool = False,
     ):
         """
         Initialize the MARL_SIM_OBSTACLE environment.
@@ -72,10 +73,13 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                 dwell period expires. 1.0 = immediate respawn after dwell (legacy).
             station_keeping_reward (float): Small positive reward given each step a
                 robot successfully holds at its goal without collision.
+            save_ani (bool): If True, IRSim buffers rendered frames so
+                ``env.end()`` writes an animation. Requires plotting enabled.
         """
         display = False if disable_plotting else True
         self.env = irsim.make(
-            world_file, disable_all_plot=disable_plotting, display=display
+            world_file, disable_all_plot=disable_plotting, display=display,
+            save_ani=save_ani,
         )
         robot_info = self.env.get_robot_info(0)
         self.robot_goal = robot_info.goal

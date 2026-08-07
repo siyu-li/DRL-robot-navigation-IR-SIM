@@ -51,6 +51,34 @@ logger.disable("irsim")
 
 COARSE, PRECISE = 0, 1
 
+# Reported metrics, shared by this harness and the plan→distil loop.
+#
+# The headline is **cost per successful episode** — `avg cost/ep` mixes the
+# solved and unsolved episodes together, so it moves with the success/timeout
+# composition as much as with plan quality, and it is not comparable across
+# cost tables at all.  The cost split below separates the flat per-group coarse
+# constants from the `precise_unit` surcharge, which is the term that changes
+# between cost configs.
+RESULT_ROWS = [
+    ("success rate",         "success_rate",        "{:.1%}"),
+    ("collision rate",       "collision_rate",      "{:.1%}"),
+    ("timeout rate",         "timeout_rate",        "{:.1%}"),
+    ("avg decisions/ep",     "avg_decisions",       "{:.1f}"),
+    ("cost/success ep  <<",  "avg_cost_success",    "{:.0f}"),
+    ("  coarse cost/ep",     "avg_coarse_cost",     "{:.0f}"),
+    ("  precise cost/ep",    "avg_precise_cost",    "{:.0f}"),
+    ("  precise share",      "precise_cost_share",  "{:.1%}"),
+    ("avg cost/ep (mixed)",  "avg_cost",            "{:.0f}"),
+    ("precise fraction",     "precise_frac",        "{:.1%}"),
+    ("coarse fraction",      "coarse_frac",         "{:.1%}"),
+    ("safe-coarse avail.",   "safe_avail_frac",     "{:.1%}"),
+    ("coarse breaches (!)",  "coarse_breach",       "{:d}"),
+    ("precise breaches",     "precise_breach",      "{:d}"),
+    ("  driven robot",       "precise_breach_active",    "{:d}"),
+    ("  bystander (!)",      "precise_breach_bystander", "{:d}"),
+    ("avg transitions/dec",  "avg_transitions",     "{:.1f}"),
+]
+
 DEFAULT_BACKBONE_CKPT = (
     "robot_nav/models/MARL/marlTD3/checkpoint/"
     "Mar.04_obstacle_14robots_partial_inactive/"
@@ -70,16 +98,22 @@ DEFAULT_COST_CONFIG = "robot_nav/models/MARL/capswitcher_14/cost_14robots.yaml"
 
 def build_env(
     device: torch.device, cost: SwitcherCost, goal_threshold: float,
-    backbone_ckpt: str,
+    backbone_ckpt: str, disable_plotting: bool = True, save_ani: bool = False,
 ) -> tuple[SwitcherEnv, CoarseSteering14, MARL_SIM_OBSTACLE]:
-    """Construct 14-robot sim + backbone + coarse primitive + switcher env."""
+    """
+    Construct 14-robot sim + backbone + coarse primitive + switcher env.
+
+    ``disable_plotting`` / ``save_ani`` are off by default so every evaluation
+    path stays headless; ``render_gaz14.py`` flips them to watch a policy.
+    """
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
-        disable_plotting=True,
+        disable_plotting=disable_plotting,
         reward_phase=6,
         per_robot_goal_reset=False,
         obstacle_proximity_threshold=1.5,
         num_inactive_robots=0,
+        save_ani=save_ani,
     )
     assert sim.num_robots == 14, f"expected 14 robots, world has {sim.num_robots}"
     backbone = GATBackbone(
@@ -123,13 +157,28 @@ def run(
 
     ``policy`` (a ``GumbelSwitcher14``) supplies per-decision transition
     counts — the lazy budget unit; baselines report 0.
+
+    Episode cost is split into its two priced components so a run is readable
+    independently of how precision happens to be priced:
+
+    * ``coarse_cost``   — the flat per-group constants (the baseline of moving
+      the formation at all);
+    * ``precise_cost``  — the ``precise_unit`` surcharge for resolving robots
+      one at a time.
+
+    Collisions are attributed to the mode that was executing when the sim
+    flagged them (``coarse_breach`` / ``precise_breach``, which sum to the
+    collision count), and — for precise — to whether the flagged robot was the
+    one being driven or a stationary bystander.
     """
     if policy is not None:
         policy.decision_transitions = []
     n = {"success": 0, "collision": 0, "timeout": 0}
     coarse_dec = precise_dec = total_dec = 0
-    safe_available = coarse_breach = 0
-    costs, lengths = [], []
+    safe_available = coarse_breach = precise_breach = 0
+    precise_breach_active = precise_breach_bystander = 0
+    costs, lengths, success_costs = [], [], []
+    coarse_costs, precise_costs = [], []
 
     for ep in range(episodes):
         seed = base_seed + ep
@@ -140,6 +189,7 @@ def run(
         env.reset()
         done = False
         ep_cost, ep_len = 0.0, 0
+        ep_coarse_cost = ep_precise_cost = 0.0
         info: dict = {}
         while not done:
             decision = decide_fn(env)
@@ -152,34 +202,64 @@ def run(
             )
             ep_len += 1
             total_dec += 1
-            ep_cost += float(info["path_cost"])
+            step_cost = float(info["path_cost"])
+            ep_cost += step_cost
             if decision["mode"] == COARSE:
                 coarse_dec += 1
+                ep_coarse_cost += step_cost
                 if info["collision"]:
                     coarse_breach += 1
             else:
                 precise_dec += 1
+                ep_precise_cost += step_cost
+                if info["collision"]:
+                    precise_breach += 1
+                    # Precise drives exactly one robot at a time; the rest hold
+                    # still.  If the flagged robot is the driven one, the frozen
+                    # individual policy steered into something.
+                    flagged = set(info.get("collision_robots") or [])
+                    if info.get("active_robot") in flagged:
+                        precise_breach_active += 1
+                    else:
+                        precise_breach_bystander += 1
 
         if info.get("all_reached"):
             n["success"] += 1
+            success_costs.append(ep_cost)
         if info.get("collision"):
             n["collision"] += 1
         if info.get("timeout"):
             n["timeout"] += 1
         costs.append(ep_cost)
+        coarse_costs.append(ep_coarse_cost)
+        precise_costs.append(ep_precise_cost)
         lengths.append(ep_len)
 
+    avg_cost = float(np.mean(costs))
+    avg_coarse_cost = float(np.mean(coarse_costs))
+    avg_precise_cost = float(np.mean(precise_costs))
     return {
         "episodes": episodes,
         "success_rate": n["success"] / episodes,
         "collision_rate": n["collision"] / episodes,
         "timeout_rate": n["timeout"] / episodes,
         "avg_decisions": float(np.mean(lengths)),
-        "avg_cost": float(np.mean(costs)),
+        "avg_cost": avg_cost,
+        # Headline: what a solved episode actually costs.  None when no episode
+        # succeeded (cycle 1 of a cold run can legitimately have zero).
+        "avg_cost_success": (
+            float(np.mean(success_costs)) if success_costs else None
+        ),
+        "avg_coarse_cost": avg_coarse_cost,
+        "avg_precise_cost": avg_precise_cost,
+        "precise_cost_share": avg_precise_cost / max(avg_cost, 1e-9),
         "coarse_frac": coarse_dec / max(total_dec, 1),
         "precise_frac": precise_dec / max(total_dec, 1),
         "safe_avail_frac": safe_available / max(total_dec, 1),
         "coarse_breach": coarse_breach,
+        "precise_breach": precise_breach,
+        "precise_breach_active": precise_breach_active,
+        "precise_breach_bystander": precise_breach_bystander,
         "avg_transitions": (
             float(np.mean(policy.decision_transitions))
             if policy is not None and policy.decision_transitions
@@ -255,26 +335,15 @@ def _save_pi_targets(
 
 def print_table(results: dict[str, dict]) -> None:
     """Side-by-side comparison of the result dicts."""
-    rows = [
-        ("success rate",        "success_rate",    "{:.1%}"),
-        ("collision rate",      "collision_rate",  "{:.1%}"),
-        ("timeout rate",        "timeout_rate",    "{:.1%}"),
-        ("avg decisions/ep",    "avg_decisions",   "{:.1f}"),
-        ("avg path length/ep",  "avg_cost",        "{:.1f}"),
-        ("precise fraction",    "precise_frac",    "{:.1%}"),
-        ("coarse fraction",     "coarse_frac",     "{:.1%}"),
-        ("safe-coarse avail.",  "safe_avail_frac", "{:.1%}"),
-        ("coarse breaches (!)", "coarse_breach",   "{:d}"),
-        ("avg transitions/dec", "avg_transitions", "{:.1f}"),
-    ]
     names = list(results)
-    header = f"{'metric':<22}" + "".join(f"{nm:>14}" for nm in names)
+    header = f"{'metric':<24}" + "".join(f"{nm:>14}" for nm in names)
     print("\n" + header)
     print("-" * len(header))
-    for label, key, fmt in rows:
-        line = f"{label:<22}"
+    for label, key, fmt in RESULT_ROWS:
+        line = f"{label:<24}"
         for nm in names:
-            line += f"{fmt.format(results[nm][key]):>14}"
+            v = results[nm].get(key)
+            line += f"{'—' if v is None else fmt.format(v):>14}"
         print(line)
     print()
 

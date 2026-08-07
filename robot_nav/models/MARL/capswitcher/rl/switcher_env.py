@@ -199,7 +199,10 @@ class SwitcherEnv:
             info:   Dict with diagnostic keys:
                     ``collision``, ``all_reached``, ``timeout``, ``oob``,
                     ``mode``, ``group``, ``steps_taken``, ``robots_moved``,
-                    ``path_cost``.
+                    ``path_cost``, plus the collision-attribution keys
+                    ``collision_robots`` (indices flagged by the sim) and
+                    ``active_robot`` (the robot the precise rollout was
+                    driving when the sub-step fired; ``None`` for coarse).
         """
         self._decision_count += 1
 
@@ -214,6 +217,11 @@ class SwitcherEnv:
             "steps_taken":  0,
             "robots_moved": 0,
             "path_cost":    0.0,
+            # Collision attribution: which robots the sim flagged, and which
+            # robot precise mode was driving at the time (precise moves exactly
+            # one robot per sub-step, so this pins the blame).
+            "collision_robots": [],
+            "active_robot":     None,
         }
 
         if action == 0:
@@ -307,6 +315,7 @@ class SwitcherEnv:
             if float(self._last_distances[r]) <= self.goal_threshold:
                 continue
             info["robots_moved"] += 1
+            info["active_robot"] = r
             for _ in range(self.selection_interval):
                 # Fresh actions for the current state (lazy: one forward/state).
                 if not self._cache_valid:
@@ -360,6 +369,9 @@ class SwitcherEnv:
         done = False
         if any(collision):
             info["collision"] = True
+            info["collision_robots"] = [
+                i for i, c in enumerate(collision) if c
+            ]
             done = True
         if all(goal):
             info["all_reached"] = True

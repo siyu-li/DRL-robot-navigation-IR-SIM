@@ -43,6 +43,7 @@ from loguru import logger
 from robot_nav.eval_mpc_14 import (
     DEFAULT_BACKBONE_CKPT,
     DEFAULT_COST_CONFIG,
+    RESULT_ROWS,
     _gumbel_decider,
     _save_pi_targets,
     build_env,
@@ -63,18 +64,8 @@ from robot_nav.train_prior import train_prior
 
 logger.disable("irsim")
 
-# Reported per cycle: (label, results key, format).
-_ROWS = [
-    ("success rate",        "success_rate",    "{:.1%}"),
-    ("collision rate",      "collision_rate",  "{:.1%}"),
-    ("timeout rate",        "timeout_rate",    "{:.1%}"),
-    ("avg decisions/ep",    "avg_decisions",   "{:.1f}"),
-    ("avg cost/ep",         "avg_cost",        "{:.0f}"),
-    ("precise fraction",    "precise_frac",    "{:.1%}"),
-    ("coarse fraction",     "coarse_frac",     "{:.1%}"),
-    ("safe-coarse avail.",  "safe_avail_frac", "{:.1%}"),
-    ("coarse breaches (!)", "coarse_breach",   "{:d}"),
-    ("avg transitions/dec", "avg_transitions", "{:.1f}"),
+# Reported per cycle: the shared eval metrics plus this loop's distil stats.
+_ROWS = RESULT_ROWS + [
     ("prior val KL",        "val_kl",          "{:.4f}"),
     ("prior feas acc",      "feas_acc",        "{:.3f}"),
     ("distil samples",      "n_samples",       "{:d}"),
@@ -85,14 +76,14 @@ _ROWS = [
 def print_table(cycles: list[dict], leaf: str) -> None:
     """Print the across-cycle comparison table."""
     names = [c["name"] for c in cycles]
-    header = f"{'metric':<22}" + "".join(f"{nm:>14}" for nm in names)
+    header = f"{'metric':<24}" + "".join(f"{nm:>14}" for nm in names)
     print("\n" + "=" * len(header))
     print(f"CAPSwitcher-14 plan→distil loop — leaf heuristic: {leaf}")
     print("=" * len(header))
     print(header)
     print("-" * len(header))
     for label, key, fmt in _ROWS:
-        line = f"{label:<22}"
+        line = f"{label:<24}"
         for c in cycles:
             v = c.get(key)
             line += f"{'—' if v is None else fmt.format(v):>14}"
@@ -101,13 +92,37 @@ def print_table(cycles: list[dict], leaf: str) -> None:
 
     first, last = cycles[0], cycles[-1]
     d_succ = last["success_rate"] - first["success_rate"]
-    d_cost = last["avg_cost"] - first["avg_cost"]
-    print(
-        f"cycle 1 → {len(cycles)}:  success {d_succ:+.1%}   "
-        f"avg cost {d_cost:+.0f} ({d_cost / max(first['avg_cost'], 1e-9):+.1%})"
-    )
+    print(f"cycle 1 → {len(cycles)}:  success {d_succ:+.1%}")
+
+    # Headline cost delta on solved episodes only.  A cold cycle 1 can solve
+    # nothing, so anchor on the earliest cycle that actually has a value.
+    solved = [(i, c) for i, c in enumerate(cycles, 1) if c["avg_cost_success"]]
+    if len(solved) >= 2:
+        (i0, a), (i1, b) = solved[0], solved[-1]
+        c0, c1 = a["avg_cost_success"], b["avg_cost_success"]
+        d = c1 - c0
+        note = "" if a is first else (
+            f"  (earlier cycles solved nothing; anchored on {i0} → {i1})"
+        )
+        print(f"{'':13}cost/success ep {d:+.0f} ({d / c0:+.1%})   "
+              f"[{c0:.0f} → {c1:.0f}]{note}")
+    else:
+        print(f"{'':13}cost/success ep — (fewer than two cycles solved anything)")
+
+    # Precision is the term that differs between cost tables; when it dominates,
+    # the total-cost trend tracks pricing rather than plan quality.
+    s0, s1 = first["precise_cost_share"], last["precise_cost_share"]
+    print(f"{'':13}precise cost share {s0:.1%} → {s1:.1%}")
+    if s1 > 0.5:
+        print("NOTE: the precise surcharge is over half of episode cost — total "
+              "cost now tracks precision pricing more than plan quality. "
+              "Compare cost/success ep, and consider lowering precise_unit.")
+
     if any(c["coarse_breach"] > 0 for c in cycles):
         print("WARNING: coarse breaches > 0 — raise --d-safe or check geometry.")
+    if any(c["precise_breach_bystander"] > 0 for c in cycles):
+        print("WARNING: a stationary robot was flagged in a precise collision — "
+              "expected only for the driven robot; check collision semantics.")
     print()
 
 
@@ -238,12 +253,20 @@ def main() -> None:
         _save_pi_targets(pi_log, shard_dir, f"cycle_{t:02d}", args.d_safe)
         shard_dirs.append(str(shard_dir))
 
+        cs = stats["avg_cost_success"]
         print(
             f"  success {stats['success_rate']:.1%}  "
             f"collision {stats['collision_rate']:.1%}  "
-            f"avg cost {stats['avg_cost']:.0f}  "
+            f"cost/success ep {'—' if cs is None else f'{cs:.0f}'}  "
+            f"(coarse {stats['avg_coarse_cost']:.0f} + precise "
+            f"{stats['avg_precise_cost']:.0f}, precise share "
+            f"{stats['precise_cost_share']:.1%})  "
             f"precise {stats['precise_frac']:.1%}  "
-            f"transitions/dec {stats['avg_transitions']:.1f}"
+            f"transitions/dec {stats['avg_transitions']:.1f}\n"
+            f"  breaches: coarse {stats['coarse_breach']}  "
+            f"precise {stats['precise_breach']} "
+            f"(driven {stats['precise_breach_active']}, "
+            f"bystander {stats['precise_breach_bystander']})"
         )
 
         # ---- 2. distil -> the prior the NEXT cycle plans with ------------
