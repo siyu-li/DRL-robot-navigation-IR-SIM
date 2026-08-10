@@ -98,13 +98,13 @@ DEFAULT_COST_CONFIG = "robot_nav/models/MARL/capswitcher_14/cost_14robots.yaml"
 
 def build_env(
     device: torch.device, cost: SwitcherCost, goal_threshold: float,
-    backbone_ckpt: str, disable_plotting: bool = True, save_ani: bool = False,
+    backbone_ckpt: str, disable_plotting: bool = True,
 ) -> tuple[SwitcherEnv, CoarseSteering14, MARL_SIM_OBSTACLE]:
     """
     Construct 14-robot sim + backbone + coarse primitive + switcher env.
 
-    ``disable_plotting`` / ``save_ani`` are off by default so every evaluation
-    path stays headless; ``render_gaz14.py`` flips them to watch a policy.
+    Plotting is off by default so every evaluation path stays headless;
+    ``render_gaz14.py`` turns it on to watch a policy live.
     """
     sim = MARL_SIM_OBSTACLE(
         world_file="robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
@@ -113,7 +113,6 @@ def build_env(
         per_robot_goal_reset=False,
         obstacle_proximity_threshold=1.5,
         num_inactive_robots=0,
-        save_ani=save_ani,
     )
     assert sim.num_robots == 14, f"expected 14 robots, world has {sim.num_robots}"
     backbone = GATBackbone(

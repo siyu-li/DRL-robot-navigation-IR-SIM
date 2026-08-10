@@ -10,16 +10,13 @@ decision cost, and the running episode cost split into its coarse and precise
 components.  Terminal events name the flagged robots and, for precise, the
 robot that was being driven at the time — the collision-attribution question.
 
+Live viewing only — nothing is written to disk.  A display is required (X
+forwarding when running on the GPU box).
+
 Usage (GPU box; irsim's step is what needs the machine, plotting is extra):
-    # watch live in a window (needs a display / X forwarding)
     python -m robot_nav.render_gaz14 \
         --prior-model runs/gaz14_value/cycle_05_prior/prior_best.pt \
         --value-model <value ckpt> --episodes 3
-
-    # headless box: write a GIF per episode instead
-    python -m robot_nav.render_gaz14 \
-        --prior-model runs/gaz14_value/cycle_05_prior/prior_best.pt \
-        --value-model <value ckpt> --episodes 3 --save-ani --out-dir renders
 
     # jump straight to an episode the eval table flagged (same --seed!)
     python -m robot_nav.render_gaz14 --prior-model <ckpt> --only-episode 17
@@ -30,7 +27,6 @@ from __future__ import annotations
 import argparse
 import random
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -154,10 +150,6 @@ def main() -> None:
                     help="render just this episode index (0-based, as in eval)")
     ap.add_argument("--render-delay", type=float, default=0.0,
                     help="extra seconds per decision, to watch it more slowly")
-    ap.add_argument("--save-ani", action="store_true",
-                    help="write an animation instead of showing a window "
-                         "(headless-friendly)")
-    ap.add_argument("--out-dir", type=str, default="renders")
     ap.add_argument("--quiet", action="store_true",
                     help="omit the per-decision trace")
     # --- search hyper-parameters: keep identical to the eval run ---
@@ -180,7 +172,6 @@ def main() -> None:
         device, cost=cost, goal_threshold=args.goal_threshold,
         backbone_ckpt=args.backbone_ckpt,
         disable_plotting=False,          # the whole point of this script
-        save_ani=args.save_ani,
     )
 
     leaf_value = None
@@ -230,33 +221,14 @@ def main() -> None:
         [args.only_episode] if args.only_episode is not None
         else list(range(args.episodes))
     )
-    out_dir = Path(args.out_dir)
-    if args.save_ani:
-        # save_animate() writes to the global path manager's ani_path; it takes
-        # no path argument, so point it at --out-dir here.
-        from irsim.config.path_param import path_manager
-
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path_manager.ani_path = str(out_dir)
-
     summaries = []
     for ep in eps:
         summaries.append(render_episode(
             env, policy, coarse, args.seed + ep, ep,
             args.render_delay, not args.quiet,
         ))
-        if args.save_ani:
-            # IRSim buffers frames for the whole session, so flush per episode
-            # to get one file each.  Not env.end() — that tears the env down
-            # (closes figures, resets the object registry) and the next episode
-            # would have nothing to run in.  rm_fig_path clears the buffer so
-            # episodes don't bleed into each other.
-            sim.env._env_plot.save_animate(
-                ani_name=f"gaz14_ep{ep:03d}", rm_fig_path=True,
-            )
 
-    if not args.save_ani:
-        sim.env.end(ending_time=0)
+    sim.env.end(ending_time=0)
 
     print(f"\n{'=' * 78}\nSummary\n{'=' * 78}")
     print(f"{'ep':>4} {'seed':>6} {'outcome':>10} {'decisions':>10} "
@@ -265,8 +237,6 @@ def main() -> None:
         print(f"{s['episode']:>4} {s['seed']:>6} {s['outcome']:>10} "
               f"{s['decisions']:>10} {s['cost']:>10.0f} "
               f"{s['coarse_cost']:>10.0f} {s['precise_cost']:>10.0f}")
-    if args.save_ani:
-        print(f"\nAnimations written to {out_dir}/")
     print()
 
 
