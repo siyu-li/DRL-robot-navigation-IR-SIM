@@ -278,10 +278,39 @@ class ForwardModel14:
         Next state after one precise-all decision: resolve robots one at a time,
         each driven by its frozen GAT action for ``selection_interval`` sub-steps
         while the others hold still, integrating unicycle dynamics.
+
+        This is the budgeted transition (``n_precise_expansions``); the
+        unbudgeted :meth:`precise_rollout` shares its body.
         """
         self.n_precise_expansions += 1
+        return self._precise_rollout(ms, record=False)[0]
+
+    def precise_rollout(self, ms: ModelState) -> tuple[ModelState, list]:
+        """
+        Same transition as :meth:`precise_next`, additionally returning the
+        swept path — **not** charged to the transition budget (diagnostics only).
+
+        Unlike coarse, precise is never shield-vetted: the search only sees the
+        end state (via :meth:`collision_pred`), so the sub-steps in between are
+        invisible to it.  The path exposes them, letting an offline vet score
+        precise with the same swept-clearance criterion the shield applies to
+        coarse (``robot_nav/eval_feasibility_14.py``).
+
+        Returns:
+            ``(next_state, path)`` where ``path`` is a list of
+            ``(driven_robot, positions)`` pairs — one per sub-step, positions
+            an ``(N, 2)`` array — led by the entry state as ``(-1, positions)``.
+            ``driven_robot`` is the only robot that moved on that sub-step.
+        """
+        return self._precise_rollout(ms, record=True)
+
+    def _precise_rollout(
+        self, ms: ModelState, record: bool
+    ) -> tuple[ModelState, list]:
+        """Shared body of ``precise_next`` / ``precise_rollout``."""
         poses = ms.poses.copy()
         last = ms.last_actions.copy()
+        path: list = [(-1, poses[:, :2].copy())] if record else []
         # Robots already at goal are skipped (mirrors the env; they are also
         # not charged by the precise pricing).  Membership is frozen at entry —
         # a robot arriving mid-decision still finishes its own sub-steps.
@@ -298,7 +327,9 @@ class ForwardModel14:
                 sim_actions[r] = (lin, ang)
                 poses = self._integrate(poses, sim_actions)
                 last = sim_actions
-        return ModelState(poses=poses, last_actions=last)
+                if record:
+                    path.append((int(r), poses[:, :2].copy()))
+        return ModelState(poses=poses, last_actions=last), path
 
     def _integrate(self, poses: np.ndarray, sim_actions: np.ndarray) -> np.ndarray:
         """One unicycle sub-step for all robots (forward Euler, pre-update heading)."""
