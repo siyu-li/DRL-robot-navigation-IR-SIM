@@ -19,6 +19,9 @@ Usage (run on the GPU box — local irsim step crashes; see project memory):
         --log-pi-targets data/pi_targets_14
     python -m robot_nav.eval_mpc_14 --episodes 100 --budgets 40 100 \
         --prior-model <ckpt> --value-model <ckpt>
+    python -m robot_nav.eval_mpc_14 --episode 100 --budgets 100 \
+        --prior-model runs/gaz14_value/cycle_05_prior/prior_best.pt \
+        --value-model robot_nav/models/MARL/capswitcher/checkpoint/value_local/value_geometry.pt
 """
 
 from __future__ import annotations

@@ -10,7 +10,7 @@
 #   `members` lists the robots that translate when the group is chosen —
 #   informational for editing, and validated against the live group algebra
 #   at load time.  `cost: auto` means len(members) x move_distance.
-precise_unit: 61.57
+precise_unit: 11.57
 coarse:
   # ---- size 3 -------------------------------------------------------------
   - {id: 0,  members: [2, 6, 10],                   move_distance: 1.0, cost: 52.7}
