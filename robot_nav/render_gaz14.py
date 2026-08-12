@@ -5,6 +5,12 @@ Same env, same seeds and the same ``GumbelSwitcher14`` as ``eval_mpc_14`` /
 ``iterate_gaz14`` — only plotting is on and the per-decision trace is printed,
 so episode *k* here is exactly episode *k* of the evaluation table.
 
+That equality relies on ``seed_episode`` seeding irsim's own module-level
+generator as well as the two global ones: irsim draws the obstacle layout and
+the goals from a generator that ``random.seed`` / ``np.random.seed`` do not
+reach.  Runs made before that fix cannot be replayed — their layouts were
+drawn from entropy and are gone.
+
 Each decision prints its mode, the chosen coarse group (with members), what the
 decision cost, and the running episode cost split into its coarse and precise
 components.  Terminal events name the flagged robots and, for precise, the
@@ -25,7 +31,6 @@ Usage (GPU box; irsim's step is what needs the machine, plotting is extra):
 from __future__ import annotations
 
 import argparse
-import random
 import time
 
 import numpy as np
@@ -40,6 +45,7 @@ from robot_nav.eval_mpc_14 import (
     resolve_device,
 )
 from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
+from robot_nav.models.MARL.capswitcher.rl.switcher_env import seed_episode
 from robot_nav.models.MARL.capswitcher_14.configs import MOVE_GROUPS
 from robot_nav.models.MARL.capswitcher_14.rl.search.features import (
     GroupFeatureBuilder,
@@ -65,9 +71,7 @@ def render_episode(
     render_delay: float, verbose: bool,
 ) -> dict:
     """Run one seeded episode with plotting on; return its summary."""
-    random.seed(seed)
-    np.random.seed(seed)
-    env._coarse_rng = np.random.default_rng(seed)
+    seed_episode(env, seed)
 
     env.reset()
     done = False

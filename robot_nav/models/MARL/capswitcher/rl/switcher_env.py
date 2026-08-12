@@ -55,6 +55,38 @@ import torch
 from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
 
 
+def seed_episode(env: "SwitcherEnv", seed: int) -> None:
+    """
+    Seed every generator one episode of ``env`` draws from, before ``reset()``.
+
+    Four independent sources feed an episode, and missing any one of them makes
+    it unreplayable:
+
+    * ``random`` — robot start poses and the inactive-robot draw
+      (``MARL_SIM_OBSTACLE.reset`` uses ``random.uniform`` / ``random.sample``);
+    * ``numpy.random`` — the legacy global, used by policy code;
+    * ``env._coarse_rng`` — the uniform group draw of the coarse-only baseline;
+    * **irsim's own module-level Generator** (``irsim.util.random``) — this is
+      the one that is easy to miss.  It places the **obstacles**
+      (``random_obstacle_position``) and the **goals** (``set_random_goal`` →
+      ``random_point_range``), it is built unseeded at import, and none of the
+      three above touch it.  Without seeding it, re-running "episode k" gives
+      the same robot start poses on a *different* obstacle layout with
+      *different* goals — i.e. not the same episode at all.
+
+    Seeding it makes an episode index a reproducible handle: the same
+    ``--seed`` and episode number replay the same world in ``render_gaz14``.
+    """
+    import random as _random
+
+    from irsim.util.random import set_seed as _irsim_set_seed
+
+    _random.seed(seed)
+    np.random.seed(seed)
+    _irsim_set_seed(seed)
+    env._coarse_rng = np.random.default_rng(seed)
+
+
 def _outside_bounds(poses: list, sim) -> bool:
     """Return True if any robot pose is outside the world boundary."""
     for pose in poses:

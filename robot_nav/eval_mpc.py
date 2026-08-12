@@ -28,7 +28,6 @@ Usage (run on the GPU box — local irsim step crashes; see project memory):
 from __future__ import annotations
 
 import argparse
-import random
 from pathlib import Path
 
 import numpy as np
@@ -39,7 +38,10 @@ from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 from robot_nav.models.MARL.capswitcher.policies.gat_backbone import GATBackbone
 from robot_nav.models.MARL.capswitcher.policies.coarse_steering import CoarseSteering
 from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
-from robot_nav.models.MARL.capswitcher.rl.switcher_env import SwitcherEnv
+from robot_nav.models.MARL.capswitcher.rl.switcher_env import (
+    SwitcherEnv,
+    seed_episode,
+)
 from robot_nav.models.MARL.capswitcher.rl.search.minimin import MPCSwitcher
 from robot_nav.models.MARL.capswitcher.rl.search.mcts import MCTSSwitcher
 from robot_nav.models.MARL.capswitcher.rl.search.gumbel import GumbelSwitcher
@@ -128,10 +130,9 @@ def run(
 
     for ep in range(episodes):
         seed = base_seed + ep
-        random.seed(seed)
-        np.random.seed(seed)
+        seed_episode(env, seed)
+        # 6-robot only: the coarse primitive's random column drop.
         env.coarse.rng = np.random.default_rng(seed)
-        env._coarse_rng = np.random.default_rng(seed)  # coarse-only group choice
 
         env.reset()
         done = False

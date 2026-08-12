@@ -24,7 +24,6 @@ Usage (run on the GPU box — local irsim step crashes; see project memory):
 from __future__ import annotations
 
 import argparse
-import random
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +33,10 @@ from loguru import logger
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 from robot_nav.models.MARL.capswitcher.policies.gat_backbone import GATBackbone
 from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
-from robot_nav.models.MARL.capswitcher.rl.switcher_env import SwitcherEnv
+from robot_nav.models.MARL.capswitcher.rl.switcher_env import (
+    SwitcherEnv,
+    seed_episode,
+)
 from robot_nav.models.MARL.capswitcher_14.configs import (
     MOVE_GROUPS,
     make_coarse_steering,
@@ -181,9 +183,7 @@ def run(
 
     for ep in range(episodes):
         seed = base_seed + ep
-        random.seed(seed)
-        np.random.seed(seed)
-        env._coarse_rng = np.random.default_rng(seed)  # coarse-only group choice
+        seed_episode(env, seed)
 
         env.reset()
         done = False

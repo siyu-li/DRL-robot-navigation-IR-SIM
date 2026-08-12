@@ -42,7 +42,6 @@ Usage (GPU box — local irsim ``step`` crashes; see project memory):
 from __future__ import annotations
 
 import argparse
-import random
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -262,9 +261,7 @@ def run(
     try:
         for ep in range(episodes):
             seed = base_seed + ep
-            random.seed(seed)
-            np.random.seed(seed)
-            env._coarse_rng = np.random.default_rng(seed)
+            seed_episode(env, seed)
 
             env.reset()
             done = False
