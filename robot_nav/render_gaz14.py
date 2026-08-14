@@ -1,7 +1,7 @@
 """
 Watch a trained CAPSwitcher-14 prior plan, one episode at a time.
 
-Same env, same seeds and the same ``GumbelSwitcher14`` as ``eval_mpc_14`` /
+Same env, same seeds and the same ``GumbelSwitcher14`` as ``eval_gaz14_lazy`` /
 ``iterate_gaz14`` — only plotting is on and the per-decision trace is printed,
 so episode *k* here is exactly episode *k* of the evaluation table.
 
@@ -37,7 +37,7 @@ import numpy as np
 import torch
 from loguru import logger
 
-from robot_nav.eval_mpc_14 import (
+from robot_nav.eval_gaz14_lazy import (
     COARSE,
     DEFAULT_BACKBONE_CKPT,
     DEFAULT_COST_CONFIG,

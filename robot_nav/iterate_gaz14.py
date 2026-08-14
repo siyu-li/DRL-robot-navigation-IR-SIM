@@ -40,7 +40,7 @@ from pathlib import Path
 import torch
 from loguru import logger
 
-from robot_nav.eval_mpc_14 import (
+from robot_nav.eval_gaz14_lazy import (
     DEFAULT_BACKBONE_CKPT,
     DEFAULT_COST_CONFIG,
     RESULT_ROWS,

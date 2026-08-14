@@ -1,7 +1,7 @@
 """
 Train the learned prior (PriorNet) from logged root decisions — sim-free.
 
-Data: ``.npz`` shards written by ``eval_mpc_14 --log-pi-targets`` (one sample
+Data: ``.npz`` shards written by ``eval_gaz14_lazy --log-pi-targets`` (one sample
 per real decision).  Pass **all** iteration directories to ``--data``: mixing
 shards across plan→distill iterations is the replay guard against
 distribution shift between teachers (do not train on only the latest).

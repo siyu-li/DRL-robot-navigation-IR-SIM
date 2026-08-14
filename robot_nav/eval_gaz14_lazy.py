@@ -1,10 +1,22 @@
 """
-Evaluation + phase-0 collection harness for the 14-robot lazy Gumbel switcher.
+Evaluation + phase-0 collection harness for the 14-robot **lazy** Gumbel
+switcher — GAZ14-L, the budget-matched counterpart of ``eval_gaz14_eager.py``
+(GAZ14-E).
 
 Runs ``GumbelSwitcher14`` (22 coarse groups + precise, lazy tree, budget in
 model transitions) against the two mode-only baselines over matched seeded
-episodes.  With ``--log-pi-targets`` every real decision is logged as
-training data for the learned prior:
+episodes.  Only the root is eagerly vetted; below it, transitions are bought
+one edge at a time and unmaterialised edges are priced by completed-Q — the
+variable GAZ14-E holds against this one, at the same budget over the same
+seeded episodes.
+
+``build_env`` / ``run`` / ``RESULT_ROWS`` / ``_save_pi_targets`` live here and
+are imported by ``eval_gaz14_eager.py``, ``iterate_gaz14.py``,
+``render_gaz14.py`` and ``eval_feasibility_14.py``, so every 14-robot harness
+measures the same thing the same way.
+
+With ``--log-pi-targets`` every real decision is logged as training data for
+the learned prior:
 
     features (root group/global), all 22 shield clearances (exact labels for
     the feasibility head), the legal mask, and the improved root policy π′
@@ -15,11 +27,11 @@ with the default uniform prior (high-budget teacher).  Iteration t trains a
 prior with ``train_prior.py`` and re-collects with ``--prior-model <ckpt>``.
 
 Usage (run on the GPU box — local irsim step crashes; see project memory):
-    python -m robot_nav.eval_mpc_14 --episodes 100 --budgets 100  \
+    python -m robot_nav.eval_gaz14_lazy --episodes 100 --budgets 100  \
         --log-pi-targets data/pi_targets_14
-    python -m robot_nav.eval_mpc_14 --episodes 100 --budgets 40 100 \
+    python -m robot_nav.eval_gaz14_lazy --episodes 100 --budgets 40 100 \
         --prior-model <ckpt> --value-model <ckpt>
-    python -m robot_nav.eval_mpc_14 --episode 100 --budgets 100 \
+    python -m robot_nav.eval_gaz14_lazy --episode 100 --budgets 115 \
         --prior-model runs/gaz14_value/cycle_05_prior/prior_best.pt \
         --value-model robot_nav/models/MARL/capswitcher/checkpoint/value_local/value_geometry.pt
 """

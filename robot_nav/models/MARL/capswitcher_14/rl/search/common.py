@@ -45,6 +45,12 @@ class Branch:
     step_cost: float          # exact per-decision motion cost (known at stub time)
     frames: list | None = field(default=None)     # vetted coarse frames (post-mat.)
     candidate: object | None = field(default=None)  # shield CoarseCandidate (post-mat.)
+    # Goal-distance reduction (m) the edge buys, filled on materialisation by
+    # the *eager* tree only (``tree_eager.expand_node_eager``): for coarse it
+    # copies the shield candidate's predicted progress, for precise it is
+    # measured on the rolled-out child.  Stays ``None`` throughout the lazy
+    # tree, whose prior is forbidden to see materialisation output at all.
+    progress: float | None = field(default=None)
 
 
 def expand_stubs(model, ms) -> list[Branch]:

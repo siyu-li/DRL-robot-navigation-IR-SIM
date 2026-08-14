@@ -1,7 +1,7 @@
 """
 Feasibility diagnostic for the two CAPSwitcher-14 action sets.
 
-``eval_mpc_14``'s ``safe-coarse avail.`` row is an **OR over the whole coarse
+``eval_gaz14_lazy``'s ``safe-coarse avail.`` row is an **OR over the whole coarse
 action set**: the fraction of decisions at which *at least one* of the 22 groups
 passed the shield.  At ~98% it says the switcher is essentially never left
 without a coarse option — it says nothing about how feasible an individual group
@@ -48,7 +48,7 @@ import numpy as np
 import torch
 from loguru import logger
 
-from robot_nav.eval_mpc_14 import (
+from robot_nav.eval_gaz14_lazy import (
     DEFAULT_BACKBONE_CKPT,
     DEFAULT_COST_CONFIG,
     build_env,

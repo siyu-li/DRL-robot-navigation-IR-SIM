@@ -133,14 +133,14 @@ and collision / all-reached / out-of-bounds are `done` flags, not bonuses.
 
 ## 5. Phase 0 → distill loop
 
-1. **Phase 0 (teacher)**: `eval_mpc_14 --budgets 100 --log-pi-targets ...`
+1. **Phase 0 (teacher)**: `eval_gaz14_lazy --budgets 100 --log-pi-targets ...`
    with the uniform prior.  Each real decision logs: root features
    (`features.py` — static, *never* vetting output), all 22 clearance labels,
    the legal mask, and π′ (root-only distillation target — settled).
 2. **Distill**: `train_prior.py` — masked KL on π′ + Huber on the clearance
    margin, one trunk, two heads.  Pass **all** iteration directories to
    `--data` (replay mixing across teachers).
-3. **Deploy / iterate**: `eval_mpc_14 --prior-model <ckpt>` at matched or
+3. **Deploy / iterate**: `eval_gaz14_lazy --prior-model <ckpt>` at matched or
    smaller budgets; re-collect, re-train.  Refresh the value net
    (`train_value`) in the same cycle — π′ quality is bounded by the Q it is
    computed from.
@@ -157,18 +157,31 @@ policies/coarse_steering.py    CoarseSteering14: full-A rotation, no drop RNG
 rl/forward_model.py            ForwardModel14: coarse_move (single edge),
                                precise_next, n_transitions
 rl/search/common.py            Branch stubs, expand_stubs, QNormalizer
+rl/search/features.py          GroupFeatureBuilder (static features only)
+--- GAZ14-L (lazy): per-edge materialisation, completed-Q --------------------
 rl/search/tree.py              lazy Node, materialize, completed_q, backup
 rl/search/gumbel.py            GumbelAlphaZero14 + GumbelSwitcher14
-rl/search/features.py          GroupFeatureBuilder (static features only)
+rl/search/priors.py            UniformPrior (stub-only contract)
 rl/search/prior_net.py         PriorNet + LearnedPrior (logits + feasibility)
-rl/search/priors.py            UniformPrior (phase 0)
-robot_nav/eval_mpc_14.py       eval + phase-0 shard collection (GPU box)
+--- GAZ14-E (eager): whole-node expansion, no completion ---------------------
+rl/search/tree_eager.py        expand_node_eager, simulate_eager, expansion_cost
+rl/search/gumbel_eager.py      GumbelAlphaZero14Eager + GumbelSwitcher14Eager
+rl/search/priors_eager.py      HeuristicPrior14 (post-vet contract)
+-----------------------------------------------------------------------------
+robot_nav/eval_gaz14_lazy.py   eval + shard collection, GAZ14-L (GPU box)
+robot_nav/eval_gaz14_eager.py  eval + shard collection, GAZ14-E (GPU box)
+robot_nav/iterate_gaz14.py     plan->distil loop, GAZ14-L (GPU box)
 robot_nav/train_prior.py       distillation training (sim-free, local OK)
 tests/test_capswitcher_14_config.py   pinned group lists, A_FULL, determinism
 tests/test_tree_search_14.py          lazy search semantics + minimin anchor
+tests/test_tree_search_eager_14.py    eager semantics, atomic budget, prior
 tests/test_prior_net_14.py            features/net shapes, prior contract
 tests/test_switcher_cost.py           cost formulas, drift validation, YAMLs
 ```
+
+The two search variants share `common.py` / `features.py` and the fixed
+23-wide branch layout, so their logged π′ shards are interchangeable and
+`train_prior.py` consumes either teacher unchanged.
 
 Reused from `capswitcher` (imported, not forked): shield sweep geometry,
 `SwitcherCost`, `GATBackbone`, `SwitcherEnv`, `LearnedCostToGo`.
