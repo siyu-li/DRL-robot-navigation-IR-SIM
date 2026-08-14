@@ -5,11 +5,11 @@ Same env, same seeds and the same ``GumbelSwitcher14`` as ``eval_mpc_14`` /
 ``iterate_gaz14`` — only plotting is on and the per-decision trace is printed,
 so episode *k* here is exactly episode *k* of the evaluation table.
 
-That equality relies on ``seed_episode`` seeding irsim's own module-level
-generator as well as the two global ones: irsim draws the obstacle layout and
-the goals from a generator that ``random.seed`` / ``np.random.seed`` do not
-reach.  Runs made before that fix cannot be replayed — their layouts were
-drawn from entropy and are gone.
+That equality relies on ``seed_episode`` being called before every ``reset()``:
+on the pinned ir-sim 2.x the obstacle layout and the goals are drawn from the
+``np.random`` legacy global, so seeding it is what pins the world, not just the
+robot start poses.  Runs made before that fix cannot be replayed — their
+layouts were drawn from entropy and are gone.
 
 Each decision prints its mode, the chosen coarse group (with members), what the
 decision cost, and the running episode cost split into its coarse and precise

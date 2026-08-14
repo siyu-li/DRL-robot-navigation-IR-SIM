@@ -59,6 +59,7 @@ from robot_nav.models.MARL.capswitcher.rl.shield import (
     ShieldGeometry,
     min_member_clearance,
 )
+from robot_nav.models.MARL.capswitcher.rl.switcher_env import seed_episode
 from robot_nav.models.MARL.capswitcher_14.configs import MOVE_GROUPS
 from robot_nav.models.MARL.capswitcher_14.rl.forward_model import (
     ForwardModel14,

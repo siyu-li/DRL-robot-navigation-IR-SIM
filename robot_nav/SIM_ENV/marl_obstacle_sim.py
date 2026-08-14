@@ -432,6 +432,44 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         y_min = self.y_range[0] + 1
         y_max = self.y_range[1] - 1
 
+        # Obstacles are placed *before* the robot poses, and the placement is
+        # rejection-tested against everything except the robots.  Both halves of
+        # that matter for replay: the pose loop below spaces robots against
+        # ``obstacle_list``, so the obstacles must already hold this episode's
+        # layout, and the obstacles must not look at the robots or their draw
+        # count would depend on where the previous episode happened to leave
+        # them.  Object positions survive ``reset`` (``set_state(init=True)``
+        # rewrites ``_init_state``), and that carried-over state is the one
+        # thing ``seed_episode`` cannot rewind — with either dependency in
+        # place, the same seed replays a different world.
+        if obstacle_states is not None:
+            # Use provided obstacle states
+            for oi, obs in enumerate(self.env.obstacle_list):
+                obs.set_state(state=obstacle_states[oi], init=True)
+        elif random_obstacles:
+            if random_obstacle_ids is None:
+                random_obstacle_ids = [i + self.num_robots for i in range(7)]
+            range_low = np.c_[[self.x_range[0], self.y_range[0], -np.pi]]
+            range_high = np.c_[[self.x_range[1], self.y_range[1], np.pi]]
+            # Static scenery (walls, non-randomized obstacles) is identical
+            # every episode, so keeping it in the check costs no determinism.
+            robots = set(id(r) for r in self.env.robot_list)
+            existing = [
+                obj for obj in self.env.objects
+                if obj.id not in random_obstacle_ids and id(obj) not in robots
+            ]
+            for obs in self.env.obstacle_list:
+                if obs.id not in random_obstacle_ids:
+                    continue
+                for _ in range(100):
+                    obs.set_state(
+                        state=np.random.uniform(range_low, range_high, (3, 1)),
+                        init=True,
+                    )
+                    if not any(obs.check_collision(o) for o in existing):
+                        break
+                existing.append(obs)
+
         init_states = []
         for robot in self.env.robot_list:
             conflict = True
@@ -461,21 +499,6 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
 
             init_states.append(pos)
             robot.set_state(state=np.array(robot_state), init=True)
-
-        # Set obstacle positions - either from provided states or randomize
-        if obstacle_states is not None:
-            # Use provided obstacle states
-            for oi, obs in enumerate(self.env.obstacle_list):
-                obs.set_state(state=obstacle_states[oi], init=True)
-        elif random_obstacles:
-            if random_obstacle_ids is None:
-                random_obstacle_ids = [i + self.num_robots for i in range(7)]
-            self.env.random_obstacle_position(
-                range_low=[self.x_range[0], self.y_range[0], -np.pi],
-                range_high=[self.x_range[1], self.y_range[1], np.pi],
-                ids=random_obstacle_ids,
-                non_overlapping=True,
-            )
 
         # Ensure randomized goals are at least 0.5 away from each other
         goal_positions = []

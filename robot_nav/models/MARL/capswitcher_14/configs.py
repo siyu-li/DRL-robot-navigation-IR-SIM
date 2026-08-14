@@ -58,6 +58,7 @@ def make_coarse_steering(
     step_time: float = 0.3,
     ang_max: float = 1.0,
     lin_max: float = 0.5,
+    nonlinear_solver: str = "bfgs",
 ) -> CoarseSteering14:
     """The canonical 14-robot coarse primitive over ``A_FULL`` / ``MOVE_GROUPS``."""
     return CoarseSteering14(
@@ -68,4 +69,5 @@ def make_coarse_steering(
         step_time=step_time,
         ang_max=ang_max,
         lin_max=lin_max,
+        nonlinear_solver=nonlinear_solver,
     )

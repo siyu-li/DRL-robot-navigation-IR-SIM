@@ -130,6 +130,7 @@ def build_env(
     coarse = make_coarse_steering(
         move_distance=cost.move_distances,
         method="nonlinear",
+        nonlinear_solver= "bfgs_lean",
         step_time=sim.env.step_time,
         ang_max=1.0,
         lin_max=0.5,

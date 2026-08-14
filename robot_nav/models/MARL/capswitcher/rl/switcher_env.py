@@ -59,31 +59,40 @@ def seed_episode(env: "SwitcherEnv", seed: int) -> None:
     """
     Seed every generator one episode of ``env`` draws from, before ``reset()``.
 
-    Four independent sources feed an episode, and missing any one of them makes
-    it unreplayable:
+    Three independent sources feed an episode, and missing any one of them
+    makes it unreplayable:
 
     * ``random`` — robot start poses and the inactive-robot draw
       (``MARL_SIM_OBSTACLE.reset`` uses ``random.uniform`` / ``random.sample``);
-    * ``numpy.random`` — the legacy global, used by policy code;
-    * ``env._coarse_rng`` — the uniform group draw of the coarse-only baseline;
-    * **irsim's own module-level Generator** (``irsim.util.random``) — this is
-      the one that is easy to miss.  It places the **obstacles**
-      (``random_obstacle_position``) and the **goals** (``set_random_goal`` →
-      ``random_point_range``), it is built unseeded at import, and none of the
-      three above touch it.  Without seeding it, re-running "episode k" gives
-      the same robot start poses on a *different* obstacle layout with
-      *different* goals — i.e. not the same episode at all.
+    * ``numpy.random`` — the legacy global.  Used by policy code, and — the
+      part that is easy to miss — by **irsim itself**: on the pinned ir-sim 2.x
+      the **obstacles** (``env.random_obstacle_position`` → ``np.random.uniform``)
+      and the **goals** (``set_random_goal`` → ``random_point_range`` →
+      ``np.random.uniform``) both draw from this one global.  Without it,
+      re-running "episode k" gives the same robot start poses on a *different*
+      obstacle layout with *different* goals — i.e. not the same episode at all;
+    * ``env._coarse_rng`` — the uniform group draw of the coarse-only baseline.
 
-    Seeding it makes an episode index a reproducible handle: the same
-    ``--seed`` and episode number replay the same world in ``render_gaz14``.
+    ir-sim 3.x moved its draws off the legacy global onto a private
+    module-level Generator seeded via ``irsim.util.random.set_seed``.  That
+    module does not exist on 2.x, so it is seeded best-effort: present on 3.x,
+    skipped on 2.x where ``np.random.seed`` above already covers those draws.
+
+    Seeding makes an episode index a reproducible handle: the same ``--seed``
+    and episode number replay the same world in ``render_gaz14``.
     """
     import random as _random
 
-    from irsim.util.random import set_seed as _irsim_set_seed
-
     _random.seed(seed)
     np.random.seed(seed)
-    _irsim_set_seed(seed)
+
+    try:  # ir-sim >= 3 only; on 2.x np.random.seed above already covers it
+        from irsim.util.random import set_seed as _irsim_set_seed
+    except ImportError:
+        pass
+    else:
+        _irsim_set_seed(seed)
+
     env._coarse_rng = np.random.default_rng(seed)
 
 
