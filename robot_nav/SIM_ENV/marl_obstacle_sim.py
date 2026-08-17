@@ -21,6 +21,11 @@ from scipy.spatial.distance import cdist
 from shapely.geometry import Point
 from typing import List, Tuple, Optional
 
+from robot_nav.SIM_ENV.corridor_layout import (
+    CorridorLayout,
+    sample_obstacles,
+    sample_starts,
+)
 from robot_nav.SIM_ENV.sim_env import SIM_ENV
 
 # Suppress matplotlib color redundancy warning from irsim
@@ -54,6 +59,7 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         goal_dwell_min: int = 0,
         goal_respawn_prob: float = 1.0,
         station_keeping_reward: float = 1.0,
+        layout: Optional[CorridorLayout] = None,
     ):
         """
         Initialize the MARL_SIM_OBSTACLE environment.
@@ -72,6 +78,11 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                 dwell period expires. 1.0 = immediate respawn after dwell (legacy).
             station_keeping_reward (float): Small positive reward given each step a
                 robot successfully holds at its goal without collision.
+            layout (CorridorLayout or None): If given, ``reset`` draws a banded
+                "corridor" episode — starts in one x-band, goals in the opposite
+                one, obstacles concentrated in a band across the middle — instead
+                of scattering all three over the whole arena.  ``None`` (default)
+                keeps the scattered layout, draw for draw.
         """
         display = False if disable_plotting else True
         self.env = irsim.make(
@@ -101,6 +112,39 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
         self.station_keeping_reward = station_keeping_reward
         # Per-robot dwell counter: -1 = not dwelling, >=0 = steps spent dwelling
         self.dwell_counters = [-1] * self.num_robots
+
+        # Banded episode layout (None = the scattered default).  Per-robot
+        # traverse directions are drawn by `reset`.
+        self.layout = layout
+        self._directions = None
+        if layout is not None:
+            layout.validate()
+
+    @staticmethod
+    def _bounding_radius(obj) -> float:
+        """
+        Radius of the disc bounding ``obj``'s current geometry.
+
+        Exact for the circular obstacles/robots of the 14-robot worlds and
+        conservative for anything else, which is the safe direction: the banded
+        sampler then over-spaces rather than under-spaces.
+        """
+        minx, miny, maxx, maxy = obj.geometry.bounds
+        return 0.5 * max(maxx - minx, maxy - miny)
+
+    def _obstacle_discs(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Obstacle centres ``(n, 2)`` and bounding radii ``(n,)``."""
+        if not self.env.obstacle_list:
+            return np.zeros((0, 2)), np.zeros(0)
+        xy = np.array(
+            [np.asarray(o.state).flatten()[:2] for o in self.env.obstacle_list],
+            dtype=np.float64,
+        )
+        r = np.array(
+            [self._bounding_radius(o) for o in self.env.obstacle_list],
+            dtype=np.float64,
+        )
+        return xy, r
 
     def get_obstacle_states(self) -> np.ndarray:
         """
@@ -374,13 +418,24 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                     # set_random_goal only changes the goal, not the robot's pose)
                     if self.dwell_counters[i] >= self.goal_dwell_min:
                         if random.random() < self.goal_respawn_prob:
+                            # Corridor mode shuttles: a robot that arrived is
+                            # sent back through the gate rather than given a
+                            # goal on the side it is already standing on.
+                            if self.layout is not None:
+                                self._directions[i] *= -1
+                                range_limits = self.layout.goal_range_limits(
+                                    self.x_range, self.y_range,
+                                    int(self._directions[i]),
+                                )
+                            else:
+                                range_limits = [
+                                    [self.x_range[0] + 1, self.y_range[0] + 1, -np.pi],
+                                    [self.x_range[1] - 1, self.y_range[1] - 1, np.pi],
+                                ]
                             self.env.robot_list[i].set_random_goal(
                                 obstacle_list=self.env.obstacle_list,
                                 init=True,
-                                range_limits=[
-                                    [self.x_range[0] + 1, self.y_range[0] + 1, -np.pi],
-                                    [self.x_range[1] - 1, self.y_range[1] - 1, np.pi],
-                                ],
+                                range_limits=range_limits,
                             )
                             self.prev_distances[i] = None
                             self.dwell_counters[i] = -1
@@ -446,6 +501,16 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
             # Use provided obstacle states
             for oi, obs in enumerate(self.env.obstacle_list):
                 obs.set_state(state=obstacle_states[oi], init=True)
+        elif self.layout is not None:
+            # Corridor mode: the whole obstacle set goes in the middle band,
+            # spaced so a shielded coarse move can still thread it.  Placement
+            # ignores `random_obstacle_ids` — the band *is* the scenery here.
+            _, radii = self._obstacle_discs()
+            states = sample_obstacles(
+                radii, self.x_range, self.y_range, self.layout
+            )
+            for oi, obs in enumerate(self.env.obstacle_list):
+                obs.set_state(state=states[oi].reshape(3, 1), init=True)
         elif random_obstacles:
             if random_obstacle_ids is None:
                 random_obstacle_ids = [i + self.num_robots for i in range(7)]
@@ -471,47 +536,74 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                 existing.append(obs)
 
         init_states = []
-        for robot in self.env.robot_list:
-            conflict = True
-            while conflict:
-                conflict = False
-                robot_state = [
-                    [random.uniform(x_min, x_max)],
-                    [random.uniform(y_min, y_max)],
-                    [random.uniform(-np.pi, np.pi)],
-                ]
-                pos = [robot_state[0][0], robot_state[1][0]]
+        if self.layout is not None:
+            # Same acceptance test as below (0.6 apart, 0.5 clear of obstacles),
+            # restricted to the start band — see corridor_layout.sample_starts.
+            obstacle_xy, obstacle_r = self._obstacle_discs()
+            starts = sample_starts(
+                self.num_robots, self.x_range, self.y_range, self.layout,
+                obstacle_xy, obstacle_r,
+                robot_radius=self._bounding_radius(self.env.robot_list[0]),
+            )
+            for robot, start in zip(self.env.robot_list, starts):
+                robot.set_state(state=start.reshape(3, 1), init=True)
+            init_states = starts[:, :2].tolist()
+        else:
+            for robot in self.env.robot_list:
+                conflict = True
+                while conflict:
+                    conflict = False
+                    robot_state = [
+                        [random.uniform(x_min, x_max)],
+                        [random.uniform(y_min, y_max)],
+                        [random.uniform(-np.pi, np.pi)],
+                    ]
+                    pos = [robot_state[0][0], robot_state[1][0]]
 
-                # Check robot-robot spacing
-                for loc in init_states:
-                    vector = [pos[0] - loc[0], pos[1] - loc[1]]
-                    if np.linalg.norm(vector) < 0.6:
-                        conflict = True
-                        break
-
-                # Check robot-obstacle clearance
-                if not conflict:
-                    robot_point = Point(pos[0], pos[1])
-                    for obs in self.env.obstacle_list:
-                        if obs.geometry.distance(robot_point) < 0.5:
+                    # Check robot-robot spacing
+                    for loc in init_states:
+                        vector = [pos[0] - loc[0], pos[1] - loc[1]]
+                        if np.linalg.norm(vector) < 0.6:
                             conflict = True
                             break
 
-            init_states.append(pos)
-            robot.set_state(state=np.array(robot_state), init=True)
+                    # Check robot-obstacle clearance
+                    if not conflict:
+                        robot_point = Point(pos[0], pos[1])
+                        for obs in self.env.obstacle_list:
+                            if obs.geometry.distance(robot_point) < 0.5:
+                                conflict = True
+                                break
 
+                init_states.append(pos)
+                robot.set_state(state=np.array(robot_state), init=True)
+
+        # Goal band per robot: the far side in corridor mode (so every episode
+        # is a full traverse of the obstacle band), the whole arena otherwise.
+        # Kept on self because a per-robot goal respawn flips it (see `step`).
+        self._directions = directions = (
+            self.layout.directions(self.num_robots)
+            if self.layout is not None else None
+        )
         # Ensure randomized goals are at least 0.5 away from each other
         goal_positions = []
-        for robot in self.env.robot_list:
+        for ri, robot in enumerate(self.env.robot_list):
             if robot_goal is None:
+                range_limits = (
+                    self.layout.goal_range_limits(
+                        self.x_range, self.y_range, int(directions[ri])
+                    )
+                    if self.layout is not None
+                    else [
+                        [self.x_range[0] + 1, self.y_range[0] + 1, -np.pi],
+                        [self.x_range[1] - 1, self.y_range[1] - 1, np.pi],
+                    ]
+                )
                 for _ in range(10):
                     robot.set_random_goal(
                         obstacle_list=self.env.obstacle_list,
                         init=True,
-                        range_limits=[
-                            [self.x_range[0] + 1, self.y_range[0] + 1, -np.pi],
-                            [self.x_range[1] - 1, self.y_range[1] - 1, np.pi],
-                        ],
+                        range_limits=range_limits,
                     )
                     # Check distance to all previous goals
                     pos = robot.goal[:2] if hasattr(robot, 'goal') else robot.state[:2]

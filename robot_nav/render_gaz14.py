@@ -1,9 +1,16 @@
 """
-Watch a trained CAPSwitcher-14 prior plan, one episode at a time.
+Watch a CAPSwitcher-14 policy plan, one episode at a time — either variant.
 
-Same env, same seeds and the same ``GumbelSwitcher14`` as ``eval_gaz14_lazy`` /
-``iterate_gaz14`` — only plotting is on and the per-decision trace is printed,
-so episode *k* here is exactly episode *k* of the evaluation table.
+Same env, same seeds and the same switcher as the evaluation harnesses — only
+plotting is on and the per-decision trace is printed, so episode *k* here is
+exactly episode *k* of the evaluation table:
+
+* **lazy** (default) — ``GumbelSwitcher14`` + a learned ``PriorNet``, as in
+  ``eval_gaz14_lazy`` / ``iterate_gaz14``.  ``--prior-model`` is required.
+* **eager** (``--eager``) — ``GumbelSwitcher14Eager`` + ``HeuristicPrior14``,
+  as in ``eval_gaz14_eager``.  No checkpoint needed (the eager prior reads the
+  vet instead of being learned); ``--budget`` / ``--m`` default to that
+  harness's 115 / 4 rather than the lazy 100 / 16.
 
 That equality relies on ``seed_episode`` being called before every ``reset()``:
 on the pinned ir-sim 2.x the obstacle layout and the goals are drawn from the
@@ -20,9 +27,14 @@ Live viewing only — nothing is written to disk.  A display is required (X
 forwarding when running on the GPU box).
 
 Usage (GPU box; irsim's step is what needs the machine, plotting is extra):
+    # lazy, learned prior
     python -m robot_nav.render_gaz14 \
         --prior-model runs/gaz14_value/cycle_05_prior/prior_best.pt \
-        --value-model <value ckpt> --episodes 3
+        --value-model robot_nav/models/MARL/capswitcher/checkpoint/value_local/value_geometry.pt --episodes 3
+
+    # eager, heuristic prior — the GAZ14-E row
+    python -m robot_nav.render_gaz14 --eager --budget 115 \
+        --value-model robot_nav/models/MARL/capswitcher/checkpoint/value_local/value_geometry.pt --episodes 3
 
     # jump straight to an episode the eval table flagged (same --seed!)
     python -m robot_nav.render_gaz14 --prior-model <ckpt> --only-episode 17
@@ -41,7 +53,9 @@ from robot_nav.eval_gaz14_lazy import (
     COARSE,
     DEFAULT_BACKBONE_CKPT,
     DEFAULT_COST_CONFIG,
+    add_layout_args,
     build_env,
+    layout_from_args,
     resolve_device,
 )
 from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
@@ -141,9 +155,13 @@ def render_episode(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--prior-model", type=str, required=True,
+    ap.add_argument("--eager", action="store_true",
+                    help="render GAZ14-E (GumbelSwitcher14Eager + "
+                         "HeuristicPrior14) instead of the lazy switcher")
+    ap.add_argument("--prior-model", type=str, default=None,
                     help="PriorNet checkpoint, e.g. "
-                         "runs/gaz14_value/cycle_05_prior/prior_best.pt")
+                         "runs/gaz14_value/cycle_05_prior/prior_best.pt "
+                         "(lazy only, and required there)")
     ap.add_argument("--value-model", type=str, default=None,
                     help="leaf cost-to-go checkpoint — pass the SAME one the "
                          "run was planned with, or the search differs")
@@ -157,8 +175,10 @@ def main() -> None:
     ap.add_argument("--quiet", action="store_true",
                     help="omit the per-decision trace")
     # --- search hyper-parameters: keep identical to the eval run ---
-    ap.add_argument("--budget", type=int, default=100)
-    ap.add_argument("--m", type=int, default=16)
+    # Defaults are per-variant (lazy 100/16, eager 115/4, as in the two eval
+    # harnesses), so they are resolved after parsing rather than declared here.
+    ap.add_argument("--budget", type=int, default=None)
+    ap.add_argument("--m", type=int, default=None)
     ap.add_argument("--gumbel-scale", type=float, default=1.0)
     ap.add_argument("--c-visit", type=float, default=50.0)
     ap.add_argument("--c-scale", type=float, default=1.0)
@@ -168,14 +188,36 @@ def main() -> None:
     ap.add_argument("--cost-config", type=str, default=DEFAULT_COST_CONFIG)
     ap.add_argument("--backbone-ckpt", type=str, default=DEFAULT_BACKBONE_CKPT)
     ap.add_argument("--device", type=str, default="auto")
+    # --- eager-only prior knobs (see priors_eager.HeuristicPrior14) ---
+    ap.add_argument("--uniform-prior", action="store_true",
+                    help="eager only: flat logits instead of HeuristicPrior14")
+    ap.add_argument("--w-eff", type=float, default=1.0)
+    ap.add_argument("--w-clear", type=float, default=0.5)
+    ap.add_argument("--precise-bias", type=float, default=0.0)
+    ap.add_argument("--prior-temperature", type=float, default=1.0)
+    ap.add_argument("--z-clip", type=float, default=3.0)
+    add_layout_args(ap)
     args = ap.parse_args()
+
+    if not args.eager and not args.prior_model:
+        raise SystemExit(
+            "--prior-model is required for the lazy switcher (its prior is "
+            "learned).  Pass --eager to render GAZ14-E, whose HeuristicPrior14 "
+            "needs no checkpoint."
+        )
+    if args.budget is None:
+        args.budget = 115 if args.eager else 100
+    if args.m is None:
+        args.m = 4 if args.eager else 16
 
     device = resolve_device(args.device)
     cost = SwitcherCost.from_yaml(args.cost_config)
+    layout = layout_from_args(args)
     env, coarse, sim = build_env(
         device, cost=cost, goal_threshold=args.goal_threshold,
         backbone_ckpt=args.backbone_ckpt,
         disable_plotting=False,          # the whole point of this script
+        layout=layout,
     )
 
     leaf_value = None
@@ -185,18 +227,49 @@ def main() -> None:
         leaf_value = LearnedCostToGo(args.value_model, device=device)
 
     feature_builder = GroupFeatureBuilder(MOVE_GROUPS)
-    from robot_nav.models.MARL.capswitcher_14.rl.search.prior_net import (
-        LearnedPrior,
-        PriorNet,
-    )
+    if args.eager:
+        from robot_nav.models.MARL.capswitcher_14.rl.search.gumbel_eager import (
+            GumbelSwitcher14Eager,
+        )
+        from robot_nav.models.MARL.capswitcher_14.rl.search.priors_eager import (
+            HeuristicPrior14,
+            UniformPrior,
+        )
 
-    prior = LearnedPrior(
-        PriorNet.load(args.prior_model, map_location=device),
-        feature_builder,
-        feas_margin=args.feas_margin,
-        device=device,
-    )
-    policy = GumbelSwitcher14(
+        from robot_nav.eval_gaz14_eager import check_budget
+
+        # Same guard the eval harness applies: an unspendable remainder here
+        # would mean rendering a shallower search than the row being replayed.
+        check_budget(args.budget, len(coarse.selectable_groups()) + 1, args.m)
+        switcher_cls = GumbelSwitcher14Eager
+        prior = (
+            UniformPrior() if args.uniform_prior
+            else HeuristicPrior14(
+                w_eff=args.w_eff,
+                w_clear=args.w_clear,
+                precise_bias=args.precise_bias,
+                temperature=args.prior_temperature,
+                z_clip=args.z_clip,
+                d_safe=args.d_safe,
+            )
+        )
+        prior_desc = "uniform" if args.uniform_prior else "HeuristicPrior14"
+    else:
+        from robot_nav.models.MARL.capswitcher_14.rl.search.prior_net import (
+            LearnedPrior,
+            PriorNet,
+        )
+
+        switcher_cls = GumbelSwitcher14
+        prior = LearnedPrior(
+            PriorNet.load(args.prior_model, map_location=device),
+            feature_builder,
+            feas_margin=args.feas_margin,
+            device=device,
+        )
+        prior_desc = args.prior_model
+
+    policy = switcher_cls(
         backbone=env.backbone,
         coarse=coarse,
         sim=sim,
@@ -216,8 +289,11 @@ def main() -> None:
     )
     print(
         f"Env: {sim.num_robots} robots, {len(MOVE_GROUPS)} coarse groups, "
-        f"precise_unit={cost.precise_unit}, budget={args.budget}, "
-        f"device={device}\nPrior: {args.prior_model}\n"
+        f"precise_unit={cost.precise_unit}, budget={args.budget}, m={args.m}, "
+        f"device={device}\n"
+        f"Variant: {'GAZ14-E (eager)' if args.eager else 'GAZ14-L (lazy)'}\n"
+        f"World: {'corridor ' + str(layout.band) if layout else 'scattered'}\n"
+        f"Prior: {prior_desc}\n"
         f"Leaf: {args.value_model or 'analytic'}"
     )
 

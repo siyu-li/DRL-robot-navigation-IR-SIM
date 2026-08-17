@@ -43,6 +43,8 @@ from loguru import logger
 
 from robot_nav.eval_gaz14_lazy import (
     DEFAULT_BACKBONE_CKPT,
+    add_layout_args,
+    layout_from_args,
     DEFAULT_COST_CONFIG,
     _coarse_only,
     _gumbel_decider,
@@ -140,13 +142,15 @@ def main() -> None:
     ap.add_argument("--z-clip", type=float, default=3.0,
                     help="soft saturation level of the efficiency score; raise "
                          "to resolve the cheap size-7 cluster's tail")
+    add_layout_args(ap)
     args = ap.parse_args()
 
     device = resolve_device(args.device)
     cost = SwitcherCost.from_yaml(args.cost_config)
+    layout = layout_from_args(args)
     env, coarse, sim = build_env(
         device, cost=cost, goal_threshold=args.goal_threshold,
-        backbone_ckpt=args.backbone_ckpt,
+        backbone_ckpt=args.backbone_ckpt, layout=layout,
     )
 
     expansion_cost = len(coarse.selectable_groups()) + 1
@@ -163,6 +167,7 @@ def main() -> None:
     )
 
     print(
+        f"World: {'corridor ' + str(layout.band) if layout else 'scattered'}\n"
         f"Env: {sim.num_robots} robots, {sim.num_obstacles} obstacles, "
         f"{len(MOVE_GROUPS)} coarse groups, cost_config={args.cost_config}, "
         f"precise_unit={cost.precise_unit}, d_safe={args.d_safe}, "

@@ -50,6 +50,39 @@ def _angle_wrap(angle: np.ndarray) -> np.ndarray:
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
 
+def analytic_alpha(precise_unit: float, lin_max: float, step_time: float) -> float:
+    """
+    Cost per metre per robot of the precise-completion heuristic.
+
+    ``precise_unit`` is charged per robot per sub-step, and one sub-step
+    advances a robot ``lin_max · step_time`` metres.
+    """
+    return float(precise_unit) / (float(lin_max) * float(step_time))
+
+
+def analytic_cost_to_go(
+    goal_distances: np.ndarray, goal_threshold: float, alpha: float
+) -> float:
+    """
+    The analytic leaf heuristic ``α · Σ_{i unreached} ‖p_i − goal_i‖``.
+
+    Reached robots contribute 0 — they are skipped by the precise rollout and
+    never charged.
+
+    Module-level so anything measuring the heuristic's bias (see
+    ``robot_nav/collect_leaf_data.py``) scores the *same* function the search
+    plans with, rather than a re-derivation that can drift from it.
+
+    Note the pricing this bakes in: it charges the whole completion at the
+    **precise** rate, so it is blind to coarse moves being 4–60× cheaper per
+    robot-metre.  It is therefore expected to overestimate — the direction the
+    Gumbel searches do not self-correct (see ``search/gumbel_eager.py``).
+    Quantifying that gap is what the leaf-data collection exists to do.
+    """
+    d = np.asarray(goal_distances, dtype=np.float64)
+    return float(alpha) * float(np.sum(d[d > goal_threshold]))
+
+
 @dataclass
 class ModelState:
     """Dynamic planner state for one lookahead node."""
@@ -380,9 +413,16 @@ class ForwardModel14:
         if self.leaf_value is not None:
             return float(self.leaf_value(self, ms))
         if alpha is None:
-            alpha = self.cost.precise_unit / (self.lin_max * self.step_time)
-        dist = self.goal_distances(ms)
-        return float(alpha) * float(np.sum(dist[dist > self.goal_threshold]))
+            alpha = self.analytic_alpha()
+        return analytic_cost_to_go(
+            self.goal_distances(ms), self.goal_threshold, alpha
+        )
+
+    def analytic_alpha(self) -> float:
+        """This model's ``α`` for :func:`analytic_cost_to_go`."""
+        return analytic_alpha(
+            self.cost.precise_unit, self.lin_max, self.step_time
+        )
 
 
 # robot_state goal columns (same layout as the 6-robot system).

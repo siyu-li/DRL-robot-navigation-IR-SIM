@@ -53,10 +53,17 @@ untouched: members get the motion that maximises their progress, bystanders
 keep the best-effort turn toward their own goals.
 
 Every solver below preserves that invariant — steps are built from ``∇f =
-A_mᵀ w`` and from ``(H + λI)⁻¹∇f``, both of which stay in ``row(A_m)``.  Adding
-a ``λ‖t‖²`` term to the *objective* would not: it pulls the null component
-toward zero and silently switches to a different tie-break (min-rotation).
-See ``tests/test_coarse_steering_14_solver.py``, which pins this.
+A_mᵀ w``, which stays in ``row(A_m)``.  Adding a ``λ‖t‖²`` term to the
+*objective* would not: it pulls the null component toward zero and silently
+switches to a different tie-break (min-rotation).
+
+The rotation is then wrapped into ``(−π, π]`` before it is split into frames
+(see :meth:`CoarseSteering14.compute_actions`).  The objective is periodic in
+each heading, so solvers routinely return a ``dθ`` carrying extra whole turns —
+identical final headings, identical swept path, but an ``n_rot`` (and a frame
+allocation, and a count of simulator sub-steps) proportional to the number of
+spins.  Wrapping is free in every observable except that count, which it bounds
+at ``ceil(π / (ang_max·step_time))``.
 """
 
 from __future__ import annotations
@@ -88,38 +95,39 @@ class CoarseSteering14:
                        ``SwitcherCost.move_distances``). Default 0.5.
         method:        ``"least_squares"`` (pinv heading) or ``"nonlinear"``
                        (maximise members' distance-to-goal reduction).
-        nonlinear_solver: How ``method="nonlinear"`` is solved.  All four
+        nonlinear_solver: How ``method="nonlinear"`` is solved.  All three
                        optimise the same objective from the same ``t_ls``
                        start and preserve the null-space tie-break, but the
                        objective is **wildly multi-modal** (see below), so
-                       only the first two land on the reference answer:
+                       which local optimum you land on is a property of the
+                       solver's path, not of the objective:
 
-                       * ``"bfgs"`` (default) — scipy BFGS with the analytic
-                         gradient.  Same iterates as ``"bfgs_fd"`` to ~1e-5
-                         rad, 2.8× faster: the finite-difference gradient cost
-                         6 objective evaluations per iteration, this costs 1.
+                       * ``"bfgs_lean"`` (default) — hand-rolled BFGS (no
+                         scipy), 2.2× faster than ``"bfgs"`` and 6.7× faster
+                         than ``"bfgs_fd"`` (329 µs vs 718 / 2215 µs per
+                         solve).  Its line search differs, so it lands on a
+                         *different, equally good* local optimum in most
+                         solves: over 6600 solves its mean objective is within
+                         0.02% of the reference.
+                       * ``"bfgs"`` — scipy BFGS with the analytic gradient.
+                         Same iterates as ``"bfgs_fd"`` to ~1e-5 rad, 2.8×
+                         faster: the finite-difference gradient cost 6
+                         objective evaluations per iteration, this costs 1.
                        * ``"bfgs_fd"`` — scipy BFGS with finite differences.
-                         The original implementation, kept as the reference
-                         the golden file is pinned against.
-                       * ``"bfgs_lean"`` — hand-rolled BFGS (no scipy), 6.6×
-                         faster.  Equal solution quality on average, but its
-                         line search differs, so on this landscape it lands on
-                         a *different, equally good* local optimum in ~90% of
-                         solves.  Adopt only behind an end-to-end A/B.
-                       * ``"newton"`` — damped, trust-region Newton, 8×
-                         faster, and **worse**: it converges to a nearby local
-                         optimum with ~11% less member progress on average.
-                         Kept for the bounded-rotation experiment, not for use
-                         as-is.
+                         The original implementation, kept as the reference.
 
-                       See ``tests/test_coarse_steering_14_solver.py`` for the
-                       measured numbers behind each claim.
+                       A damped trust-region Newton solver used to live here
+                       too.  It was removed on 2026-08-17: it converged to a
+                       nearby *worse* stationary point (15.4% less member
+                       progress over 6600 solves), and the only thing it was
+                       better at — bounded rotations — is now handled for
+                       every solver by the wrap in :meth:`compute_actions`.
         step_time:     Simulator step duration (s). Default 0.3.
         ang_max:       Max angular velocity magnitude (rad/s). Default 1.0.
         lin_max:       Max linear velocity (m/s). Default 0.5.
     """
 
-    _SOLVERS = ("bfgs", "bfgs_fd", "bfgs_lean", "newton")
+    _SOLVERS = ("bfgs_lean", "bfgs", "bfgs_fd")
 
     def __init__(
         self,
@@ -130,8 +138,8 @@ class CoarseSteering14:
         step_time: float = 0.3,
         ang_max: float = 1.0,
         lin_max: float = 0.5,
-        nonlinear_solver: str = "bfgs",
-        newton_trust_rad: float = 0.5,
+        nonlinear_solver: str = "bfgs_lean",
+        trust_rad: float = 0.5,
     ) -> None:
         if method not in ("least_squares", "nonlinear"):
             raise ValueError(
@@ -168,7 +176,7 @@ class CoarseSteering14:
             raise ValueError("move_distance must be non-negative")
         self.method = method
         self.nonlinear_solver = nonlinear_solver
-        self.newton_trust_rad = float(newton_trust_rad)
+        self.trust_rad = float(trust_rad)
         self.step_time = float(step_time)
         self.ang_max = float(ang_max)
         self.lin_max = float(lin_max)
@@ -200,10 +208,9 @@ class CoarseSteering14:
         dist0: np.ndarray,
         phi: np.ndarray,
         d: float,
-        want_hess: bool = False,
-    ) -> tuple[float, np.ndarray, np.ndarray | None]:
+    ) -> tuple[float, np.ndarray]:
         """
-        Objective, gradient and (optionally) Hessian of the rotation solve.
+        Objective and gradient of the rotation solve.
 
         In polar form — with ``L = ‖g − p‖`` the current distance, ``φ`` the
         bearing to the goal and ``δ = θ + A_m·t − φ`` the post-rotation heading
@@ -215,11 +222,13 @@ class CoarseSteering14:
         zero gradient and is added by the caller only for reporting), and::
 
             ∂D/∂δ = d·L·sin δ / D                      ⇒  ∇f = A_mᵀ w
-            ∂²D/∂δ² = (d·L·cos δ − w²) / D             ⇒  H  = A_mᵀ diag(h) A_m
 
-        Both are exact, so no finite differences are needed.  Note ``∇f`` and
-        ``H`` are built from ``A_mᵀ``: every step made from them lies in
-        ``row(A_m)``, which is what preserves the null-space tie-break.
+        The gradient is exact, so no finite differences are needed.  Note it is
+        built from ``A_mᵀ``: every step made from it lies in ``row(A_m)``,
+        which is what preserves the null-space tie-break.
+
+        The analytic Hessian ``H = A_mᵀ diag((d·L·cos δ − w²) / D) A_m`` was
+        computed here too; it went with the Newton solver on 2026-08-17.
         """
         delta = theta_m + A_m @ t - phi
         sin_d, cos_d = np.sin(delta), np.cos(delta)
@@ -227,89 +236,7 @@ class CoarseSteering14:
         D = np.sqrt(np.maximum(dist0 * dist0 - 2.0 * d * dist0 * cos_d + d * d,
                                1e-18))
         w = d * dist0 * sin_d / D
-        f = float(np.sum(D))
-        grad = A_m.T @ w
-        hess = None
-        if want_hess:
-            h = (d * dist0 * cos_d - w * w) / D
-            hess = A_m.T @ (h[:, None] * A_m)
-        return f, grad, hess
-
-    def _solve_newton(
-        self,
-        t_ls: np.ndarray,
-        theta_m: np.ndarray,
-        A_m: np.ndarray,
-        dist0: np.ndarray,
-        phi: np.ndarray,
-        d: float,
-        gtol: float = 1e-5,
-        max_iter: int = 50,
-    ) -> np.ndarray:
-        """
-        Damped Newton from ``t_ls`` — the fast path.
-
-        ``(H + λI)`` handles the objective's non-convexity (λ grows until the
-        step is a descent direction) and its rank deficiency (H is singular on
-        ``null(A_m)``; the damping makes the system solvable without ever
-        putting a component there, since ``∇f`` has none).  Armijo backtracking
-        keeps every accepted step a decrease.
-
-        The **trust region** is not optional here.  The objective is periodic
-        in each member's heading, so "this step decreases f" does not bound how
-        far the step travels: an undamped Newton step near a flat Hessian
-        direction wraps the swarm through hundreds of radians and lands, quite
-        legitimately, at a lower f — a different (and physically absurd) local
-        optimum, with ``n_rot`` to match.  Capping ``‖A_full·step‖∞`` at
-        ``newton_trust_rad`` per iteration keeps the iterate on the same short
-        leash a line-searched BFGS is on, which is what makes the two agree.
-        """
-        k = A_m.shape[1]
-        eye = np.eye(k)
-        t = t_ls.copy()
-        f, grad, hess = self._rotation_terms(
-            t, theta_m, A_m, dist0, phi, d, want_hess=True
-        )
-        lam = 1e-8
-        iters = 0
-        for iters in range(1, max_iter + 1):
-            if np.max(np.abs(grad)) <= gtol:
-                iters -= 1
-                break
-            step = None
-            for _ in range(30):                    # raise λ until it descends
-                try:
-                    cand = np.linalg.solve(hess + lam * eye, -grad)
-                except np.linalg.LinAlgError:
-                    lam = max(lam * 10.0, 1e-6)
-                    continue
-                if float(grad @ cand) < 0.0:
-                    step = cand
-                    break
-                lam = max(lam * 10.0, 1e-6)
-            if step is None:                       # fall back to steepest descent
-                step = -grad
-            # Trust region, in radians of actual robot rotation.
-            max_rot = float(np.max(np.abs(self.A_full @ step)))
-            if max_rot > self.newton_trust_rad:
-                step = step * (self.newton_trust_rad / max_rot)
-            slope = float(grad @ step)
-            alpha, accepted = 1.0, False
-            for _ in range(30):                    # Armijo backtracking
-                f_new, grad_new, hess_new = self._rotation_terms(
-                    t + alpha * step, theta_m, A_m, dist0, phi, d, want_hess=True
-                )
-                if f_new <= f + 1e-4 * alpha * slope:
-                    accepted = True
-                    break
-                alpha *= 0.5
-            if not accepted:                       # no decrease available → done
-                break
-            t = t + alpha * step
-            f, grad, hess = f_new, grad_new, hess_new
-            lam = max(lam * 0.5, 1e-10)
-        self.last_solve_iterations = iters
-        return t
+        return float(np.sum(D)), A_m.T @ w
 
     def _solve_bfgs_lean(
         self,
@@ -332,11 +259,27 @@ class CoarseSteering14:
         rest.  The curvature test guards the update: if ``yᵀs ≤ 0`` the
         approximation would lose positive-definiteness, so the update is
         skipped rather than corrupted.
+
+        **The trust region is not optional.**  The objective is periodic in
+        each member's heading, so "this move decreases f" does not bound how
+        far the move travels: the Wolfe search *grows* ``alpha`` (doubling,
+        up to 30 times per iteration) whenever the objective is still falling
+        at the end of a step, and on this landscape that walks the iterate to
+        a legitimately-lower but physically absurd optimum hundreds of
+        thousands of radians away.  Measured before the cap: mean ``n_rot``
+        125.6, worst 248699 sub-steps for a single coarse edge; the lazy tree
+        holds every vetted edge's frames for the whole decision, so runs were
+        OOM-killed at ~27 GB.
+
+        Note the cap is on ``alpha · step``, the **accepted displacement** —
+        capping ``step`` alone does nothing, because ``alpha`` then scales it
+        straight back up.  With it: mean ``n_rot`` 12.1, worst 34, mean
+        objective within 0.02% of the scipy-BFGS reference.
         """
         k = A_m.shape[1]
         eye = np.eye(k)
         t = t_ls.copy()
-        f, grad, _ = self._rotation_terms(t, theta_m, A_m, dist0, phi, d)
+        f, grad = self._rotation_terms(t, theta_m, A_m, dist0, phi, d)
         H = np.eye(k)
         iters = 0
         for iters in range(1, max_iter + 1):
@@ -349,10 +292,14 @@ class CoarseSteering14:
                 H = np.eye(k)
                 step = -grad
                 slope = float(grad @ step)
-            alpha, lo, hi = 1.0, 0.0, np.inf
+            # Trust region, in radians of actual robot rotation: the largest
+            # alpha whose displacement turns no robot more than `trust_rad`.
+            max_rot = float(np.max(np.abs(self.A_full @ step)))
+            alpha_max = (self.trust_rad / max_rot) if max_rot > 0.0 else 1.0
+            alpha, lo, hi = min(1.0, alpha_max), 0.0, np.inf
             f_new, grad_new = f, grad
             for _ in range(30):
-                f_new, grad_new, _ = self._rotation_terms(
+                f_new, grad_new = self._rotation_terms(
                     t + alpha * step, theta_m, A_m, dist0, phi, d
                 )
                 if f_new > f + 1e-4 * alpha * slope:          # Armijo
@@ -360,8 +307,11 @@ class CoarseSteering14:
                     alpha = 0.5 * (lo + hi)
                     continue
                 if abs(float(grad_new @ step)) > 0.9 * abs(slope):   # curvature
+                    if alpha >= alpha_max:       # curvature unmet, but capped
+                        break
                     lo = alpha
-                    alpha = 2.0 * alpha if hi == np.inf else 0.5 * (lo + hi)
+                    alpha = (min(2.0 * alpha, alpha_max) if hi == np.inf
+                             else 0.5 * (lo + hi))
                     continue
                 break
             s_vec = alpha * step
@@ -408,17 +358,13 @@ class CoarseSteering14:
             dist0 = np.linalg.norm(rel, axis=1)                       # (Nm,)
             phi = np.arctan2(rel[:, 1], rel[:, 0])                    # (Nm,)
 
-            if self.nonlinear_solver == "newton":
-                t_star = self._solve_newton(
-                    t_ls, theta_m, A_m, dist0, phi, d
-                )
-            elif self.nonlinear_solver == "bfgs_lean":
+            if self.nonlinear_solver == "bfgs_lean":
                 t_star = self._solve_bfgs_lean(
                     t_ls, theta_m, A_m, dist0, phi, d
                 )
             elif self.nonlinear_solver == "bfgs":
                 def fun_and_grad(t: np.ndarray) -> tuple[float, np.ndarray]:
-                    f, g, _ = self._rotation_terms(
+                    f, g = self._rotation_terms(
                         t, theta_m, A_m, dist0, phi, d
                     )
                     return f - float(np.sum(dist0)), g
@@ -483,6 +429,16 @@ class CoarseSteering14:
         d_theta_actual = self._solve_rotation(
             theta_current, d_theta_desired, px, py, gx, gy, members, move_distance
         )
+        # Execute the *short way round*.  The objective sees headings only
+        # through sin/cos, so it cannot distinguish dθ from dθ + 2πk and
+        # regularly returns a solution that spins robots through many full
+        # turns.  Every robot ends on the same heading either way, and no robot
+        # translates during the rotation phase, so the swept path and the
+        # shield's verdict are unchanged — but n_rot, the frames it allocates
+        # and the sub-steps the simulator executes are all bounded by
+        # ceil(π / (ang_max·step_time)) instead of by whatever the solver
+        # happened to return.
+        d_theta_actual = _angle_wrap(d_theta_actual)
 
         # ---- Rotation sub-steps (split to respect ang_max) ----------------
         max_abs = float(np.max(np.abs(d_theta_actual))) if d_theta_actual.size else 0.0

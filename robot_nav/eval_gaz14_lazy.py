@@ -45,6 +45,7 @@ import numpy as np
 import torch
 from loguru import logger
 
+from robot_nav.SIM_ENV.corridor_layout import CorridorLayout
 from robot_nav.SIM_ENV.marl_obstacle_sim import MARL_SIM_OBSTACLE
 from robot_nav.models.MARL.capswitcher.policies.gat_backbone import GATBackbone
 from robot_nav.models.MARL.capswitcher.rl.cost import SwitcherCost
@@ -113,23 +114,64 @@ def resolve_device(name: str) -> torch.device:
 DEFAULT_COST_CONFIG = "robot_nav/models/MARL/capswitcher_14/cost_14robots.yaml"
 
 
+CORRIDOR_WORLD = "robot_nav/worlds/multi_robot_world_corridor_14robots.yaml"
+SCATTERED_WORLD = "robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml"
+
+
+def add_layout_args(ap: argparse.ArgumentParser) -> None:
+    """Add the shared ``--corridor`` knobs, so all three runners agree on them."""
+    ap.add_argument("--corridor", action="store_true",
+                    help="banded world: starts in one x-band, goals in the "
+                         "opposite one, all obstacles in a band across the "
+                         "middle (sparse -> dense -> sparse).  Default is the "
+                         "scattered randomized-obstacle world.")
+    ap.add_argument("--corridor-band", type=float, nargs=2, default=(0.40, 0.60),
+                    metavar=("LO", "HI"),
+                    help="obstacle band as fractions of the world width")
+    ap.add_argument("--corridor-min-gap", type=float, default=1.0,
+                    help="minimum free gap between two obstacles (m); 2*(rho+"
+                         "d_safe) keeps the gate threadable by a coarse move")
+    ap.add_argument("--corridor-bidirectional", action="store_true",
+                    help="send half the robots right-to-left, so the swarm has "
+                         "to interpenetrate inside the gate")
+
+
+def layout_from_args(args: argparse.Namespace) -> CorridorLayout | None:
+    """``CorridorLayout`` for :func:`build_env`, or ``None`` for the scattered world."""
+    if not getattr(args, "corridor", False):
+        return None
+    return CorridorLayout(
+        band=(float(args.corridor_band[0]), float(args.corridor_band[1])),
+        min_gap=args.corridor_min_gap,
+        bidirectional=args.corridor_bidirectional,
+    )
+
+
 def build_env(
     device: torch.device, cost: SwitcherCost, goal_threshold: float,
     backbone_ckpt: str, disable_plotting: bool = True,
+    layout: CorridorLayout | None = None,
 ) -> tuple[SwitcherEnv, CoarseSteering14, MARL_SIM_OBSTACLE]:
     """
     Construct 14-robot sim + backbone + coarse primitive + switcher env.
 
     Plotting is off by default so every evaluation path stays headless;
     ``render_gaz14.py`` turns it on to watch a policy live.
+
+    ``layout`` selects the episode distribution: ``None`` is the scattered
+    randomized-obstacle world every result so far was measured on; a
+    ``CorridorLayout`` is the banded sparse→dense→sparse world, which keeps the
+    same 14 robots and 7 obstacles (the frozen backbone's shapes) and only moves
+    where they are drawn.
     """
     sim = MARL_SIM_OBSTACLE(
-        world_file="robot_nav/worlds/multi_robot_world_obstacle_14robots.yaml",
+        world_file=CORRIDOR_WORLD if layout is not None else SCATTERED_WORLD,
         disable_plotting=disable_plotting,
         reward_phase=6,
         per_robot_goal_reset=False,
         obstacle_proximity_threshold=1.5,
         num_inactive_robots=0,
+        layout=layout,
     )
     assert sim.num_robots == 14, f"expected 14 robots, world has {sim.num_robots}"
     backbone = GATBackbone(
@@ -142,7 +184,7 @@ def build_env(
     coarse = make_coarse_steering(
         move_distance=cost.move_distances,
         method="nonlinear",
-        nonlinear_solver= "bfgs_lean",
+        nonlinear_solver="bfgs_lean",
         step_time=sim.env.step_time,
         ang_max=1.0,
         lin_max=0.5,
@@ -167,13 +209,20 @@ def build_env(
 
 
 def run(
-    env: SwitcherEnv, decide_fn, episodes: int, base_seed: int, policy=None
+    env: SwitcherEnv, decide_fn, episodes: int, base_seed: int, policy=None,
+    on_step=None,
 ) -> dict:
     """
     Run ``decide_fn`` for ``episodes`` seeded episodes and collect stats.
 
     ``policy`` (a ``GumbelSwitcher14``) supplies per-decision transition
     counts — the lazy budget unit; baselines report 0.
+
+    ``on_step(ep, decision, step_cost, info, done)`` — optional observer called
+    once per executed decision, after the env step, with the realised cost of
+    that decision.  It exists so ``collect_leaf_data.py`` can harvest
+    cost-to-go labels from the **same** episode loop the evaluation tables are
+    produced by, rather than a parallel one that could drift from it.
 
     Episode cost is split into its two priced components so a run is readable
     independently of how precision happens to be priced:
@@ -219,6 +268,8 @@ def run(
             total_dec += 1
             step_cost = float(info["path_cost"])
             ep_cost += step_cost
+            if on_step is not None:
+                on_step(ep, decision, step_cost, info, done)
             if decision["mode"] == COARSE:
                 coarse_dec += 1
                 ep_coarse_cost += step_cost
@@ -395,15 +446,18 @@ def main() -> None:
                     help="learned cost-to-go checkpoint (train_value.py)")
     ap.add_argument("--log-pi-targets", type=str, default=None,
                     help="directory for harvests the training data for learning prior")
+    add_layout_args(ap)
     args = ap.parse_args()
 
     device = resolve_device(args.device)
     cost = SwitcherCost.from_yaml(args.cost_config)
+    layout = layout_from_args(args)
     env, coarse, sim = build_env(
         device, cost=cost, goal_threshold=args.goal_threshold,
-        backbone_ckpt=args.backbone_ckpt,
+        backbone_ckpt=args.backbone_ckpt, layout=layout,
     )
     print(
+        f"World: {'corridor ' + str(layout.band) if layout else 'scattered'}\n"
         f"Env: {sim.num_robots} robots, {sim.num_obstacles} obstacles, "
         f"{len(MOVE_GROUPS)} coarse groups, cost_config={args.cost_config}, "
         f"precise_unit={cost.precise_unit}, d_safe={args.d_safe}, "

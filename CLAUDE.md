@@ -11,11 +11,13 @@ DRL robot navigation in IR-SIM. Two bodies of work share `robot_nav/`:
 
 ## Environment & commands
 
-Poetry (`pyproject.toml`, Python ≥3.10); local conda env `DRL_robot_nav`. Entry points are
-modules run from the repo root.
+Python ≥3.10. Use the conda env **`DRL_nav`**
+(`/home/siyu/miniconda3/envs/DRL_nav/bin/python`) — `pyproject.toml` describes a Poetry setup,
+but Poetry is not installed on this machine and plain `python` resolves to miniconda `base`,
+which has no pytest. Entry points are modules run from the repo root with `PYTHONPATH=.`.
 
 ```bash
-poetry run pytest                                # testpaths=tests; CI runs this on master
+PYTHONPATH=. python -m pytest -q                 # testpaths=tests; CI runs this on master
 tensorboard --logdir runs
 
 python -m robot_nav.marl_train_obstacle_6robots  # also _14robots; marl_test_*; marl_finetune_partial_inactive
@@ -29,11 +31,14 @@ python -m robot_nav.train_value --data data/value_data --out-dir <ckpt-dir>
 
 ## Gotchas
 
-- **Local irsim is broken inside `sim.step`** (`step_status` error) — this breaks *everything*
-  that advances the simulator: training, MARL tests, `eval_mpc`, `check_mpc_model`. It is a
-  pre-existing environment mismatch, **not** caused by new code; don't debug it as if it were.
-  Run those on the GPU box. Sim-free work (`train_value`, unit tests, analysis of saved shards)
-  runs locally.
+- **This machine runs the simulator fine** under `DRL_nav` (irsim 2.5.5, CUDA available) —
+  `env.reset()`, `env.step()` and the full 14-robot switcher loop were verified end to end on
+  2026-08-17. An earlier note here claimed `sim.step` was broken locally with a `step_status`
+  error and that sim work had to move to "the GPU box"; that error comes from a different
+  interpreter (miniconda `base`), not from `DRL_nav`, and this *is* the GPU box.
+- **31 GB RAM, 1 GB swap.** A run that dies with a bare `Killed` and no traceback was
+  OOM-killed, not crashed. Confirm with `journalctl -k | grep -i oom` before debugging it as
+  anything else.
 - **Checkpoints are not in git.** Paths in code point at absent directories locally — e.g. the
   frozen GAT backbone `marlTD3/checkpoint/Mar.04_obstacle_14robots_partial_inactive/` referenced
   by `eval_mpc.build_env`. Expected, not a bug.
