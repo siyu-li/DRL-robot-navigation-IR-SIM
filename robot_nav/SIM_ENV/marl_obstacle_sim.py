@@ -423,9 +423,14 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
                             # goal on the side it is already standing on.
                             if self.layout is not None:
                                 self._directions[i] *= -1
+                                # In aligned mode the robot's current y keeps
+                                # the shuttle in its lane; ignored otherwise.
                                 range_limits = self.layout.goal_range_limits(
                                     self.x_range, self.y_range,
                                     int(self._directions[i]),
+                                    start_y=float(
+                                        self.env.robot_list[i].state[1]
+                                    ),
                                 )
                             else:
                                 range_limits = [
@@ -591,7 +596,8 @@ class MARL_SIM_OBSTACLE(SIM_ENV):
             if robot_goal is None:
                 range_limits = (
                     self.layout.goal_range_limits(
-                        self.x_range, self.y_range, int(directions[ri])
+                        self.x_range, self.y_range, int(directions[ri]),
+                        start_y=init_states[ri][1],
                     )
                     if self.layout is not None
                     else [

@@ -134,16 +134,32 @@ def add_layout_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--corridor-bidirectional", action="store_true",
                     help="send half the robots right-to-left, so the swarm has "
                          "to interpenetrate inside the gate")
+    ap.add_argument("--corridor-empty", action="store_true",
+                    help="sanity corridor: park all obstacles in a strip along "
+                         "the top wall, outside the traffic band — the arena "
+                         "is effectively obstacle-free while the world keeps "
+                         "the 7 obstacles the frozen backbone expects.  "
+                         "Implies --corridor.")
+    ap.add_argument("--corridor-aligned", action="store_true",
+                    help="sanity corridor: robots start on evenly spaced "
+                         "y-lanes facing their direction of travel, and each "
+                         "goal is pinned to its robot's start y, so the "
+                         "nominal solution is 'drive straight'.  Implies "
+                         "--corridor.")
 
 
 def layout_from_args(args: argparse.Namespace) -> CorridorLayout | None:
     """``CorridorLayout`` for :func:`build_env`, or ``None`` for the scattered world."""
-    if not getattr(args, "corridor", False):
+    empty = getattr(args, "corridor_empty", False)
+    aligned = getattr(args, "corridor_aligned", False)
+    if not (getattr(args, "corridor", False) or empty or aligned):
         return None
     return CorridorLayout(
         band=(float(args.corridor_band[0]), float(args.corridor_band[1])),
         min_gap=args.corridor_min_gap,
         bidirectional=args.corridor_bidirectional,
+        obstacle_free=empty,
+        aligned_goals=aligned,
     )
 
 
@@ -399,13 +415,13 @@ def _save_pi_targets(
     print(f"Saved {len(pi_log)} prior-training samples to {path}")
 
 
-def print_table(results: dict[str, dict]) -> None:
+def print_table(results: dict[str, dict], rows: list | None = None) -> None:
     """Side-by-side comparison of the result dicts."""
     names = list(results)
     header = f"{'metric':<24}" + "".join(f"{nm:>14}" for nm in names)
     print("\n" + header)
     print("-" * len(header))
-    for label, key, fmt in RESULT_ROWS:
+    for label, key, fmt in (RESULT_ROWS if rows is None else rows):
         line = f"{label:<24}"
         for nm in names:
             v = results[nm].get(key)
@@ -456,8 +472,14 @@ def main() -> None:
         device, cost=cost, goal_threshold=args.goal_threshold,
         backbone_ckpt=args.backbone_ckpt, layout=layout,
     )
+    world_desc = "scattered" if layout is None else (
+        "corridor "
+        + ("empty" if layout.obstacle_free else str(layout.band))
+        + (" aligned" if layout.aligned_goals else "")
+        + (" bidirectional" if layout.bidirectional else "")
+    )
     print(
-        f"World: {'corridor ' + str(layout.band) if layout else 'scattered'}\n"
+        f"World: {world_desc}\n"
         f"Env: {sim.num_robots} robots, {sim.num_obstacles} obstacles, "
         f"{len(MOVE_GROUPS)} coarse groups, cost_config={args.cost_config}, "
         f"precise_unit={cost.precise_unit}, d_safe={args.d_safe}, "

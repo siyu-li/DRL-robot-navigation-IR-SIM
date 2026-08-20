@@ -117,6 +117,78 @@ def test_bidirectional_splits_the_swarm_and_mirrors_its_goals():
     assert layout.goal_range_limits(X_RANGE, Y_RANGE, RIGHT_TO_LEFT)[1][0] < bx0
 
 
+def test_obstacle_free_parks_the_set_clear_of_the_traffic_band():
+    """
+    Sanity mode keeps all 7 obstacles (the frozen backbone's shape) but parks
+    them along the top wall: inside the world, above `y_band`, and far enough
+    that the GAT's obstacle-proximity shaping (1.5 m) never fires in the band.
+    """
+    layout = CorridorLayout(obstacle_free=True)
+    layout.validate()
+    obs = _obstacles(layout, 0)
+    _, y1 = layout.y_band(Y_RANGE)
+
+    assert len(obs) == len(RADII)
+    assert np.all(obs[:, 0] - RADII >= X_RANGE[0])
+    assert np.all(obs[:, 0] + RADII <= X_RANGE[1])
+    assert np.all(obs[:, 1] + RADII <= Y_RANGE[1])
+    # A robot centre at the very top of the band keeps >= 1.5 m to any surface.
+    assert np.all(obs[:, 1] - RADII - y1 >= 1.5 - 1e-9)
+    # Parked scenery is deterministic — it consumes no RNG, so it cannot
+    # shift the seeded start/goal draws.
+    np.testing.assert_array_equal(obs, _obstacles(layout, 1))
+
+
+def test_validate_obstacle_free_only_requires_disjoint_sides():
+    CorridorLayout(obstacle_free=True, start_width=0.45, goal_width=0.45).validate()
+    with pytest.raises(ValueError, match="overlap"):
+        CorridorLayout(obstacle_free=True, start_width=0.6, goal_width=0.5).validate()
+
+
+def test_aligned_goals_pin_goal_y_to_the_start_lane():
+    """The easy sanity case: spawn facing forward, goal dead ahead."""
+    layout = CorridorLayout(obstacle_free=True, aligned_goals=True)
+    obs = _obstacles(layout, 3)
+    random.seed(3)
+    starts = sample_starts(N_ROBOTS, X_RANGE, Y_RANGE, layout, obs[:, :2], RADII)
+    y0, y1 = layout.y_band(Y_RANGE)
+
+    assert np.all((starts[:, 1] >= y0) & (starts[:, 1] <= y1))
+    assert np.all(starts[:, 2] == 0.0)  # facing down the corridor
+
+    for i in range(N_ROBOTS):
+        lo, hi = layout.goal_range_limits(
+            X_RANGE, Y_RANGE, LEFT_TO_RIGHT, start_y=starts[i, 1]
+        )
+        assert lo[1] == hi[1] == pytest.approx(starts[i, 1])
+
+    d = np.linalg.norm(starts[:, None, :2] - starts[None, :, :2], axis=2)
+    np.fill_diagonal(d, np.inf)
+    assert d.min() >= 0.6
+
+
+def test_aligned_bidirectional_gives_each_half_its_own_lane():
+    layout = CorridorLayout(
+        obstacle_free=True, aligned_goals=True, bidirectional=True
+    )
+    directions = layout.directions(N_ROBOTS)
+    obs = _obstacles(layout, 5)
+    random.seed(5)
+    starts = sample_starts(N_ROBOTS, X_RANGE, Y_RANGE, layout, obs[:, :2], RADII)
+
+    assert np.all(starts[directions == LEFT_TO_RIGHT, 2] == 0.0)
+    assert np.all(starts[directions == RIGHT_TO_LEFT, 2] == np.pi)
+    # Distinct lanes for everyone — opposing streams never share a y.
+    assert len(np.unique(starts[:, 1])) == N_ROBOTS
+
+
+def test_goal_range_ignores_start_y_unless_aligned():
+    lo, hi = CorridorLayout().goal_range_limits(
+        X_RANGE, Y_RANGE, LEFT_TO_RIGHT, start_y=5.0
+    )
+    assert lo[1] != hi[1]
+
+
 def test_layout_is_reproducible_from_the_seeded_globals():
     """
     ``seed_episode`` seeds ``numpy.random`` and ``random``; drawing from those

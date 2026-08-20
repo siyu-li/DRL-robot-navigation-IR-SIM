@@ -47,9 +47,10 @@ def draw(ax, layout: CorridorLayout, seed: int, n_robots: int, n_obstacles: int,
     )
     directions = layout.directions(n_robots)
 
-    bx0, bx1 = layout.obstacle_band(X_RANGE)
     y0, y1 = layout.y_band(Y_RANGE)
-    ax.axvspan(bx0, bx1, color="saddlebrown", alpha=0.10, lw=0)
+    if not layout.obstacle_free:
+        bx0, bx1 = layout.obstacle_band(X_RANGE)
+        ax.axvspan(bx0, bx1, color="saddlebrown", alpha=0.10, lw=0)
     for d, colour in ((LEFT_TO_RIGHT, "tab:blue"), (-LEFT_TO_RIGHT, "tab:red")):
         if not np.any(directions == d):
             continue
@@ -64,7 +65,8 @@ def draw(ax, layout: CorridorLayout, seed: int, n_robots: int, n_obstacles: int,
     goals = np.zeros((n_robots, 2))
     for i, d in enumerate(directions):
         gx0, gx1 = layout.goal_band(X_RANGE, int(d))
-        goals[i] = (np.random.uniform(gx0, gx1), np.random.uniform(y0, y1))
+        gy = starts[i, 1] if layout.aligned_goals else np.random.uniform(y0, y1)
+        goals[i] = (np.random.uniform(gx0, gx1), gy)
 
     for i, d in enumerate(directions):
         colour = "tab:blue" if d == LEFT_TO_RIGHT else "tab:red"
@@ -82,7 +84,13 @@ def draw(ax, layout: CorridorLayout, seed: int, n_robots: int, n_obstacles: int,
     ax.set_xlim(*X_RANGE)
     ax.set_ylim(*Y_RANGE)
     ax.set_aspect("equal")
-    ax.set_title(f"seed {seed}   tightest gate gap {gap:.2f} m", fontsize=9)
+    ax.set_title(
+        f"seed {seed}   " + (
+            "obstacles parked" if layout.obstacle_free
+            else f"tightest gate gap {gap:.2f} m"
+        ),
+        fontsize=9,
+    )
     ax.tick_params(labelsize=7)
     return gap
 
@@ -102,6 +110,10 @@ def main() -> None:
     ap.add_argument("--goal-width", type=float, default=0.25)
     ap.add_argument("--min-gap", type=float, default=1.0)
     ap.add_argument("--bidirectional", action="store_true")
+    ap.add_argument("--empty", action="store_true",
+                    help="sanity mode: obstacles parked along the top wall")
+    ap.add_argument("--aligned", action="store_true",
+                    help="sanity mode: y-lanes, goal y pinned to start y")
     args = ap.parse_args()
 
     layout = CorridorLayout(
@@ -110,6 +122,8 @@ def main() -> None:
         goal_width=args.goal_width,
         min_gap=args.min_gap,
         bidirectional=args.bidirectional,
+        obstacle_free=args.empty,
+        aligned_goals=args.aligned,
     )
     layout.validate()
 
