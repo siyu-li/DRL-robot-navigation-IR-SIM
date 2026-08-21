@@ -359,3 +359,51 @@ def test_wrapper_falls_back_to_precise_on_empty_plan():
     d = policy.decide(None)
     assert d["mode"] == PRECISE
     assert policy.n_fallbacks == 1
+
+
+# ---------------------------------------------------------------------------
+# Worker-shard merge (eval_gaz14_baselines --out / --merge)
+# ---------------------------------------------------------------------------
+
+
+def _fake_stats(n: int = 25) -> dict:
+    return {
+        "episodes": n,
+        "success_rate": 0.8, "collision_rate": 0.12, "timeout_rate": 0.08,
+        "avg_decisions": 41.5,
+        "avg_cost": 1234.5, "avg_cost_success": 1100.25,
+        "avg_coarse_cost": 900.0, "avg_precise_cost": 334.5,
+        "precise_cost_share": 334.5 / 1234.5,
+        "coarse_frac": 0.7, "precise_frac": 0.3, "safe_avail_frac": 0.0,
+        "coarse_breach": 1, "precise_breach": 3,
+        "precise_breach_active": 2, "precise_breach_bystander": 1,
+        "avg_transitions": 96.4,
+        "avg_plans": 1.4, "plan_solved_rate": 0.9,
+        "cap_hits": 4, "fallbacks": 0,
+        "avg_coarse_vets": 800.2, "avg_precise_rollouts": 140.8,
+        "avg_transitions_ep": 941.0, "avg_expansions": 40.9,
+    }
+
+
+def test_shard_counts_round_trip():
+    from robot_nav.eval_gaz14_baselines import _from_counts, _to_counts
+
+    stats = _fake_stats()
+    back = _from_counts(_to_counts(stats))
+    for k, v in stats.items():
+        assert back[k] == pytest.approx(v, rel=1e-9), k
+
+
+def test_merging_two_equal_shards_preserves_rates_doubles_counts():
+    from robot_nav.eval_gaz14_baselines import _from_counts, _to_counts
+
+    stats = _fake_stats()
+    a, b = _to_counts(stats), _to_counts(stats)
+    merged = _from_counts({k: a[k] + b[k] for k in a})
+    assert merged["episodes"] == 2 * stats["episodes"]
+    for k in ("success_rate", "avg_cost", "avg_cost_success", "avg_decisions",
+              "avg_transitions", "plan_solved_rate", "avg_transitions_ep",
+              "precise_cost_share", "coarse_frac"):
+        assert merged[k] == pytest.approx(stats[k], rel=1e-9), k
+    for k in ("coarse_breach", "precise_breach", "cap_hits"):
+        assert merged[k] == 2 * stats[k], k

@@ -29,16 +29,34 @@ Episodes, seeds, metrics and the result table are shared with
 ``eval_gaz14_lazy`` (same ``build_env`` / ``run`` / ``print_table``), so rows
 are comparable across the two scripts' tables at matched ``--seed``.
 
+Parallel workers
+----------------
+Same trick as the data collectors: episodes are independently seeded
+(episode k = ``--seed + k``), so disjoint seed blocks in separate processes
+run exactly the episodes a single big run would, and ``--out`` /
+``--merge`` recombine them **exactly** (means episode-weighted, counts
+summed).  Workers must share ``--max-transitions`` / prior / value / world
+flags — the merge warns when shards disagree or seed ranges overlap.
+
 Usage (run on the GPU box — local irsim step crashes; see project memory):
     python -m robot_nav.eval_gaz14_baselines --episodes 100 \
         --algos astar levints phs phs-star \
         --prior-model runs/gaz14_value/cycle_05_prior/prior_best.pt \
         --value-model robot_nav/models/MARL/capswitcher/checkpoint/value_local/value_geometry.pt
+
+    # 4 workers over the same 100 episodes (disjoint seed blocks), then merge:
+    for S in 1000 1025 1050 1075; do
+        python -m robot_nav.eval_gaz14_baselines --algos astar --episodes 25 \
+            --seed $S --out runs/baselines14 <shared flags> &
+    done; wait
+    python -m robot_nav.eval_gaz14_baselines --merge runs/baselines14
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 
 import numpy as np
 from loguru import logger
@@ -142,6 +160,131 @@ def _effort_stats(per_ep: list[dict]) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Worker shards: save one JSON per (algo, seed block); merge exactly.
+#
+# Every mean/rate in the stats dict is recoverable as a sum given its
+# denominator (episodes, total decisions, or total plans), so shards from
+# disjoint seed blocks recombine into exactly the numbers a single big run
+# would have printed.
+# ---------------------------------------------------------------------------
+
+_INT_KEYS = ("coarse_breach", "precise_breach", "precise_breach_active",
+             "precise_breach_bystander", "cap_hits", "fallbacks")
+
+
+def _to_counts(stats: dict) -> dict:
+    """Undo the per-shard averaging: means/rates -> sums with denominators."""
+    n = stats["episodes"]
+    dec = stats["avg_decisions"] * n
+    successes = round(stats["success_rate"] * n)
+    plans = stats["avg_plans"] * n
+    return {
+        "episodes": n,
+        "decisions": dec,
+        "successes": successes,
+        "collisions": round(stats["collision_rate"] * n),
+        "timeouts": round(stats["timeout_rate"] * n),
+        "cost": stats["avg_cost"] * n,
+        "coarse_cost": stats["avg_coarse_cost"] * n,
+        "precise_cost": stats["avg_precise_cost"] * n,
+        "success_cost": (
+            (stats["avg_cost_success"] or 0.0) * successes
+        ),
+        "coarse_dec": stats["coarse_frac"] * dec,
+        "precise_dec": stats["precise_frac"] * dec,
+        "safe_avail": stats["safe_avail_frac"] * dec,
+        "transitions_dec": stats["avg_transitions"] * dec,
+        "plans": plans,
+        "solved_plans": stats["plan_solved_rate"] * plans,
+        "coarse_vets": stats["avg_coarse_vets"] * n,
+        "precise_rollouts": stats["avg_precise_rollouts"] * n,
+        "transitions_ep": stats["avg_transitions_ep"] * n,
+        "expansions": stats["avg_expansions"] * n,
+        **{k: stats[k] for k in _INT_KEYS},
+    }
+
+
+def _from_counts(c: dict) -> dict:
+    """Re-average merged sums into a stats dict for :func:`print_table`."""
+    n = c["episodes"]
+    dec = max(c["decisions"], 1)
+    return {
+        "episodes": n,
+        "success_rate": c["successes"] / n,
+        "collision_rate": c["collisions"] / n,
+        "timeout_rate": c["timeouts"] / n,
+        "avg_decisions": c["decisions"] / n,
+        "avg_cost": c["cost"] / n,
+        "avg_cost_success": (
+            c["success_cost"] / c["successes"] if c["successes"] else None
+        ),
+        "avg_coarse_cost": c["coarse_cost"] / n,
+        "avg_precise_cost": c["precise_cost"] / n,
+        "precise_cost_share": c["precise_cost"] / max(c["cost"], 1e-9),
+        "coarse_frac": c["coarse_dec"] / dec,
+        "precise_frac": c["precise_dec"] / dec,
+        "safe_avail_frac": c["safe_avail"] / dec,
+        "avg_transitions": c["transitions_dec"] / dec,
+        "avg_plans": c["plans"] / n,
+        "plan_solved_rate": c["solved_plans"] / max(c["plans"], 1e-9),
+        "avg_coarse_vets": c["coarse_vets"] / n,
+        "avg_precise_rollouts": c["precise_rollouts"] / n,
+        "avg_transitions_ep": c["transitions_ep"] / n,
+        "avg_expansions": c["expansions"] / n,
+        **{k: int(round(c[k])) for k in _INT_KEYS},
+    }
+
+
+def _save_shard(out_dir: Path, algo: str, args: argparse.Namespace,
+                stats: dict) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{algo}_s{args.seed}_e{args.episodes}.json"
+    path.write_text(json.dumps(
+        {
+            "algo": algo,
+            "label": ALGO_LABELS[algo],
+            "seed": args.seed,
+            "episodes": args.episodes,
+            "max_transitions": args.max_transitions,
+            "prior_model": args.prior_model,
+            "value_model": args.value_model,
+            "stats": stats,
+        },
+        indent=2,
+    ))
+    print(f"Saved shard: {path}")
+
+
+def merge_shards(shard_dir: Path) -> dict[str, dict]:
+    """Combine all ``*.json`` worker shards in ``shard_dir`` into one table."""
+    shards = [json.loads(p.read_text()) for p in sorted(shard_dir.glob("*.json"))]
+    if not shards:
+        raise SystemExit(f"no .json shards in {shard_dir}")
+
+    results: dict[str, dict] = {}
+    for algo in dict.fromkeys(s["algo"] for s in shards):   # keep CLI order
+        group = sorted((s for s in shards if s["algo"] == algo),
+                       key=lambda s: s["seed"])
+        # Sanity: disjoint seed blocks, identical planner configuration.
+        for a, b in zip(group, group[1:]):
+            if a["seed"] + a["episodes"] > b["seed"]:
+                print(f"WARNING: {algo} shards s{a['seed']} and s{b['seed']} "
+                      "overlap — episodes double-counted.")
+        for key in ("max_transitions", "prior_model", "value_model"):
+            if len({str(s.get(key)) for s in group}) > 1:
+                print(f"WARNING: {algo} shards disagree on {key} — "
+                      "the merged row mixes configurations.")
+        counts = [_to_counts(s["stats"]) for s in group]
+        merged = {k: sum(c[k] for c in counts) for k in counts[0]}
+        label = group[0]["label"]
+        results[label] = _from_counts(merged)
+        blocks = ", ".join(f"s{s['seed']}+{s['episodes']}" for s in group)
+        print(f"{label}: {len(group)} shard(s) [{blocks}] -> "
+              f"{merged['episodes']} episodes")
+    return results
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--episodes", type=int, default=100)
@@ -165,8 +308,20 @@ def main() -> None:
     ap.add_argument("--value-model", type=str, default=None,
                     help="learned cost-to-go checkpoint -> h for A*/PHS/PHS*; "
                          "default analytic α·Σdist")
+    ap.add_argument("--out", type=str, default=None,
+                    help="directory for per-(algo, seed-block) JSON shards — "
+                         "run disjoint seed blocks in parallel workers, then "
+                         "combine with --merge")
+    ap.add_argument("--merge", type=str, default=None,
+                    help="merge the worker shards in this directory into one "
+                         "table and exit (no episodes are run)")
     add_layout_args(ap)
     args = ap.parse_args()
+
+    if args.merge:
+        results = merge_shards(Path(args.merge))
+        print_table(results, rows=BASELINE_ROWS)
+        return
 
     device = resolve_device(args.device)
     cost = SwitcherCost.from_yaml(args.cost_config)
@@ -231,6 +386,8 @@ def main() -> None:
         # Print each algorithm's rows the moment it finishes — these runs take
         # hours per algorithm, and a killed run must not lose finished results.
         print_table({name: stats}, rows=BASELINE_ROWS)
+        if args.out:
+            _save_shard(Path(args.out), algo, args, stats)
 
     if len(results) > 1:
         print_table(results, rows=BASELINE_ROWS)
