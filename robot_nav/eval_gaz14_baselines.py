@@ -93,7 +93,8 @@ def _episode_tracker(policy: PlanToGoalSwitcher14):
     """
     ``on_step`` observer diffing the policy's cumulative counters at each
     episode end — per-episode search effort from the same loop that produces
-    the outcome metrics.
+    the outcome metrics.  Prints one progress line per finished episode:
+    plan-to-goal runs are long, and a silent 12-hour loop is undebuggable.
     """
     per_ep: list[dict] = []
     prev = policy.snapshot()
@@ -103,8 +104,20 @@ def _episode_tracker(policy: PlanToGoalSwitcher14):
         if done:
             policy.reset_plan()      # never replay a stale suffix next episode
             cur = policy.snapshot()
-            per_ep.append({k: cur[k] - prev[k] for k in cur})
+            d = {k: cur[k] - prev[k] for k in cur}
+            per_ep.append(d)
             prev = cur
+            outcome = (
+                "SUCCESS" if info.get("all_reached")
+                else "COLLISION" if info.get("collision")
+                else "TIMEOUT" if info.get("timeout") else "ENDED"
+            )
+            print(
+                f"  ep {ep:3d}: {outcome:<9} plans={d['plans']:<3} "
+                f"solved={d['solved_plans']:<3} cap_hits={d['cap_hits']:<3} "
+                f"transitions={d['coarse_vets'] + d['precise_expansions']}",
+                flush=True,
+            )
 
     return on_step, per_ep
 
@@ -215,8 +228,12 @@ def main() -> None:
                     policy=policy, on_step=on_step)
         stats.update(_effort_stats(per_ep))
         results[name] = stats
+        # Print each algorithm's rows the moment it finishes — these runs take
+        # hours per algorithm, and a killed run must not lose finished results.
+        print_table({name: stats}, rows=BASELINE_ROWS)
 
-    print_table(results, rows=BASELINE_ROWS)
+    if len(results) > 1:
+        print_table(results, rows=BASELINE_ROWS)
 
 
 if __name__ == "__main__":

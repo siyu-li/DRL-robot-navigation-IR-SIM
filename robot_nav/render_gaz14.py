@@ -11,6 +11,12 @@ exactly episode *k* of the evaluation table:
   as in ``eval_gaz14_eager``.  No checkpoint needed (the eager prior reads the
   vet instead of being learned); ``--budget`` / ``--m`` default to that
   harness's 115 / 4 rather than the lazy 100 / 16.
+* **baseline** (``--baseline astar|levints|levints-depth|phs|phs-star``) —
+  ``PlanToGoalSwitcher14``, as in ``eval_gaz14_baselines``.  Plans to the goal
+  once and replays the plan; every planning event prints its transition count,
+  plan length and whether the plan is in-model solved or a cap-limited
+  partial.  Pass the SAME ``--prior-model`` / ``--value-model`` /
+  ``--max-transitions`` as the eval run to replay its episodes.
 
 That equality relies on ``seed_episode`` being called before every ``reset()``:
 on the pinned ir-sim 2.x the obstacle layout and the goals are drawn from the
@@ -38,6 +44,10 @@ Usage (GPU box; irsim's step is what needs the machine, plotting is extra):
 
     # jump straight to an episode the eval table flagged (same --seed!)
     python -m robot_nav.render_gaz14 --prior-model <ckpt> --only-episode 17
+
+    # watch what the A* baseline planned for eval episode 17
+    python -m robot_nav.render_gaz14 --baseline astar --only-episode 17 \
+        --prior-model <ckpt> --value-model <ckpt> --max-transitions 20000
 """
 
 from __future__ import annotations
@@ -81,11 +91,15 @@ def _outcome(info: dict) -> str:
 
 
 def render_episode(
-    env, policy: GumbelSwitcher14, coarse, seed: int, ep: int,
+    env, policy, coarse, seed: int, ep: int,
     render_delay: float, verbose: bool,
 ) -> dict:
     """Run one seeded episode with plotting on; return its summary."""
     seed_episode(env, seed)
+
+    if hasattr(policy, "reset_plan"):
+        policy.reset_plan()          # plan-to-goal: never replay a stale suffix
+    is_planner = hasattr(policy, "n_plans")
 
     env.reset()
     done = False
@@ -95,7 +109,22 @@ def render_episode(
 
     print(f"\n{'=' * 78}\nEpisode {ep} (seed {seed})\n{'=' * 78}")
     while not done:
+        if is_planner:
+            before = (policy.n_plans, policy.n_solved_plans,
+                      policy.n_cap_hits, policy.n_fallbacks)
         decision = policy.decide(env._robot_state)
+        if is_planner and policy.n_plans > before[0]:
+            if policy.n_fallbacks > before[3]:
+                what = "EMPTY plan -> precise fallback"
+            else:
+                kind = (
+                    "solved in-model" if policy.n_solved_plans > before[1]
+                    else "PARTIAL (best g+h)"
+                )
+                cap = ", cap hit" if policy.n_cap_hits > before[2] else ""
+                what = (f"{len(policy._plan) + 1} decisions, {kind}{cap}")
+            print(f"  -- plan #{policy.n_plans}: "
+                  f"{policy.decision_transitions[-1]} transitions -> {what}")
         _, _, done, info = env.step(
             decision["mode"], group=decision["group"], frames=decision["frames"]
         )
@@ -153,11 +182,30 @@ def render_episode(
     }
 
 
+def _print_summary(summaries: list[dict]) -> None:
+    print(f"\n{'=' * 78}\nSummary\n{'=' * 78}")
+    print(f"{'ep':>4} {'seed':>6} {'outcome':>10} {'decisions':>10} "
+          f"{'cost':>10} {'coarse':>10} {'precise':>10}")
+    for s in summaries:
+        print(f"{s['episode']:>4} {s['seed']:>6} {s['outcome']:>10} "
+              f"{s['decisions']:>10} {s['cost']:>10.0f} "
+              f"{s['coarse_cost']:>10.0f} {s['precise_cost']:>10.0f}")
+    print()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--eager", action="store_true",
                     help="render GAZ14-E (GumbelSwitcher14Eager + "
                          "HeuristicPrior14) instead of the lazy switcher")
+    ap.add_argument("--baseline", type=str, default=None,
+                    choices=["astar", "levints", "levints-depth", "phs",
+                             "phs-star"],
+                    help="render a plan-to-goal best-first baseline "
+                         "(eval_gaz14_baselines) instead of a GAZ switcher")
+    ap.add_argument("--max-transitions", type=int, default=20000,
+                    help="baseline only: per-planning-call transition cap — "
+                         "keep identical to the eval run")
     ap.add_argument("--prior-model", type=str, default=None,
                     help="PriorNet checkpoint, e.g. "
                          "runs/gaz14_value/cycle_05_prior/prior_best.pt "
@@ -199,11 +247,14 @@ def main() -> None:
     add_layout_args(ap)
     args = ap.parse_args()
 
-    if not args.eager and not args.prior_model:
+    if args.eager and args.baseline:
+        raise SystemExit("--eager and --baseline are mutually exclusive.")
+    if not args.eager and not args.baseline and not args.prior_model:
         raise SystemExit(
             "--prior-model is required for the lazy switcher (its prior is "
             "learned).  Pass --eager to render GAZ14-E, whose HeuristicPrior14 "
-            "needs no checkpoint."
+            "needs no checkpoint, or --baseline <algo> for a plan-to-goal "
+            "baseline (uniform-prior fallback)."
         )
     if args.budget is None:
         args.budget = 115 if args.eager else 100
@@ -227,6 +278,59 @@ def main() -> None:
         leaf_value = LearnedCostToGo(args.value_model, device=device)
 
     feature_builder = GroupFeatureBuilder(MOVE_GROUPS)
+    if args.baseline:
+        from robot_nav.models.MARL.capswitcher_14.rl.search.best_first import (
+            EVALUATIONS,
+            PlanToGoalSwitcher14,
+        )
+
+        prior = None
+        if args.prior_model:
+            from robot_nav.models.MARL.capswitcher_14.rl.search.prior_net import (
+                LearnedPrior,
+                PriorNet,
+            )
+
+            prior = LearnedPrior(
+                PriorNet.load(args.prior_model, map_location=device),
+                feature_builder,
+                device=device,
+            )
+        policy = PlanToGoalSwitcher14(
+            backbone=env.backbone,
+            coarse=coarse,
+            sim=sim,
+            evaluate=EVALUATIONS[args.baseline],
+            prior=prior,
+            max_transitions=args.max_transitions,
+            d_safe=args.d_safe,
+            selection_interval=env.selection_interval,
+            goal_threshold=args.goal_threshold,
+            cost=env.cost,
+            leaf_value=leaf_value,
+        )
+        print(
+            f"Env: {sim.num_robots} robots, {len(MOVE_GROUPS)} coarse groups, "
+            f"precise_unit={cost.precise_unit}, "
+            f"max_transitions={args.max_transitions}, device={device}\n"
+            f"Variant: baseline {args.baseline} (plan-to-goal)\n"
+            f"World: {'corridor ' + str(layout.band) if layout else 'scattered'}\n"
+            f"Prior: {args.prior_model or 'uniform'}\n"
+            f"Leaf: {args.value_model or 'analytic'}"
+        )
+        eps = (
+            [args.only_episode] if args.only_episode is not None
+            else list(range(args.episodes))
+        )
+        summaries = [
+            render_episode(env, policy, coarse, args.seed + ep, ep,
+                           args.render_delay, not args.quiet)
+            for ep in eps
+        ]
+        sim.env.end(ending_time=0)
+        _print_summary(summaries)
+        return
+
     if args.eager:
         from robot_nav.models.MARL.capswitcher_14.rl.search.gumbel_eager import (
             GumbelSwitcher14Eager,
@@ -310,14 +414,7 @@ def main() -> None:
 
     sim.env.end(ending_time=0)
 
-    print(f"\n{'=' * 78}\nSummary\n{'=' * 78}")
-    print(f"{'ep':>4} {'seed':>6} {'outcome':>10} {'decisions':>10} "
-          f"{'cost':>10} {'coarse':>10} {'precise':>10}")
-    for s in summaries:
-        print(f"{s['episode']:>4} {s['seed']:>6} {s['outcome']:>10} "
-              f"{s['decisions']:>10} {s['cost']:>10.0f} "
-              f"{s['coarse_cost']:>10.0f} {s['precise_cost']:>10.0f}")
-    print()
+    _print_summary(summaries)
 
 
 if __name__ == "__main__":
