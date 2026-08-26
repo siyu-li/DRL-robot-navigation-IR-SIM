@@ -165,7 +165,7 @@ class GumbelAlphaZero14:
                 trusted = [
                     a for a in allowed
                     if node.children[a] is not None
-                    or a == node.precise_action
+                    or node.is_precise(a)
                     or feas[a]
                 ]
                 allowed = trusted or allowed
@@ -208,6 +208,7 @@ class GumbelAlphaZero14:
         return {
             "mode": b.mode,
             "group": b.group,
+            "pgroup": b.pgroup,
             "frames": b.frames,
             # All 22 coarse candidates (safe and refuted) — clearance labels.
             "candidates": [
@@ -218,7 +219,7 @@ class GumbelAlphaZero14:
             "pi_prime": pi_prime,
             "prior_logits": np.asarray(logits, dtype=np.float64),
             "legal": root.legal.copy(),
-            "actions": [(br.mode, br.group) for br in root.branches],
+            "actions": [(br.mode, br.group, br.pgroup) for br in root.branches],
             "n_transitions": model.n_transitions,
         }
 
@@ -256,12 +257,16 @@ class GumbelSwitcher14:
         default_rho: float = 0.2,
         leaf_value=None,
         feature_builder=None,
+        coupling=None,
+        precise_groups: list | None = None,
     ) -> None:
         if cost is None:
             raise ValueError(
                 "GumbelSwitcher14 requires a SwitcherCost (load "
                 "cost_14robots.yaml with SwitcherCost.from_yaml)"
             )
+        self.coupling = coupling
+        self.precise_groups = precise_groups
         self.backbone = backbone
         self.coarse = coarse
         self.sim = sim
@@ -294,6 +299,8 @@ class GumbelSwitcher14:
             cost=self.cost,
             default_rho=self.default_rho,
             leaf_value=self.leaf_value,
+            coupling=self.coupling,
+            precise_groups=self.precise_groups,
         )
 
     def decide(self, robot_state: np.ndarray) -> dict:

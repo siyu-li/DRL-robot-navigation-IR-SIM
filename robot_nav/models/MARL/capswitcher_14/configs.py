@@ -52,6 +52,30 @@ MOVE_GROUPS: list[list[int]] = build_move_groups()
 N_MOVE_GROUPS: int = len(MOVE_GROUPS)  # 22
 
 
+# --- Precise-group configurations (redesign §3) ----------------------------
+#
+# Config "all"    — legacy: one precise edge resolving every unreached robot
+#                   sequentially (``precise_groups=None`` everywhere).
+# Config "pairs"  — 7 fixed 2-robot groups.  Every pair of A_FULL rows has
+#                   rank 2, so a pair's headings are exactly controllable;
+#                   the fixed index partition keeps runs comparable (dynamic
+#                   pairing is future work).
+# Config "singles"— 14 1-robot groups.
+
+PRECISE_CONFIGS = ("all", "pairs", "singles")
+
+
+def build_precise_groups(config: str) -> list[list[int]] | None:
+    """Precise-group member lists for a named configuration (None = legacy)."""
+    if config == "all":
+        return None
+    if config == "pairs":
+        return [[i, i + 1] for i in range(0, N_ROBOTS - 1, 2)]
+    if config == "singles":
+        return [[i] for i in range(N_ROBOTS)]
+    raise ValueError(f"unknown precise config {config!r}; use {PRECISE_CONFIGS}")
+
+
 def make_coarse_steering(
     move_distance: float | dict = 0.5,
     method: str = "least_squares",

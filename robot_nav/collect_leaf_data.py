@@ -44,6 +44,17 @@ Usage (GPU box — local irsim step crashes; see project memory):
     python -m robot_nav.collect_leaf_data --episodes 100 --variant lazy \
         --budget 115 --out data/leaf_14l
 
+Collection is single-core CPU-bound (roughly 5-8 min per 14-robot episode at
+budget 115), and episodes are independent, so ``--workers`` splits the seed
+range over that many processes for a near-linear speedup:
+
+    python -m robot_nav.collect_leaf_data --episodes 100 --variant lazy \
+        --budget 115 --workers 6 --out data/leaf_14l
+
+Each worker writes its own shard and every consumer globs the directory, so the
+result is the serial one up to episode ordering.  Budget ~1.5 GB RAM and a CUDA
+context per worker.
+
 Then, locally:
     python -m robot_nav.analyze_leaf_data --data data/leaf_14e
 """
@@ -51,6 +62,10 @@ Then, locally:
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -162,11 +177,19 @@ class LeafCollector:
     """
 
     def __init__(self, env, alpha: float, goal_threshold: float,
-                 feature_builder: GroupFeatureBuilder) -> None:
+                 feature_builder: GroupFeatureBuilder,
+                 base_seed: int = 0) -> None:
         self.env = env
         self.alpha = float(alpha)
         self.goal_threshold = float(goal_threshold)
         self.feature_builder = feature_builder
+        # Episodes are identified by their own seed (``run`` uses
+        # ``base_seed + ep``), not by the 0-based loop counter.  That makes the
+        # id globally unique, so shards collected in parallel over disjoint
+        # seed ranges concatenate without two different episodes sharing an id
+        # — which would silently fuse them into one unit in
+        # ``train_value.episode_split``.
+        self.base_seed = int(base_seed)
         self.episodes: list[dict] = []
         self._current: dict | None = None
         self._pending_state: np.ndarray | None = None
@@ -184,8 +207,9 @@ class LeafCollector:
 
     def __call__(self, ep: int, decision: dict, step_cost: float,
                  info: dict, done: bool) -> None:
-        if self._current is None or self._current["index"] != ep:
-            self._current = self._new_episode(ep)
+        index = self.base_seed + ep
+        if self._current is None or self._current["index"] != index:
+            self._current = self._new_episode(index)
             self.episodes.append(self._current)
 
         state = self._pending_state
@@ -214,6 +238,157 @@ class LeafCollector:
             rec["reached"] = bool(info.get("all_reached"))
 
 
+def shard_name(args: argparse.Namespace, seed: int) -> str:
+    """
+    Filename for the shard a run with ``seed`` writes.
+
+    Provenance goes in the filename as well as the payload: labels are only
+    valid for the policy that produced them, and shards from different policies
+    must not silently merge into one fit.  The seed keeps parallel workers from
+    colliding.  Derived from the arguments alone so the parent process can name
+    its workers' outputs without building an env.
+    """
+    tag = f"{'p' if args.prior_model else 'u'}{'l' if args.value_model else 'a'}"
+    return f"leaf_{args.variant}_b{args.budget}_{tag}_s{seed}.npz"
+
+
+# Options forwarded verbatim to workers.  ``episodes``/``seed`` are excluded:
+# each worker gets its own slice of the seed range.  ``keep_censored`` is a
+# flag and handled separately.
+_FORWARDED_OPTS = (
+    "variant", "budget", "m", "gumbel_scale", "d_safe", "goal_threshold",
+    "cost_config", "backbone_ckpt", "device", "out", "prior_model",
+    "feas_margin", "value_model",
+)
+
+
+def worker_argv(args: argparse.Namespace, episodes: int, seed: int) -> list[str]:
+    """Command line re-invoking this module for one block of the seed range."""
+    argv = [sys.executable, "-m", "robot_nav.collect_leaf_data",
+            "--episodes", str(episodes), "--seed", str(seed)]
+    for name in _FORWARDED_OPTS:
+        value = getattr(args, name)
+        if value is None:
+            continue
+        argv += [f"--{name.replace('_', '-')}", str(value)]
+    if args.keep_censored:
+        argv.append("--keep-censored")
+    return argv
+
+
+def collect_parallel(args: argparse.Namespace) -> None:
+    """
+    Fan the seed range out over ``--workers`` independent processes.
+
+    Episodes are independent — ``run`` reseeds from ``base_seed + ep`` before
+    each one — so the only coordination needed is splitting the range into
+    disjoint blocks.  Each worker writes its own shard (the seed is in the
+    filename) and ``analyze_leaf_data`` / ``train_value`` concatenate every
+    ``.npz`` under the output directory, so the result is exactly the serial
+    one up to episode ordering.
+
+    Processes rather than threads: the per-decision work is CPU-bound Python
+    and the GIL would serialise it, and each worker needs its own irsim world.
+    Each is pinned to a single BLAS thread so K workers occupy K cores instead
+    of K x cores fighting over the same ones.
+    """
+    workers = max(1, min(args.workers, args.episodes))
+    # Contiguous seed blocks; the remainder goes to the first few workers.
+    per, extra = divmod(args.episodes, workers)
+    counts = [per + (1 if i < extra else 0) for i in range(workers)]
+    seeds, cursor = [], args.seed
+    for count in counts:
+        seeds.append(cursor)
+        cursor += count
+
+    out_dir = Path(args.out)
+    log_dir = out_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    child_env = dict(os.environ)
+    child_env.update(
+        OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
+        OPENBLAS_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1",
+    )
+
+    print(f"Fanning {args.episodes} episodes over {workers} workers "
+          f"(seeds {args.seed}..{args.seed + args.episodes - 1})\n"
+          f"Per-worker output: {log_dir}/")
+
+    procs = []
+    try:
+        for i, (seed, count) in enumerate(zip(seeds, counts)):
+            log_path = log_dir / f"worker{i}_s{seed}.log"
+            handle = log_path.open("w")
+            proc = subprocess.Popen(
+                worker_argv(args, count, seed), env=child_env,
+                stdout=handle, stderr=subprocess.STDOUT,
+            )
+            procs.append({"i": i, "seed": seed, "count": count, "proc": proc,
+                          "handle": handle, "log": log_path, "rc": None})
+            print(f"  worker {i}: seeds {seed}..{seed + count - 1} "
+                  f"({count} ep), pid {proc.pid}")
+
+        t0 = time.time()
+        remaining = len(procs)
+        while remaining:
+            time.sleep(2.0)
+            for rec in procs:
+                if rec["rc"] is not None:
+                    continue
+                rc = rec["proc"].poll()
+                if rc is None:
+                    continue
+                rec["rc"] = rc
+                rec["handle"].close()
+                remaining -= 1
+                mins = (time.time() - t0) / 60.0
+                status = "done" if rc == 0 else f"FAILED rc={rc} -> {rec['log']}"
+                print(f"  [{mins:6.1f} min] worker {rec['i']} "
+                      f"({rec['count']} ep): {status}  "
+                      f"({remaining} still running)")
+    except KeyboardInterrupt:
+        print("\nInterrupted — terminating workers")
+        for rec in procs:
+            if rec["rc"] is None:
+                rec["proc"].terminate()
+        for rec in procs:
+            rec["proc"].wait()
+            rec["handle"].close()
+        raise
+
+    elapsed = (time.time() - t0) / 60.0
+    failed = [r["i"] for r in procs if r["rc"] != 0]
+
+    # Report on what actually landed on disk, not on what was requested: a
+    # worker can exit non-zero after writing nothing (e.g. no episode solved).
+    written = [out_dir / shard_name(args, r["seed"]) for r in procs]
+    written = [p for p in written if p.exists()]
+    ratios = []
+    for path in written:
+        with np.load(path, allow_pickle=False) as z:
+            valid = z["valid"]
+            ratios.append(z["ratio"][valid & np.isfinite(z["ratio"])])
+    merged = np.concatenate(ratios) if ratios else np.zeros(0)
+
+    print(f"\n{len(written)}/{len(procs)} shards written in {elapsed:.1f} min "
+          f"-> {out_dir}")
+    if failed:
+        print(f"WARNING: workers {failed} failed; see {log_dir}/ for tracebacks")
+    if merged.size == 0:
+        raise SystemExit(
+            "No shard carries a valid labelled decision. Check the worker logs."
+        )
+    print(
+        f"\nQuick look — G / h_analytic over {merged.size} labelled decisions "
+        f"(all shards):\n"
+        f"  median {np.median(merged):.4f}   mean {merged.mean():.4f}   "
+        f"IQR [{np.percentile(merged, 25):.4f}, "
+        f"{np.percentile(merged, 75):.4f}]\n"
+        f"Run analyze_leaf_data.py --data {out_dir} for the constant-alpha test."
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--episodes", type=int, default=100)
@@ -235,6 +410,12 @@ def main() -> None:
     ap.add_argument("--keep-censored", action="store_true",
                     help="also store timeout/collision episodes (valid=False); "
                          "excluded from the ratio either way")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="split the seed range over this many processes, each "
+                         "writing its own shard into --out.  Collection is "
+                         "single-core CPU-bound, so this is the main speed "
+                         "knob; every worker loads its own backbone, so budget "
+                         "roughly 1.5 GB RAM and some GPU memory apiece")
     # --- policy that generates the trajectories -------------------------
     ap.add_argument("--prior-model", type=str, default=None,
                     help="learned PriorNet checkpoint; a better policy makes "
@@ -248,6 +429,12 @@ def main() -> None:
                          "this changes the policy being measured, not the "
                          "heuristic being scored — see the printed note")
     args = ap.parse_args()
+
+    # Fan out before touching torch/irsim: the parent stays a thin supervisor
+    # and never loads a backbone or a CUDA context of its own.
+    if args.workers > 1:
+        collect_parallel(args)
+        return
 
     device = resolve_device(args.device)
     cost = SwitcherCost.from_yaml(args.cost_config)
@@ -332,7 +519,8 @@ def main() -> None:
                 f"produces are not a trustworthy basis for labels."
             )
 
-    collector = LeafCollector(env, alpha, args.goal_threshold, feature_builder)
+    collector = LeafCollector(env, alpha, args.goal_threshold, feature_builder,
+                              base_seed=args.seed)
 
     def decide(e):
         collector.before_decision()
@@ -358,11 +546,7 @@ def main() -> None:
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Provenance goes in the filename as well as the payload: labels are only
-    # valid for the policy that produced them, and shards from different
-    # policies must not silently merge into one fit.
-    tag = f"{'p' if args.prior_model else 'u'}{search_leaf[0]}"
-    path = out_dir / f"leaf_{args.variant}_b{args.budget}_{tag}_s{args.seed}.npz"
+    path = out_dir / shard_name(args, args.seed)
     np.savez_compressed(
         path, alpha=np.float64(alpha),
         goal_threshold=np.float64(args.goal_threshold),

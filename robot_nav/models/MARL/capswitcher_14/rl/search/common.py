@@ -43,6 +43,7 @@ class Branch:
     mode: int                 # COARSE (0) or PRECISE (1)
     group: int | None         # coarse move-group id, else None
     step_cost: float          # exact per-decision motion cost (known at stub time)
+    pgroup: int | None = field(default=None)  # precise-group id (configs B/C), None = precise-all
     frames: list | None = field(default=None)     # vetted coarse frames (post-mat.)
     candidate: object | None = field(default=None)  # shield CoarseCandidate (post-mat.)
     # Goal-distance reduction (m) the edge buys, filled on materialisation by
@@ -56,16 +57,39 @@ class Branch:
 def expand_stubs(model, ms) -> list[Branch]:
     """
     Build the branch stubs for ``ms``: every selectable coarse group plus the
-    always-present precise edge (last).  No model transition is run — this is
-    the cheap half of an expansion; the prior forward pass is the other half.
+    precise edges (last).  No model transition is run — this is the cheap half
+    of an expansion; the prior forward pass is the other half.
+
+    Precise edges depend on the model's configuration (redesign §3):
+
+    * ``model.precise_groups is None`` — the single legacy precise-all edge.
+    * otherwise — one edge per precise group that still has an unreached
+      member (a fully-arrived group would be a no-op edge; it is simply not
+      an action at this node, mirroring how a refuted coarse edge is not one).
+      With every robot unreached, at least one precise edge always exists, so
+      a node's legal set can only go empty at the terminal.
     """
     branches = [
         Branch(mode=COARSE, group=g, step_cost=model.step_cost(COARSE, ms, g))
         for g in model.coarse.selectable_groups()
     ]
-    branches.append(
-        Branch(mode=PRECISE, group=None, step_cost=model.step_cost(PRECISE, ms))
-    )
+    pgs = getattr(model, "precise_groups", None)
+    if pgs is None:
+        branches.append(
+            Branch(mode=PRECISE, group=None, step_cost=model.step_cost(PRECISE, ms))
+        )
+    else:
+        for pg in range(len(pgs)):
+            if model.driven_members(ms, pg).size == 0:
+                continue
+            branches.append(
+                Branch(
+                    mode=PRECISE,
+                    group=None,
+                    step_cost=model.step_cost(PRECISE, ms, pgroup=pg),
+                    pgroup=pg,
+                )
+            )
     return branches
 
 

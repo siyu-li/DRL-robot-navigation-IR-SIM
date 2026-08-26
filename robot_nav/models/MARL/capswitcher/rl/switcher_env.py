@@ -126,6 +126,17 @@ class SwitcherEnv:
                             the precise rollout skips (and never charges) such
                             robots. Default 0.3.
         device:             Torch device used by the backbone.
+        coupling:           Optional ``PreciseCoupling`` — the physics fix
+                            (redesign §2): a driven robot's rotation is realised
+                            through the actuation matrix, so every bystander
+                            receives its coupled side-rotation command (but
+                            never translates).  ``None`` keeps the legacy
+                            independent-rotation behaviour.
+        precise_groups:     Optional list of member-index lists (redesign §3).
+                            When set, ``step(1, pgroup=k)`` drives group ``k``'s
+                            unreached members simultaneously instead of the
+                            legacy all-robots sequential resolution (which
+                            remains available via ``pgroup=None``).
     """
 
     NUM_ACTIONS: int = 2   # {0: coarse, 1: precise}
@@ -142,6 +153,8 @@ class SwitcherEnv:
         goal_threshold: float = 0.3,
         device: torch.device = torch.device("cpu"),
         terminate_on_oob: bool = True,
+        coupling=None,
+        precise_groups: list | None = None,
     ) -> None:
         if cost is None:
             raise ValueError(
@@ -157,6 +170,11 @@ class SwitcherEnv:
         self.goal_threshold = float(goal_threshold)
         self.device = device
         self.terminate_on_oob = terminate_on_oob
+        self.coupling = coupling
+        self.precise_groups = (
+            None if precise_groups is None
+            else [np.asarray(g, dtype=int) for g in precise_groups]
+        )
 
         self._step_count: int = 0          # sim sub-steps (diagnostic only)
         self._decision_count: int = 0      # switcher decisions (episode budget)
@@ -220,6 +238,7 @@ class SwitcherEnv:
         action: int,
         group: int | None = None,
         frames: list | None = None,
+        pgroup: int | None = None,
     ) -> tuple[np.ndarray, float, bool, dict[str, Any]]:
         """
         Execute one switcher decision with the chosen mode.
@@ -232,6 +251,10 @@ class SwitcherEnv:
                     (action 0 only).  Used by the safety shield so the plan that
                     runs is exactly the plan that was vetted; takes precedence
                     over ``group`` for the rollout (``group`` is still recorded).
+            pgroup: Optional precise-group id (action 1 only; requires
+                    ``precise_groups``): drive that group's unreached members
+                    simultaneously instead of the all-robots sequential
+                    resolution.
 
         Returns:
             obs:    (N, 512) next observation.
@@ -263,12 +286,17 @@ class SwitcherEnv:
             # one robot per sub-step, so this pins the blame).
             "collision_robots": [],
             "active_robot":     None,
+            # Precise pricing unit: sub-steps summed over driven robots.  For
+            # the legacy sequential rollout this equals ``steps_taken`` (one
+            # robot per sub-step); for group mode it is |driven| per sub-step.
+            "robot_substeps":   0,
+            "pgroup":           None,
         }
 
         if action == 0:
             done = self._run_coarse(info, group=group, frames=frames)
         else:
-            done = self._run_precise(info)
+            done = self._run_precise(info, pgroup=pgroup)
 
         # ---- Decision-budget timeout (counted in decisions, not sub-steps) ---
         if not done and self._decision_count >= self.max_decisions:
@@ -287,7 +315,7 @@ class SwitcherEnv:
                 )
         else:
             info["path_cost"] = float(
-                self.cost.precise_substep_cost(info["steps_taken"])
+                self.cost.precise_substep_cost(info["robot_substeps"])
             )
 
         reward = -info["path_cost"]
@@ -337,19 +365,31 @@ class SwitcherEnv:
                 return True
         return False
 
-    def _run_precise(self, info: dict[str, Any]) -> bool:
+    def _run_precise(
+        self, info: dict[str, Any], pgroup: int | None = None
+    ) -> bool:
         """
-        Resolve robots one at a time with their frozen individual GAT policy.
+        Execute one precise decision.
 
-        Each robot is driven for ``selection_interval`` sub-steps while the
-        others hold still; its action is recomputed every sub-step (state
-        dependent) from a full-graph backbone forward.  Robots already within
-        ``goal_threshold`` of their goal are skipped entirely — they neither
-        move nor add cost-bearing sub-steps.
+        ``pgroup=None`` (legacy / config A): resolve robots one at a time with
+        their frozen individual GAT policy — each unreached robot is driven for
+        ``selection_interval`` sub-steps while the others hold position.
+
+        ``pgroup=k`` (configs B/C; requires ``precise_groups``): drive group
+        ``k``'s unreached members **simultaneously** for ``selection_interval``
+        sub-steps.
+
+        In both modes, with a configured ``coupling`` the driven set's angular
+        commands are realised through the actuation matrix (redesign §2) —
+        bystanders receive their coupled side-rotation but never a linear
+        command.  Robots already within ``goal_threshold`` are skipped and
+        never charged.
 
         Returns:
             done: True if a terminal condition fired during the rollout.
         """
+        if pgroup is not None:
+            return self._run_precise_group(info, pgroup)
         n = self.sim.num_robots
         steps = 0
         for r in range(n):
@@ -362,20 +402,69 @@ class SwitcherEnv:
                 if not self._cache_valid:
                     self._refresh_cache()
                 raw = self._cached_raw_actions
-                # Only robot r moves; convert actor-space to sim-input
+                # Only robot r advances; convert actor-space to sim-input
                 # (lin_vel = (raw[0]+1)/4 ∈ [0, 0.5], ang_vel = raw[1]).
-                sim_actions = [
-                    [(float(raw[i, 0]) + 1.0) / 4.0, float(raw[i, 1])]
-                    if i == r else [0.0, 0.0]
-                    for i in range(n)
-                ]
+                if self.coupling is not None:
+                    w = self.coupling.coupled_ang([r], [float(raw[r, 1])])
+                    sim_actions = [
+                        [(float(raw[i, 0]) + 1.0) / 4.0 if i == r else 0.0,
+                         float(w[i])]
+                        for i in range(n)
+                    ]
+                else:
+                    sim_actions = [
+                        [(float(raw[i, 0]) + 1.0) / 4.0, float(raw[i, 1])]
+                        if i == r else [0.0, 0.0]
+                        for i in range(n)
+                    ]
                 done = self._apply_substep(sim_actions, info)
                 steps += 1
                 info["steps_taken"] = steps
+                info["robot_substeps"] = steps  # one driven robot per sub-step
                 # State changed → cached actions/embedding are stale.
                 self._cache_valid = False
                 if done:
                     return True
+        return False
+
+    def _run_precise_group(self, info: dict[str, Any], pgroup: int) -> bool:
+        """Drive one precise group's unreached members simultaneously."""
+        if self.precise_groups is None:
+            raise ValueError("step(pgroup=...) requires precise_groups")
+        members = self.precise_groups[pgroup]
+        driven = [
+            int(r) for r in members
+            if float(self._last_distances[r]) > self.goal_threshold
+        ]
+        info["pgroup"] = int(pgroup)
+        info["robots_moved"] = len(driven)
+        if not driven:
+            return False                       # no-op edge (search filters these)
+        n = self.sim.num_robots
+        driven_set = set(driven)
+        for _ in range(self.selection_interval):
+            if not self._cache_valid:
+                self._refresh_cache()
+            raw = self._cached_raw_actions
+            if self.coupling is not None:
+                w = self.coupling.coupled_ang(
+                    driven, [float(raw[r, 1]) for r in driven]
+                )
+            else:
+                w = np.zeros(n)
+                for r in driven:
+                    w[r] = float(raw[r, 1])
+            sim_actions = [
+                [(float(raw[i, 0]) + 1.0) / 4.0 if i in driven_set else 0.0,
+                 float(w[i])]
+                for i in range(n)
+            ]
+            done = self._apply_substep(sim_actions, info)
+            info["steps_taken"] += 1
+            info["robot_substeps"] += len(driven)
+            self._cache_valid = False
+            if done:
+                return True
         return False
 
     def _apply_substep(

@@ -113,9 +113,11 @@ def _log_softmax(logits: np.ndarray) -> np.ndarray:
 class BFSNode:
     """One generated node: state + path bookkeeping (parent chain = the plan)."""
 
-    __slots__ = ("ms", "g", "h", "log_pi", "depth", "parent", "branch", "terminal")
+    __slots__ = ("ms", "g", "h", "log_pi", "depth", "parent", "branch",
+                 "terminal", "aidx")
 
-    def __init__(self, ms, g, h, log_pi, depth, parent, branch, terminal) -> None:
+    def __init__(self, ms, g, h, log_pi, depth, parent, branch, terminal,
+                 aidx: int = -1) -> None:
         self.ms = ms
         self.g = g                    # exact accumulated step cost from root
         self.h = h                    # leaf cost-to-go estimate (0 if terminal)
@@ -124,6 +126,7 @@ class BFSNode:
         self.parent = parent          # BFSNode | None
         self.branch = branch          # Branch taken from parent (None at root)
         self.terminal = terminal      # all_reached in-model
+        self.aidx = aidx              # branch index within parent's stubs
 
 
 @dataclass
@@ -144,7 +147,8 @@ def _extract_decisions(node: BFSNode) -> list[dict]:
     out: list[dict] = []
     while node.parent is not None:
         b = node.branch
-        out.append({"mode": b.mode, "group": b.group, "frames": b.frames})
+        out.append({"mode": b.mode, "group": b.group, "pgroup": b.pgroup,
+                    "frames": b.frames})
         node = node.parent
     out.reverse()
     return out
@@ -161,12 +165,16 @@ class BestFirstSearch14:
         max_transitions: cap on ``model.n_transitions`` per :meth:`run`; the
                          expansion in progress is finished, so the cap can
                          overshoot by at most one node's edges (≤ 23).
+        recorder:        optional :class:`~.trace.TraceRecorder` — logs every
+                         expansion + plan outcome to npz shards (redesign §6).
     """
 
-    def __init__(self, evaluate, prior=None, max_transitions: int = 20000) -> None:
+    def __init__(self, evaluate, prior=None, max_transitions: int = 20000,
+                 recorder=None) -> None:
         self.evaluate = evaluate
         self.prior = prior if prior is not None else UniformPrior()
         self.max_transitions = int(max_transitions)
+        self.recorder = recorder
 
     def run(self, model, ms, trace: list | None = None) -> PlanResult:
         """
@@ -176,6 +184,8 @@ class BestFirstSearch14:
         if model.all_reached(ms):
             return PlanResult([], True, 0.0, 0, model.n_coarse_vets,
                               model.n_precise_expansions, False)
+        if self.recorder is not None:
+            self.recorder.begin_plan(model, ms)
         root = BFSNode(
             ms, g=0.0, h=float(model.cost_to_go(ms)), log_pi=0.0, depth=0,
             parent=None, branch=None, terminal=False,
@@ -196,18 +206,38 @@ class BestFirstSearch14:
             log_pi_cond = _log_softmax(
                 np.asarray(self.prior(model, node.ms, branches), dtype=np.float64)
             )
+            branch_rows: list[tuple] = []       # recorder rows, stub order
+
+            def rec(b, safe, clearance, child_g, child_h, terminal, collision):
+                branch_rows.append((
+                    b.mode,
+                    -1 if b.group is None else b.group,
+                    -1 if b.pgroup is None else b.pgroup,
+                    b.step_cost, safe, clearance,
+                    child_g, child_h, terminal, collision,
+                ))
+
+            nan = float("nan")
             for a, b in enumerate(branches):
                 if b.mode == PRECISE:
-                    child_ms = model.precise_next(node.ms)
+                    child_ms = (
+                        model.precise_next(node.ms) if b.pgroup is None
+                        else model.precise_group_next(node.ms, b.pgroup)
+                    )
+                    clearance = nan
                 else:
                     mv = model.coarse_move(node.ms, b.group)
+                    clearance = float(mv.candidate.clearance)
                     if not mv.candidate.safe:
+                        rec(b, False, clearance, nan, nan, False, False)
                         continue          # illegal edge; the vet was charged
                     b.frames = mv.candidate.frames
                     b.candidate = mv.candidate
                     child_ms = mv.next_state
                 terminal = model.all_reached(child_ms)
                 if not terminal and model.collision_pred(child_ms):
+                    rec(b, True, clearance, node.g + b.step_cost, nan,
+                        False, True)
                     continue              # dead end (precise is never vetted)
                 child = BFSNode(
                     child_ms,
@@ -218,7 +248,9 @@ class BestFirstSearch14:
                     parent=node,
                     branch=b,
                     terminal=terminal,
+                    aidx=a,
                 )
+                rec(b, True, clearance, child.g, child.h, terminal, False)
                 if terminal and (best_goal is None or child.g < best_goal.g):
                     best_goal = child
                 if child.g + child.h < best_partial.g + best_partial.h:
@@ -227,15 +259,22 @@ class BestFirstSearch14:
                 heapq.heappush(heap, (key, tiebreak, child))
                 tiebreak += 1
             expansions += 1
+            if self.recorder is not None:
+                self.recorder.record_expansion(node, branch_rows)
+
+        def finish(result: PlanResult, goal_node: BFSNode | None) -> PlanResult:
+            if self.recorder is not None:
+                self.recorder.end_plan(result, goal_node)
+            return result
 
         expand(root)                      # the root is always expanded first
         while heap:
             _, _, node = heapq.heappop(heap)
             if node.terminal:             # first popped solution node wins
-                return PlanResult(
+                return finish(PlanResult(
                     _extract_decisions(node), True, node.g, expansions,
                     model.n_coarse_vets, model.n_precise_expansions, False,
-                )
+                ), node)
             if model.n_transitions >= self.max_transitions:
                 cap_hit = True
                 break
@@ -244,15 +283,15 @@ class BestFirstSearch14:
         # Cap hit or queue exhausted without popping a goal.  A generated goal
         # node is still an exact in-model plan — prefer it over any estimate.
         if best_goal is not None:
-            return PlanResult(
+            return finish(PlanResult(
                 _extract_decisions(best_goal), True, best_goal.g, expansions,
                 model.n_coarse_vets, model.n_precise_expansions, cap_hit,
-            )
-        return PlanResult(
+            ), best_goal)
+        return finish(PlanResult(
             _extract_decisions(best_partial), False,
             best_partial.g + best_partial.h, expansions,
             model.n_coarse_vets, model.n_precise_expansions, cap_hit,
-        )
+        ), best_partial)
 
 
 # ---------------------------------------------------------------------------
@@ -290,12 +329,18 @@ class PlanToGoalSwitcher14:
         cost: SwitcherCost | None = None,
         default_rho: float = 0.2,
         leaf_value=None,
+        coupling=None,
+        precise_groups: list | None = None,
+        recorder=None,
     ) -> None:
         if cost is None:
             raise ValueError(
                 "PlanToGoalSwitcher14 requires a SwitcherCost (load "
                 "cost_14robots.yaml with SwitcherCost.from_yaml)"
             )
+        self.coupling = coupling
+        self.precise_groups = precise_groups
+        self.recorder = recorder
         self.backbone = backbone
         self.coarse = coarse
         self.sim = sim
@@ -306,7 +351,8 @@ class PlanToGoalSwitcher14:
         self.default_rho = float(default_rho)
         self.leaf_value = leaf_value
         self.search = BestFirstSearch14(
-            evaluate, prior=prior, max_transitions=max_transitions
+            evaluate, prior=prior, max_transitions=max_transitions,
+            recorder=recorder,
         )
 
         self._plan: deque[dict] = deque()
@@ -331,6 +377,8 @@ class PlanToGoalSwitcher14:
             cost=self.cost,
             default_rho=self.default_rho,
             leaf_value=self.leaf_value,
+            coupling=self.coupling,
+            precise_groups=self.precise_groups,
         )
         return model, ForwardModel14.state_from_robot_state(robot_state)
 
@@ -349,14 +397,15 @@ class PlanToGoalSwitcher14:
             if not self._plan:
                 self.n_fallbacks += 1
                 return {
-                    "mode": PRECISE, "group": None, "frames": None,
-                    "candidates": [],
+                    "mode": PRECISE, "group": None, "pgroup": None,
+                    "frames": None, "candidates": [],
                 }
         else:
             self.decision_transitions.append(0)
         d = self._plan.popleft()
         return {
-            "mode": d["mode"], "group": d["group"], "frames": d["frames"],
+            "mode": d["mode"], "group": d["group"],
+            "pgroup": d.get("pgroup"), "frames": d["frames"],
             "candidates": [],
         }
 

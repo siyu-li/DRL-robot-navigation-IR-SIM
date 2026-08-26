@@ -94,7 +94,12 @@ class Node:
 
     @property
     def precise_action(self) -> int:
+        # Legacy single-precise-edge assumption; prefer ``is_precise`` when
+        # multiple precise edges (configs B/C) may exist.
         return len(self.branches) - 1
+
+    def is_precise(self, a: int) -> bool:
+        return self.branches[a].mode == PRECISE
 
 
 def make_node(model, ms) -> Node:
@@ -133,7 +138,11 @@ def materialize(node: Node, a: int, model) -> Node | None:
     """
     branch = node.branches[a]
     if branch.mode == PRECISE:
-        child = make_node(model, model.precise_next(node.ms))
+        next_ms = (
+            model.precise_next(node.ms) if branch.pgroup is None
+            else model.precise_group_next(node.ms, branch.pgroup)
+        )
+        child = make_node(model, next_ms)
     else:
         mv = model.coarse_move(node.ms, branch.group)
         branch.candidate = mv.candidate

@@ -126,7 +126,8 @@ def render_episode(
             print(f"  -- plan #{policy.n_plans}: "
                   f"{policy.decision_transitions[-1]} transitions -> {what}")
         _, _, done, info = env.step(
-            decision["mode"], group=decision["group"], frames=decision["frames"]
+            decision["mode"], group=decision["group"],
+            frames=decision["frames"], pgroup=decision.get("pgroup"),
         )
         step += 1
         cost = float(info["path_cost"])
@@ -195,6 +196,18 @@ def _print_summary(summaries: list[dict]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--precise-only", action="store_true",
+                    help="no search: every decision is the precise mode "
+                         "(sequential per-robot GAT), as in the precise-only "
+                         "baseline rows.  Combine with --coupled-precise to "
+                         "watch the physics fix (bystander side-rotations)")
+    ap.add_argument("--precise-config",
+                    choices=["all", "pairs", "singles"], default="all",
+                    help="precise action set for baseline rendering "
+                         "(pairs/singles: per-group precise edges)")
+    ap.add_argument("--coupled-precise", action="store_true",
+                    help="physics fix (redesign §2): precise rotation couples "
+                         "through the actuation matrix")
     ap.add_argument("--eager", action="store_true",
                     help="render GAZ14-E (GumbelSwitcher14Eager + "
                          "HeuristicPrior14) instead of the lazy switcher")
@@ -247,9 +260,12 @@ def main() -> None:
     add_layout_args(ap)
     args = ap.parse_args()
 
-    if args.eager and args.baseline:
-        raise SystemExit("--eager and --baseline are mutually exclusive.")
-    if not args.eager and not args.baseline and not args.prior_model:
+    if sum(map(bool, (args.eager, args.baseline, args.precise_only))) > 1:
+        raise SystemExit(
+            "--eager / --baseline / --precise-only are mutually exclusive."
+        )
+    if not args.eager and not args.baseline and not args.precise_only \
+            and not args.prior_model:
         raise SystemExit(
             "--prior-model is required for the lazy switcher (its prior is "
             "learned).  Pass --eager to render GAZ14-E, whose HeuristicPrior14 "
@@ -269,7 +285,35 @@ def main() -> None:
         backbone_ckpt=args.backbone_ckpt,
         disable_plotting=False,          # the whole point of this script
         layout=layout,
+        precise_config=args.precise_config, coupled=args.coupled_precise,
     )
+
+    if args.precise_only:
+        from robot_nav.models.MARL.capswitcher.rl.reward import PRECISE
+
+        class _PreciseOnly:
+            def decide(self, robot_state):
+                return {"mode": PRECISE, "group": None, "pgroup": None,
+                        "frames": None}
+
+        print(
+            f"Env: {sim.num_robots} robots, precise-only "
+            f"({'COUPLED rotation' if args.coupled_precise else 'legacy uncoupled'}), "
+            f"precise_unit={cost.precise_unit}, device={device}\n"
+            f"World: {'corridor ' + str(layout.band) if layout else 'scattered'}"
+        )
+        eps = (
+            [args.only_episode] if args.only_episode is not None
+            else list(range(args.episodes))
+        )
+        summaries = [
+            render_episode(env, _PreciseOnly(), coarse, args.seed + ep, ep,
+                           args.render_delay, not args.quiet)
+            for ep in eps
+        ]
+        sim.env.end(ending_time=0)
+        _print_summary(summaries)
+        return
 
     leaf_value = None
     if args.value_model:
@@ -308,6 +352,8 @@ def main() -> None:
             goal_threshold=args.goal_threshold,
             cost=env.cost,
             leaf_value=leaf_value,
+            coupling=env.coupling,
+            precise_groups=env.precise_groups,
         )
         print(
             f"Env: {sim.num_robots} robots, {len(MOVE_GROUPS)} coarse groups, "

@@ -119,6 +119,15 @@ class ForwardModel14:
         cost:               :class:`SwitcherCost` decision-pricing table (load
                             with ``SwitcherCost.from_yaml``).
         leaf_value:         Optional learned leaf evaluator ``(model, ms) -> float``.
+        coupling:           Optional :class:`PreciseCoupling` — the physics fix
+                            (redesign §2): precise rotation is realised through
+                            the actuation matrix, side-rotating every bystander.
+                            ``None`` keeps the legacy (physically inconsistent)
+                            independent-rotation model.
+        precise_groups:     Optional list of member-index lists — the precise
+                            action set (redesign §3).  ``None`` keeps the single
+                            legacy precise-all edge; a list replaces it with one
+                            edge per group (see :meth:`precise_group_next`).
     """
 
     def __init__(
@@ -135,6 +144,8 @@ class ForwardModel14:
         goal_threshold: float = 0.3,
         cost: SwitcherCost | None = None,
         leaf_value=None,
+        coupling=None,
+        precise_groups: list | None = None,
     ) -> None:
         if cost is None:
             raise ValueError(
@@ -153,6 +164,11 @@ class ForwardModel14:
         self.goal_threshold = float(goal_threshold)
         self.cost = cost
         self.leaf_value = leaf_value
+        self.coupling = coupling
+        self.precise_groups = (
+            None if precise_groups is None
+            else [np.asarray(g, dtype=int) for g in precise_groups]
+        )
 
         self.N = self.goals.shape[0]
 
@@ -357,11 +373,83 @@ class ForwardModel14:
                 lin = (float(raw[r, 0]) + 1.0) / 4.0   # actor→sim: [0, 0.5]
                 ang = float(raw[r, 1])
                 sim_actions = np.zeros((self.N, 2), dtype=np.float64)
-                sim_actions[r] = (lin, ang)
+                if self.coupling is not None:
+                    # Physics fix: the driven robot's turn couples into every
+                    # bystander through the actuation matrix (bystanders still
+                    # do not translate).
+                    sim_actions[:, 1] = self.coupling.coupled_ang([int(r)], [ang])
+                else:
+                    sim_actions[r, 1] = ang
+                sim_actions[r, 0] = lin
                 poses = self._integrate(poses, sim_actions)
                 last = sim_actions
                 if record:
                     path.append((int(r), poses[:, :2].copy()))
+        return ModelState(poses=poses, last_actions=last), path
+
+    # ------------------------------------------------------------------
+    # Per-group precise transitions (redesign §3 — configs B/C)
+    # ------------------------------------------------------------------
+
+    def precise_group_next(self, ms: ModelState, pgroup: int) -> ModelState:
+        """
+        Next state after one precise decision driving precise-group ``pgroup``:
+        the group's *unreached* members are driven **simultaneously** by their
+        frozen GAT actions for ``selection_interval`` sub-steps.  With a
+        configured ``coupling`` the members' angular commands are realised
+        through the actuation matrix (bystanders side-rotate but do not
+        translate); without one, bystanders hold still (legacy physics).
+
+        A budgeted transition (``n_precise_expansions``), one per edge — note
+        it costs ``|driven| × selection_interval`` GAT-driven sub-steps versus
+        ``n_unreached × selection_interval`` for the legacy precise-all edge.
+        """
+        self.n_precise_expansions += 1
+        return self._precise_group_rollout(ms, pgroup, record=False)[0]
+
+    def precise_group_rollout(
+        self, ms: ModelState, pgroup: int
+    ) -> tuple[ModelState, list]:
+        """Un-budgeted variant returning the swept path (diagnostics only)."""
+        return self._precise_group_rollout(ms, pgroup, record=True)
+
+    def driven_members(self, ms: ModelState, pgroup: int) -> np.ndarray:
+        """Unreached members of precise-group ``pgroup`` at ``ms``."""
+        members = self.precise_groups[pgroup]
+        dist = self.goal_distances(ms)
+        return members[dist[members] > self.goal_threshold]
+
+    def _precise_group_rollout(
+        self, ms: ModelState, pgroup: int, record: bool
+    ) -> tuple[ModelState, list]:
+        """Shared body of ``precise_group_next`` / ``precise_group_rollout``."""
+        if self.precise_groups is None:
+            raise ValueError("precise_group_next requires precise_groups")
+        poses = ms.poses.copy()
+        last = ms.last_actions.copy()
+        path: list = [(-1, poses[:, :2].copy())] if record else []
+        driven = self.driven_members(ms, pgroup)
+        if driven.size == 0:          # all members reached — a no-op edge
+            return ModelState(poses=poses, last_actions=last), path
+        driven_list = [int(r) for r in driven]
+        for _ in range(self.selection_interval):
+            rs = self.robot_state(ModelState(poses=poses, last_actions=last))
+            raw, _ = self.backbone.get_embedding_and_actions(
+                rs, self.obstacle_states
+            )
+            raw = np.asarray(raw)
+            lin = (raw[driven, 0] + 1.0) / 4.0        # actor→sim: [0, 0.5]
+            ang = raw[driven, 1].astype(np.float64)
+            sim_actions = np.zeros((self.N, 2), dtype=np.float64)
+            if self.coupling is not None:
+                sim_actions[:, 1] = self.coupling.coupled_ang(driven_list, ang)
+            else:
+                sim_actions[driven, 1] = ang
+            sim_actions[driven, 0] = lin
+            poses = self._integrate(poses, sim_actions)
+            last = sim_actions
+            if record:
+                path.append((driven_list, poses[:, :2].copy()))
         return ModelState(poses=poses, last_actions=last), path
 
     def _integrate(self, poses: np.ndarray, sim_actions: np.ndarray) -> np.ndarray:
@@ -384,19 +472,31 @@ class ForwardModel14:
         """Number of robots still outside ``goal_threshold`` at ``ms``."""
         return int(np.sum(self.goal_distances(ms) > self.goal_threshold))
 
-    def step_cost(self, action: int, ms: ModelState, group: int | None = None) -> float:
+    def step_cost(
+        self,
+        action: int,
+        ms: ModelState,
+        group: int | None = None,
+        pgroup: int | None = None,
+    ) -> float:
         """
         Per-decision motion cost from the :class:`SwitcherCost` table.
 
-        Coarse ⇒ the group's configured constant.  Precise ⇒
+        Coarse ⇒ the group's configured constant.  Precise-all ⇒
         ``precise_unit × n_unreached(ms) × selection_interval`` — the nominal
         price of the rollout that skips reached robots (the env charges the
         sub-steps actually executed; they differ only on terminal truncation).
-        Known without vetting — lazy branch stubs carry exact step costs from
-        creation.
+        Precise-group (``pgroup``) ⇒ the same formula over the group's
+        unreached members only.  Known without vetting — lazy branch stubs
+        carry exact step costs from creation.
         """
         if action == COARSE:
             return float(self.cost.coarse_cost(group))
+        if pgroup is not None:
+            n_driven = int(self.driven_members(ms, pgroup).size)
+            return float(
+                self.cost.precise_cost(n_driven, self.selection_interval)
+            )
         return float(
             self.cost.precise_cost(self.n_unreached(ms), self.selection_interval)
         )
@@ -441,6 +541,8 @@ def build_forward_model(
     cost: SwitcherCost,
     default_rho: float,
     leaf_value=None,
+    coupling=None,
+    precise_groups: list | None = None,
 ) -> ForwardModel14:
     """
     Rebuild the deterministic forward model from the live sim + root state —
@@ -462,4 +564,6 @@ def build_forward_model(
         goal_threshold=goal_threshold,
         cost=cost,
         leaf_value=leaf_value,
+        coupling=coupling,
+        precise_groups=precise_groups,
     )

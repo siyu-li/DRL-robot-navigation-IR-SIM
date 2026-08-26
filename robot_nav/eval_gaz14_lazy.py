@@ -39,6 +39,8 @@ Usage (run on the GPU box — local irsim step crashes; see project memory):
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -54,11 +56,17 @@ from robot_nav.models.MARL.capswitcher.rl.switcher_env import (
     seed_episode,
 )
 from robot_nav.models.MARL.capswitcher_14.configs import (
+    A_FULL,
     MOVE_GROUPS,
+    PRECISE_CONFIGS,
+    build_precise_groups,
     make_coarse_steering,
 )
 from robot_nav.models.MARL.capswitcher_14.policies.coarse_steering import (
     CoarseSteering14,
+)
+from robot_nav.models.MARL.capswitcher_14.policies.precise_coupling import (
+    PreciseCoupling,
 )
 from robot_nav.models.MARL.capswitcher_14.rl.search.features import (
     GroupFeatureBuilder,
@@ -86,7 +94,6 @@ RESULT_ROWS = [
     ("  coarse cost/ep",     "avg_coarse_cost",     "{:.0f}"),
     ("  precise cost/ep",    "avg_precise_cost",    "{:.0f}"),
     ("  precise share",      "precise_cost_share",  "{:.1%}"),
-    ("avg cost/ep (mixed)",  "avg_cost",            "{:.0f}"),
     ("precise fraction",     "precise_frac",        "{:.1%}"),
     ("coarse fraction",      "coarse_frac",         "{:.1%}"),
     ("safe-coarse avail.",   "safe_avail_frac",     "{:.1%}"),
@@ -167,6 +174,7 @@ def build_env(
     device: torch.device, cost: SwitcherCost, goal_threshold: float,
     backbone_ckpt: str, disable_plotting: bool = True,
     layout: CorridorLayout | None = None,
+    precise_config: str = "all", coupled: bool = False,
 ) -> tuple[SwitcherEnv, CoarseSteering14, MARL_SIM_OBSTACLE]:
     """
     Construct 14-robot sim + backbone + coarse primitive + switcher env.
@@ -179,6 +187,13 @@ def build_env(
     ``CorridorLayout`` is the banded sparse→dense→sparse world, which keeps the
     same 14 robots and 7 obstacles (the frozen backbone's shapes) and only moves
     where they are drawn.
+
+    ``precise_config`` / ``coupled`` (redesign §2–§3): the precise action set
+    ("all" = legacy precise-all; "pairs"/"singles" = per-group edges) and the
+    coupled-rotation physics fix.  Defaults keep the **legacy** behaviour so
+    existing pipelines are bit-identical until the re-baseline is run
+    deliberately; the built env carries ``env.coupling`` / ``env.precise_groups``
+    for switcher construction.
     """
     sim = MARL_SIM_OBSTACLE(
         world_file=CORRIDOR_WORLD if layout is not None else SCATTERED_WORLD,
@@ -220,13 +235,15 @@ def build_env(
         goal_threshold=goal_threshold,
         device=device,
         terminate_on_oob=False,
+        coupling=PreciseCoupling(A_FULL, ang_max=1.0) if coupled else None,
+        precise_groups=build_precise_groups(precise_config),
     )
     return env, coarse, sim
 
 
 def run(
     env: SwitcherEnv, decide_fn, episodes: int, base_seed: int, policy=None,
-    on_step=None,
+    on_step=None, episode_log: list | None = None, on_episode=None,
 ) -> dict:
     """
     Run ``decide_fn`` for ``episodes`` seeded episodes and collect stats.
@@ -239,6 +256,11 @@ def run(
     that decision.  It exists so ``collect_leaf_data.py`` can harvest
     cost-to-go labels from the **same** episode loop the evaluation tables are
     produced by, rather than a parallel one that could drift from it.
+
+    ``episode_log`` — optional list; when given, one plain-python record per
+    episode (seed, outcome, decisions, cost split, transitions) is appended
+    and a per-episode progress line is printed, so a seeded episode can be
+    compared row-for-row across policies and the baseline planners.
 
     Episode cost is split into its two priced components so a run is readable
     independently of how precision happens to be priced:
@@ -265,11 +287,17 @@ def run(
     for ep in range(episodes):
         seed = base_seed + ep
         seed_episode(env, seed)
+        if on_episode is not None:
+            # Episode-boundary hook (e.g. TraceRecorder.set_episode) so plans
+            # recorded inside decide_fn carry their episode/seed identity.
+            on_episode(ep, seed)
 
         env.reset()
         done = False
         ep_cost, ep_len = 0.0, 0
         ep_coarse_cost = ep_precise_cost = 0.0
+        ep_coarse_dec = ep_precise_dec = 0
+        dec_start = len(policy.decision_transitions) if policy is not None else 0
         info: dict = {}
         while not done:
             decision = decide_fn(env)
@@ -278,7 +306,8 @@ def run(
                 safe_available += 1
 
             _, _, done, info = env.step(
-                decision["mode"], group=decision["group"], frames=decision["frames"]
+                decision["mode"], group=decision["group"],
+                frames=decision["frames"], pgroup=decision.get("pgroup"),
             )
             ep_len += 1
             total_dec += 1
@@ -288,11 +317,13 @@ def run(
                 on_step(ep, decision, step_cost, info, done)
             if decision["mode"] == COARSE:
                 coarse_dec += 1
+                ep_coarse_dec += 1
                 ep_coarse_cost += step_cost
                 if info["collision"]:
                     coarse_breach += 1
             else:
                 precise_dec += 1
+                ep_precise_dec += 1
                 ep_precise_cost += step_cost
                 if info["collision"]:
                     precise_breach += 1
@@ -316,6 +347,35 @@ def run(
         coarse_costs.append(ep_coarse_cost)
         precise_costs.append(ep_precise_cost)
         lengths.append(ep_len)
+
+        if episode_log is not None:
+            outcome = (
+                "SUCCESS" if info.get("all_reached")
+                else "COLLISION" if info.get("collision")
+                else "TIMEOUT" if info.get("timeout") else "ENDED"
+            )
+            ep_transitions = (
+                int(sum(policy.decision_transitions[dec_start:]))
+                if policy is not None else 0
+            )
+            episode_log.append({
+                "seed": seed,
+                "outcome": outcome,
+                "decisions": ep_len,
+                "cost": round(ep_cost, 3),
+                "coarse_cost": round(ep_coarse_cost, 3),
+                "precise_cost": round(ep_precise_cost, 3),
+                "coarse_dec": ep_coarse_dec,
+                "precise_dec": ep_precise_dec,
+                "transitions": ep_transitions,
+            })
+            print(
+                f"  ep {ep:3d} seed {seed}: {outcome:<9} dec={ep_len:<4} "
+                f"cost={ep_cost:8.1f} (coarse {ep_coarse_cost:7.1f} / "
+                f"precise {ep_precise_cost:7.1f}) "
+                f"transitions={ep_transitions}",
+                flush=True,
+            )
 
     avg_cost = float(np.mean(costs))
     avg_coarse_cost = float(np.mean(coarse_costs))
@@ -415,6 +475,143 @@ def _save_pi_targets(
     print(f"Saved {len(pi_log)} prior-training samples to {path}")
 
 
+# ---------------------------------------------------------------------------
+# Worker shards: one JSON per (budget, seed block); merge exactly.
+#
+# Same trick as ``eval_gaz14_baselines``: episodes are independently seeded
+# (episode k = --seed + k), so disjoint seed blocks in separate processes run
+# exactly the episodes a single big run would.  The Gumbel policy's noise is
+# seeded per decision from a state hash mixed with ``--policy-seed``, so
+# workers sharing one policy seed reproduce the single-run decisions exactly.
+# Every mean/rate below is recoverable as a sum given its denominator, so the
+# merged table equals the single big run's.
+# ---------------------------------------------------------------------------
+
+_INT_KEYS = ("coarse_breach", "precise_breach", "precise_breach_active",
+             "precise_breach_bystander")
+
+# Shard keys that must match across workers for a merged row to make sense.
+_CONFIG_KEYS = ("budget", "m", "policy_seed", "prior_model", "value_model")
+
+
+def _to_counts(stats: dict) -> dict:
+    """Undo the per-shard averaging: means/rates -> sums with denominators."""
+    n = stats["episodes"]
+    dec = stats["avg_decisions"] * n
+    successes = round(stats["success_rate"] * n)
+    return {
+        "episodes": n,
+        "decisions": dec,
+        "successes": successes,
+        "collisions": round(stats["collision_rate"] * n),
+        "timeouts": round(stats["timeout_rate"] * n),
+        "cost": stats["avg_cost"] * n,
+        "coarse_cost": stats["avg_coarse_cost"] * n,
+        "precise_cost": stats["avg_precise_cost"] * n,
+        "success_cost": (stats["avg_cost_success"] or 0.0) * successes,
+        "coarse_dec": stats["coarse_frac"] * dec,
+        "precise_dec": stats["precise_frac"] * dec,
+        "safe_avail": stats["safe_avail_frac"] * dec,
+        "transitions_dec": stats["avg_transitions"] * dec,
+        **{k: stats[k] for k in _INT_KEYS},
+    }
+
+
+def _from_counts(c: dict) -> dict:
+    """Re-average merged sums into a stats dict for :func:`print_table`."""
+    n = c["episodes"]
+    dec = max(c["decisions"], 1)
+    return {
+        "episodes": n,
+        "success_rate": c["successes"] / n,
+        "collision_rate": c["collisions"] / n,
+        "timeout_rate": c["timeouts"] / n,
+        "avg_decisions": c["decisions"] / n,
+        "avg_cost": c["cost"] / n,
+        "avg_cost_success": (
+            c["success_cost"] / c["successes"] if c["successes"] else None
+        ),
+        "avg_coarse_cost": c["coarse_cost"] / n,
+        "avg_precise_cost": c["precise_cost"] / n,
+        "precise_cost_share": c["precise_cost"] / max(c["cost"], 1e-9),
+        "coarse_frac": c["coarse_dec"] / dec,
+        "precise_frac": c["precise_dec"] / dec,
+        "safe_avail_frac": c["safe_avail"] / dec,
+        "avg_transitions": c["transitions_dec"] / dec,
+        **{k: int(round(c[k])) for k in _INT_KEYS},
+    }
+
+
+def _save_shard(out_dir: Path, algo: str, label: str, budget: int,
+                args: argparse.Namespace, stats: dict,
+                per_episode: list[dict]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{algo}_s{args.seed}_e{args.episodes}.json"
+    path.write_text(json.dumps(
+        {
+            "algo": algo,
+            "label": label,
+            "seed": args.seed,
+            "episodes": args.episodes,
+            "budget": budget,
+            "m": args.m,
+            "policy_seed": (
+                args.policy_seed if args.policy_seed is not None else args.seed
+            ),
+            "prior_model": args.prior_model,
+            "value_model": args.value_model,
+            "stats": stats,
+            "per_episode": per_episode,
+        },
+        indent=2,
+    ))
+    print(f"Saved shard: {path}")
+
+
+def merge_shards(shard_dir: Path) -> dict[str, dict]:
+    """
+    Combine all ``*.json`` worker shards in ``shard_dir`` into one table, and
+    write ``per_episode.csv`` — one row per (policy, seeded episode) — for
+    episode-level comparison against the baseline planners.
+    """
+    shards = [json.loads(p.read_text()) for p in sorted(shard_dir.glob("*.json"))]
+    if not shards:
+        raise SystemExit(f"no .json shards in {shard_dir}")
+
+    results: dict[str, dict] = {}
+    csv_rows: list[dict] = []
+    for algo in dict.fromkeys(s["algo"] for s in shards):
+        group = sorted((s for s in shards if s["algo"] == algo),
+                       key=lambda s: s["seed"])
+        for a, b in zip(group, group[1:]):
+            if a["seed"] + a["episodes"] > b["seed"]:
+                print(f"WARNING: {algo} shards s{a['seed']} and s{b['seed']} "
+                      "overlap — episodes double-counted.")
+        for key in _CONFIG_KEYS:
+            if len({str(s.get(key)) for s in group}) > 1:
+                print(f"WARNING: {algo} shards disagree on {key} — "
+                      "the merged row mixes configurations.")
+        counts = [_to_counts(s["stats"]) for s in group]
+        merged = {k: sum(c[k] for c in counts) for k in counts[0]}
+        label = group[0]["label"]
+        results[label] = _from_counts(merged)
+        for s in group:
+            for rec in s.get("per_episode", []):
+                csv_rows.append({"algo": label, **rec})
+        blocks = ", ".join(f"s{s['seed']}+{s['episodes']}" for s in group)
+        print(f"{label}: {len(group)} shard(s) [{blocks}] -> "
+              f"{merged['episodes']} episodes")
+
+    if csv_rows:
+        csv_path = shard_dir / "per_episode.csv"
+        with csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(csv_rows[0]))
+            writer.writeheader()
+            writer.writerows(sorted(csv_rows, key=lambda r: (r["algo"], r["seed"])))
+        print(f"Wrote {len(csv_rows)} episode rows: {csv_path}")
+    return results
+
+
 def print_table(results: dict[str, dict], rows: list | None = None) -> None:
     """Side-by-side comparison of the result dicts."""
     names = list(results)
@@ -462,8 +659,44 @@ def main() -> None:
                     help="learned cost-to-go checkpoint (train_value.py)")
     ap.add_argument("--log-pi-targets", type=str, default=None,
                     help="directory for harvests the training data for learning prior")
+    ap.add_argument("--precise-config", choices=list(PRECISE_CONFIGS),
+                    default="all",
+                    help="precise action set (redesign §3): 'all' = legacy "
+                         "single precise-all edge; 'pairs'/'singles' = one "
+                         "edge per 2-/1-robot precise group")
+    ap.add_argument("--coupled-precise", action="store_true",
+                    help="physics fix (redesign §2): precise rotation is "
+                         "realised through the actuation matrix — bystanders "
+                         "side-rotate.  Off = legacy independent rotation")
+    ap.add_argument("--policy-seed", type=int, default=None,
+                    help="seed for the Gumbel policy's per-decision noise "
+                         "(default: --seed).  Give all parallel workers the "
+                         "same value so the sharded run reproduces a single "
+                         "big run exactly")
+    ap.add_argument("--out", type=str, default=None,
+                    help="directory for per-(budget, seed-block) JSON shards "
+                         "(summary stats + per-episode records) — run "
+                         "disjoint seed blocks in parallel workers, then "
+                         "combine with --merge")
+    ap.add_argument("--merge", type=str, default=None,
+                    help="merge the worker shards in this directory into one "
+                         "table + per_episode.csv and exit (no episodes run)")
     add_layout_args(ap)
     args = ap.parse_args()
+
+    if args.merge:
+        results = merge_shards(Path(args.merge))
+        print_table(results)
+        return
+
+    if args.log_pi_targets and args.precise_config != "all":
+        ap.error("--log-pi-targets assumes the fixed 23-edge action set; "
+                 "it is only valid with --precise-config all (the new "
+                 "trace collector replaces it for pairs/singles)")
+    if args.prior_model and args.precise_config != "all":
+        ap.error("the current PriorNet emits fixed 22+1 logits; a learned "
+                 "prior with --precise-config pairs/singles needs the "
+                 "redesigned token net (design doc §5)")
 
     device = resolve_device(args.device)
     cost = SwitcherCost.from_yaml(args.cost_config)
@@ -471,6 +704,7 @@ def main() -> None:
     env, coarse, sim = build_env(
         device, cost=cost, goal_threshold=args.goal_threshold,
         backbone_ckpt=args.backbone_ckpt, layout=layout,
+        precise_config=args.precise_config, coupled=args.coupled_precise,
     )
     world_desc = "scattered" if layout is None else (
         "corridor "
@@ -531,22 +765,32 @@ def main() -> None:
             c_visit=args.c_visit,
             c_scale=args.c_scale,
             gumbel_scale=args.gumbel_scale,
-            seed=args.seed,
+            seed=args.policy_seed if args.policy_seed is not None else args.seed,
             d_safe=args.d_safe,
             selection_interval=env.selection_interval,
             goal_threshold=args.goal_threshold,
             cost=env.cost,
             leaf_value=leaf_value,
             feature_builder=feature_builder,
+            coupling=env.coupling,
+            precise_groups=env.precise_groups,
         )
         tag = "+p" if args.prior_model else ""
         name = f"GAZ14-b{b}{tag}"
         pi_log = [] if args.log_pi_targets else None
+        ep_log: list[dict] = []
         print(f"\nRunning {name} for {args.episodes} episodes ...")
         results[name] = run(env, _gumbel_decider(policy, pi_log),
-                            args.episodes, args.seed, policy=policy)
+                            args.episodes, args.seed, policy=policy,
+                            episode_log=ep_log)
         if pi_log:
             _save_pi_targets(pi_log, Path(args.log_pi_targets), name, args.d_safe)
+        # Save (and print) each budget's row the moment it finishes — the sweep
+        # takes hours per budget, and a killed run must not lose finished rows.
+        print_table({name: results[name]})
+        if args.out:
+            _save_shard(Path(args.out), f"gaz-b{b}", name, b, args,
+                        results[name], ep_log)
 
     print_table(results)
     if any(r["coarse_breach"] > 0 for r in results.values()):

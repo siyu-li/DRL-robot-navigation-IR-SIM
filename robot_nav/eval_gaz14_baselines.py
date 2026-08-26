@@ -97,8 +97,6 @@ ALGO_LABELS = {
 # materialised edges (model transition counters), averaged per episode.
 BASELINE_ROWS = RESULT_ROWS + [
     ("plans/ep",             "avg_plans",            "{:.2f}"),
-    ("plan solved rate",     "plan_solved_rate",     "{:.1%}"),
-    ("cap hits",             "cap_hits",             "{:d}"),
     ("fallback decisions",   "fallbacks",            "{:d}"),
     ("coarse vets/ep",       "avg_coarse_vets",      "{:.0f}"),
     ("precise rollouts/ep",  "avg_precise_rollouts", "{:.0f}"),
@@ -237,7 +235,7 @@ def _from_counts(c: dict) -> dict:
 
 
 def _save_shard(out_dir: Path, algo: str, args: argparse.Namespace,
-                stats: dict) -> None:
+                stats: dict, per_episode: list[dict] | None = None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{algo}_s{args.seed}_e{args.episodes}.json"
     path.write_text(json.dumps(
@@ -250,6 +248,7 @@ def _save_shard(out_dir: Path, algo: str, args: argparse.Namespace,
             "prior_model": args.prior_model,
             "value_model": args.value_model,
             "stats": stats,
+            "per_episode": per_episode or [],
         },
         indent=2,
     ))
@@ -308,6 +307,22 @@ def main() -> None:
     ap.add_argument("--value-model", type=str, default=None,
                     help="learned cost-to-go checkpoint -> h for A*/PHS/PHS*; "
                          "default analytic α·Σdist")
+    ap.add_argument("--precise-config", choices=["all", "pairs", "singles"],
+                    default="all",
+                    help="precise action set (redesign §3): 'all' = legacy "
+                         "single precise-all edge; 'pairs'/'singles' = one "
+                         "edge per 2-/1-robot precise group")
+    ap.add_argument("--coupled-precise", action="store_true",
+                    help="physics fix (redesign §2): precise rotation is "
+                         "realised through the actuation matrix — bystanders "
+                         "side-rotate.  Off = legacy independent rotation")
+    ap.add_argument("--log-traces", type=str, default=None,
+                    help="directory for search-trace shards (redesign §6): "
+                         "every expansion + plan outcome of every planning "
+                         "call, one npz per plan, raw snapshots — the "
+                         "training-data source for the token value/prior "
+                         "nets.  Shards land in "
+                         "<dir>/<algo>_<config>_s<seed>/")
     ap.add_argument("--out", type=str, default=None,
                     help="directory for per-(algo, seed-block) JSON shards — "
                          "run disjoint seed blocks in parallel workers, then "
@@ -326,9 +341,14 @@ def main() -> None:
     device = resolve_device(args.device)
     cost = SwitcherCost.from_yaml(args.cost_config)
     layout = layout_from_args(args)
+    if args.prior_model and args.precise_config != "all":
+        ap.error("the current PriorNet emits fixed 22+1 logits; a learned "
+                 "prior with --precise-config pairs/singles needs the "
+                 "redesigned token net (design doc §5)")
     env, coarse, sim = build_env(
         device, cost=cost, goal_threshold=args.goal_threshold,
         backbone_ckpt=args.backbone_ckpt, layout=layout,
+        precise_config=args.precise_config, coupled=args.coupled_precise,
     )
     print(
         f"World: {'corridor ' + str(layout.band) if layout else 'scattered'}\n"
@@ -362,6 +382,42 @@ def main() -> None:
 
     results: dict[str, dict] = {}
     for algo in args.algos:
+        recorder = None
+        if args.log_traces:
+            from robot_nav.models.MARL.capswitcher_14.configs import (
+                A_FULL,
+                build_precise_groups,
+            )
+            from robot_nav.models.MARL.capswitcher_14.rl.search.trace import (
+                TraceRecorder,
+            )
+
+            recorder = TraceRecorder(
+                Path(args.log_traces)
+                / f"{algo}_{args.precise_config}_s{args.seed}",
+                meta={
+                    "algo": algo,
+                    "precise_config": args.precise_config,
+                    "coupled": bool(args.coupled_precise),
+                    "A_full": A_FULL,
+                    "move_groups": [
+                        [int(i) for i in coarse.members_of(g)]
+                        for g in coarse.selectable_groups()
+                    ],
+                    "precise_groups": build_precise_groups(args.precise_config),
+                    "precise_unit": env.cost.precise_unit,
+                    "move_distances": env.cost.move_distances,
+                    "selection_interval": env.selection_interval,
+                    "d_safe": args.d_safe,
+                    "goal_threshold": args.goal_threshold,
+                    "max_transitions": args.max_transitions,
+                    "value_model": args.value_model,
+                    "prior_model": args.prior_model,
+                    "base_seed": args.seed,
+                    "episodes": args.episodes,
+                    "world": "corridor" if layout is not None else "scattered",
+                },
+            )
         policy = PlanToGoalSwitcher14(
             backbone=env.backbone,
             coarse=coarse,
@@ -374,20 +430,34 @@ def main() -> None:
             goal_threshold=args.goal_threshold,
             cost=env.cost,
             leaf_value=leaf_value,
+            coupling=env.coupling,
+            precise_groups=env.precise_groups,
+            recorder=recorder,
         )
         name = ALGO_LABELS[algo]
         print(f"\nRunning {name} for {args.episodes} episodes ...")
         on_step, per_ep = _episode_tracker(policy)
         decide = lambda env_, p=policy: p.decide(env_._robot_state)  # noqa: E731
+        on_episode = (
+            (lambda ep, seed, r=recorder: r.set_episode(ep, seed))
+            if recorder is not None else None
+        )
+        ep_log: list[dict] = []
         stats = run(env, decide, args.episodes, args.seed,
-                    policy=policy, on_step=on_step)
+                    policy=policy, on_step=on_step, episode_log=ep_log,
+                    on_episode=on_episode)
         stats.update(_effort_stats(per_ep))
         results[name] = stats
+        # Each episode's outcome/cost record plus its search-effort diff — the
+        # per-seed row the cross-policy comparison joins on.
+        per_episode = [
+            {**rec, "plans": d["plans"]} for rec, d in zip(ep_log, per_ep)
+        ]
         # Print each algorithm's rows the moment it finishes — these runs take
         # hours per algorithm, and a killed run must not lose finished results.
         print_table({name: stats}, rows=BASELINE_ROWS)
         if args.out:
-            _save_shard(Path(args.out), algo, args, stats)
+            _save_shard(Path(args.out), algo, args, stats, per_episode)
 
     if len(results) > 1:
         print_table(results, rows=BASELINE_ROWS)
