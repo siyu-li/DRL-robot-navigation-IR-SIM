@@ -126,12 +126,15 @@ class SwitcherEnv:
                             the precise rollout skips (and never charges) such
                             robots. Default 0.3.
         device:             Torch device used by the backbone.
-        coupling:           Optional ``PreciseCoupling`` — the physics fix
+        coupling:           Optional rotation realiser — the physics fix
                             (redesign §2): a driven robot's rotation is realised
-                            through the actuation matrix, so every bystander
-                            receives its coupled side-rotation command (but
-                            never translates).  ``None`` keeps the legacy
-                            independent-rotation behaviour.
+                            through the actuation matrix.  ``PreciseCoupling``
+                            (pinv; every bystander side-rotates) or
+                            ``GroupRotation`` (the driven robot's fixed block
+                            co-rotates uniformly); affected robots receive the
+                            angular command (and it becomes their last-action
+                            GAT input) but never translate.  ``None`` keeps the
+                            legacy independent-rotation behaviour.
         precise_groups:     Optional list of member-index lists (redesign §3).
                             When set, ``step(1, pgroup=k)`` drives group ``k``'s
                             unreached members simultaneously instead of the
@@ -247,10 +250,15 @@ class SwitcherEnv:
             action: 0 = coarse steering, 1 = precise (sequential GAT actor).
             group:  Optional 1-based coarse group to drive (action 0 only).
                     Defaults to the legacy uniform-random choice.
-            frames: Optional pre-built coarse frames to execute verbatim
-                    (action 0 only).  Used by the safety shield so the plan that
-                    runs is exactly the plan that was vetted; takes precedence
-                    over ``group`` for the rollout (``group`` is still recorded).
+            frames: Optional pre-built frames to execute verbatim.  For coarse
+                    (action 0) the shield's vetted sub-step controls, so the
+                    plan that runs is exactly the plan that was vetted; takes
+                    precedence over ``group`` for the rollout (``group`` is
+                    still recorded).  For precise (action 1) a list of
+                    ``(driven, actions)`` pairs from the forward model's
+                    ``precise_frames`` / ``precise_group_frames`` — replayed
+                    verbatim instead of re-deciding skip sets and actions live
+                    (render-side verbatim plan replay).
             pgroup: Optional precise-group id (action 1 only; requires
                     ``precise_groups``): drive that group's unreached members
                     simultaneously instead of the all-robots sequential
@@ -296,7 +304,7 @@ class SwitcherEnv:
         if action == 0:
             done = self._run_coarse(info, group=group, frames=frames)
         else:
-            done = self._run_precise(info, pgroup=pgroup)
+            done = self._run_precise(info, pgroup=pgroup, frames=frames)
 
         # ---- Decision-budget timeout (counted in decisions, not sub-steps) ---
         if not done and self._decision_count >= self.max_decisions:
@@ -366,7 +374,8 @@ class SwitcherEnv:
         return False
 
     def _run_precise(
-        self, info: dict[str, Any], pgroup: int | None = None
+        self, info: dict[str, Any], pgroup: int | None = None,
+        frames: list | None = None,
     ) -> bool:
         """
         Execute one precise decision.
@@ -379,15 +388,23 @@ class SwitcherEnv:
         ``k``'s unreached members **simultaneously** for ``selection_interval``
         sub-steps.
 
-        In both modes, with a configured ``coupling`` the driven set's angular
-        commands are realised through the actuation matrix (redesign §2) —
-        bystanders receive their coupled side-rotation but never a linear
-        command.  Robots already within ``goal_threshold`` are skipped and
-        never charged.
+        ``frames`` (either mode): pre-built ``(driven, actions)`` sub-step
+        pairs from the forward model's rollout, replayed verbatim — no skip
+        test, no policy forward.  Because the sim's integrator matches the
+        model's exactly, replayed decisions land bit-for-bit on the planned
+        states (used by ``render_gaz14 --verbatim``).
+
+        In both live modes, with a configured ``coupling`` the driven set's
+        angular commands are realised through the actuation matrix (redesign
+        §2) — bystanders receive their coupled side-rotation but never a
+        linear command.  Robots already within ``goal_threshold`` are skipped
+        and never charged.
 
         Returns:
             done: True if a terminal condition fired during the rollout.
         """
+        if frames is not None:
+            return self._replay_precise_frames(info, frames, pgroup)
         if pgroup is not None:
             return self._run_precise_group(info, pgroup)
         n = self.sim.num_robots
@@ -459,6 +476,35 @@ class SwitcherEnv:
                  float(w[i])]
                 for i in range(n)
             ]
+            done = self._apply_substep(sim_actions, info)
+            info["steps_taken"] += 1
+            info["robot_substeps"] += len(driven)
+            self._cache_valid = False
+            if done:
+                return True
+        return False
+
+    def _replay_precise_frames(
+        self, info: dict[str, Any], frames: list, pgroup: int | None = None
+    ) -> bool:
+        """
+        Replay pre-built precise sub-step frames verbatim.
+
+        The skip set and every action were decided by the forward model's
+        rollout at planning time; here they are only applied, so execution is
+        exactly the planned rollout.  Cost accounting is identical to the live
+        modes: ``robot_substeps`` counts driven robots per executed sub-step.
+
+        Returns:
+            done: True if a terminal condition fired during the replay.
+        """
+        if pgroup is not None:
+            info["pgroup"] = int(pgroup)
+        seen: set[int] = set()
+        for driven, sim_actions in frames:
+            seen.update(int(r) for r in driven)
+            info["robots_moved"] = len(seen)
+            info["active_robot"] = int(driven[0]) if len(driven) == 1 else None
             done = self._apply_substep(sim_actions, info)
             info["steps_taken"] += 1
             info["robot_substeps"] += len(driven)

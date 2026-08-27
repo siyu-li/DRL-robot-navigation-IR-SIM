@@ -247,6 +247,7 @@ def _save_shard(out_dir: Path, algo: str, args: argparse.Namespace,
             "max_transitions": args.max_transitions,
             "prior_model": args.prior_model,
             "value_model": args.value_model,
+            "analytic_alpha_scale": getattr(args, "analytic_alpha_scale", 1.0),
             "stats": stats,
             "per_episode": per_episode or [],
         },
@@ -270,7 +271,8 @@ def merge_shards(shard_dir: Path) -> dict[str, dict]:
             if a["seed"] + a["episodes"] > b["seed"]:
                 print(f"WARNING: {algo} shards s{a['seed']} and s{b['seed']} "
                       "overlap — episodes double-counted.")
-        for key in ("max_transitions", "prior_model", "value_model"):
+        for key in ("max_transitions", "prior_model", "value_model",
+                    "analytic_alpha_scale"):
             if len({str(s.get(key)) for s in group}) > 1:
                 print(f"WARNING: {algo} shards disagree on {key} — "
                       "the merged row mixes configurations.")
@@ -307,15 +309,26 @@ def main() -> None:
     ap.add_argument("--value-model", type=str, default=None,
                     help="learned cost-to-go checkpoint -> h for A*/PHS/PHS*; "
                          "default analytic α·Σdist")
+    ap.add_argument("--analytic-alpha-scale", type=float, default=1.0,
+                    help="scale on the analytic leaf's α (default α ≈ 77.1 "
+                         "per robot-metre prices everything at precise rates "
+                         "— strongly inadmissible; smaller scales broaden "
+                         "the search toward cheaper plans).  Label-quality "
+                         "probe of the value-corpus pilot; incompatible "
+                         "with --value-model")
     ap.add_argument("--precise-config", choices=["all", "pairs", "singles"],
                     default="all",
                     help="precise action set (redesign §3): 'all' = legacy "
                          "single precise-all edge; 'pairs'/'singles' = one "
                          "edge per 2-/1-robot precise group")
-    ap.add_argument("--coupled-precise", action="store_true",
+    ap.add_argument("--coupled-precise", nargs="?", const="pinv",
+                    default=None, choices=["pinv", "group"],
                     help="physics fix (redesign §2): precise rotation is "
-                         "realised through the actuation matrix — bystanders "
-                         "side-rotate.  Off = legacy independent rotation")
+                         "realised through the actuation matrix.  'pinv' "
+                         "(the bare-flag default) = minimum-norm coupling, "
+                         "all bystanders side-rotate; 'group' = the driven "
+                         "robot's fixed size-7 block rotates uniformly with "
+                         "it.  Off = legacy independent rotation")
     ap.add_argument("--log-traces", type=str, default=None,
                     help="directory for search-trace shards (redesign §6): "
                          "every expansion + plan outcome of every planning "
@@ -359,12 +372,26 @@ def main() -> None:
         f"value={args.value_model or 'analytic'}, device={device}"
     )
 
+    if args.value_model and args.analytic_alpha_scale != 1.0:
+        ap.error("--analytic-alpha-scale scales the analytic leaf; it has no "
+                 "meaning together with --value-model")
+
     leaf_value = None
     if args.value_model:
         from robot_nav.models.MARL.capswitcher.rl.value_net import LearnedCostToGo
 
         leaf_value = LearnedCostToGo(args.value_model, device=device)
         print(f"Learned leaf: feature={leaf_value.feature}")
+    elif args.analytic_alpha_scale != 1.0:
+        from robot_nav.models.MARL.capswitcher_14.rl.forward_model import (
+            analytic_cost_to_go,
+        )
+
+        scale = float(args.analytic_alpha_scale)
+        leaf_value = lambda m, ms: analytic_cost_to_go(  # noqa: E731
+            m.goal_distances(ms), m.goal_threshold, scale * m.analytic_alpha()
+        )
+        print(f"Analytic leaf: alpha scaled x{scale}")
 
     prior = None
     if args.prior_model:
@@ -398,7 +425,7 @@ def main() -> None:
                 meta={
                     "algo": algo,
                     "precise_config": args.precise_config,
-                    "coupled": bool(args.coupled_precise),
+                    "coupled": args.coupled_precise or False,
                     "A_full": A_FULL,
                     "move_groups": [
                         [int(i) for i in coarse.members_of(g)]
@@ -412,6 +439,7 @@ def main() -> None:
                     "goal_threshold": args.goal_threshold,
                     "max_transitions": args.max_transitions,
                     "value_model": args.value_model,
+                    "analytic_alpha_scale": args.analytic_alpha_scale,
                     "prior_model": args.prior_model,
                     "base_seed": args.seed,
                     "episodes": args.episodes,

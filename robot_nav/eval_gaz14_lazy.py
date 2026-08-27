@@ -65,6 +65,9 @@ from robot_nav.models.MARL.capswitcher_14.configs import (
 from robot_nav.models.MARL.capswitcher_14.policies.coarse_steering import (
     CoarseSteering14,
 )
+from robot_nav.models.MARL.capswitcher_14.policies.group_rotation import (
+    GroupRotation,
+)
 from robot_nav.models.MARL.capswitcher_14.policies.precise_coupling import (
     PreciseCoupling,
 )
@@ -170,11 +173,22 @@ def layout_from_args(args: argparse.Namespace) -> CorridorLayout | None:
     )
 
 
+def _make_coupling(coupled: bool | str | None):
+    """Coupling object for a ``--coupled-precise`` value (falsy = legacy)."""
+    if not coupled:
+        return None
+    if coupled is True or coupled == "pinv":
+        return PreciseCoupling(A_FULL, ang_max=1.0)
+    if coupled == "group":
+        return GroupRotation(A_FULL, ang_max=1.0)
+    raise ValueError(f"unknown coupling mode {coupled!r}; use 'pinv' or 'group'")
+
+
 def build_env(
     device: torch.device, cost: SwitcherCost, goal_threshold: float,
     backbone_ckpt: str, disable_plotting: bool = True,
     layout: CorridorLayout | None = None,
-    precise_config: str = "all", coupled: bool = False,
+    precise_config: str = "all", coupled: bool | str = False,
 ) -> tuple[SwitcherEnv, CoarseSteering14, MARL_SIM_OBSTACLE]:
     """
     Construct 14-robot sim + backbone + coarse primitive + switcher env.
@@ -190,10 +204,12 @@ def build_env(
 
     ``precise_config`` / ``coupled`` (redesign §2–§3): the precise action set
     ("all" = legacy precise-all; "pairs"/"singles" = per-group edges) and the
-    coupled-rotation physics fix.  Defaults keep the **legacy** behaviour so
-    existing pipelines are bit-identical until the re-baseline is run
-    deliberately; the built env carries ``env.coupling`` / ``env.precise_groups``
-    for switcher construction.
+    coupled-rotation physics fix — ``coupled`` is falsy (legacy independent
+    rotation), ``"pinv"``/``True`` (minimum-norm ``pinv(A_S)`` coupling) or
+    ``"group"`` (uniform block rotation, ``GroupRotation``).  Defaults keep
+    the **legacy** behaviour so existing pipelines are bit-identical until the
+    re-baseline is run deliberately; the built env carries ``env.coupling`` /
+    ``env.precise_groups`` for switcher construction.
     """
     sim = MARL_SIM_OBSTACLE(
         world_file=CORRIDOR_WORLD if layout is not None else SCATTERED_WORLD,
@@ -235,7 +251,7 @@ def build_env(
         goal_threshold=goal_threshold,
         device=device,
         terminate_on_oob=False,
-        coupling=PreciseCoupling(A_FULL, ang_max=1.0) if coupled else None,
+        coupling=_make_coupling(coupled),
         precise_groups=build_precise_groups(precise_config),
     )
     return env, coarse, sim
@@ -664,10 +680,14 @@ def main() -> None:
                     help="precise action set (redesign §3): 'all' = legacy "
                          "single precise-all edge; 'pairs'/'singles' = one "
                          "edge per 2-/1-robot precise group")
-    ap.add_argument("--coupled-precise", action="store_true",
+    ap.add_argument("--coupled-precise", nargs="?", const="pinv",
+                    default=None, choices=["pinv", "group"],
                     help="physics fix (redesign §2): precise rotation is "
-                         "realised through the actuation matrix — bystanders "
-                         "side-rotate.  Off = legacy independent rotation")
+                         "realised through the actuation matrix.  'pinv' "
+                         "(the bare-flag default) = minimum-norm coupling, "
+                         "all bystanders side-rotate; 'group' = the driven "
+                         "robot's fixed size-7 block rotates uniformly with "
+                         "it.  Off = legacy independent rotation")
     ap.add_argument("--policy-seed", type=int, default=None,
                     help="seed for the Gumbel policy's per-decision noise "
                          "(default: --seed).  Give all parallel workers the "

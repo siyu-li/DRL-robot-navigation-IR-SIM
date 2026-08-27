@@ -119,10 +119,15 @@ class ForwardModel14:
         cost:               :class:`SwitcherCost` decision-pricing table (load
                             with ``SwitcherCost.from_yaml``).
         leaf_value:         Optional learned leaf evaluator ``(model, ms) -> float``.
-        coupling:           Optional :class:`PreciseCoupling` — the physics fix
+        coupling:           Optional rotation realiser — the physics fix
                             (redesign §2): precise rotation is realised through
-                            the actuation matrix, side-rotating every bystander.
-                            ``None`` keeps the legacy (physically inconsistent)
+                            the actuation matrix.  Either ``PreciseCoupling``
+                            (minimum-norm ``pinv(A_S)``; every bystander
+                            side-rotates) or ``GroupRotation`` (the driven
+                            robot's fixed size-7 block rotates uniformly with
+                            it; the other block holds still).  Both expose
+                            ``coupled_ang(members, omega)``.  ``None`` keeps
+                            the legacy (physically inconsistent)
                             independent-rotation model.
         precise_groups:     Optional list of member-index lists — the precise
                             action set (redesign §3).  ``None`` keeps the single
@@ -322,7 +327,7 @@ class ForwardModel14:
         )
         return ModelState(poses=poses, last_actions=last)
 
-    def precise_next(self, ms: ModelState) -> ModelState:
+    def precise_next(self, ms: ModelState, return_frames: bool = False):
         """
         Next state after one precise-all decision: resolve robots one at a time,
         each driven by its frozen GAT action for ``selection_interval`` sub-steps
@@ -330,9 +335,18 @@ class ForwardModel14:
 
         This is the budgeted transition (``n_precise_expansions``); the
         unbudgeted :meth:`precise_rollout` shares its body.
+
+        With ``return_frames=True`` returns ``(next_state, frames)``, the
+        frames being the executed sub-step controls of **this exact rollout**
+        (the CUDA GAT forward is non-deterministic, so a re-roll would not
+        reproduce it) — replayable verbatim by ``SwitcherEnv.step(1,
+        frames=...)``.
         """
         self.n_precise_expansions += 1
-        return self._precise_rollout(ms, record=False)[0]
+        st, _, frames = self._precise_rollout(
+            ms, record=False, record_frames=return_frames
+        )
+        return (st, frames) if return_frames else st
 
     def precise_rollout(self, ms: ModelState) -> tuple[ModelState, list]:
         """
@@ -351,15 +365,38 @@ class ForwardModel14:
             an ``(N, 2)`` array — led by the entry state as ``(-1, positions)``.
             ``driven_robot`` is the only robot that moved on that sub-step.
         """
-        return self._precise_rollout(ms, record=True)
+        st, path, _ = self._precise_rollout(ms, record=True)
+        return st, path
+
+    def precise_frames(self, ms: ModelState) -> tuple[ModelState, list]:
+        """
+        Same transition as :meth:`precise_next`, additionally returning the
+        executed sub-step controls — **not** charged to the transition budget.
+
+        The frames let ``SwitcherEnv.step(1, frames=...)`` replay this exact
+        rollout verbatim (the sim's integrator matches :meth:`_integrate`
+        bit-for-bit), instead of re-deciding skip sets and actions live —
+        removing model→sim replay divergence entirely.
+
+        Returns:
+            ``(next_state, frames)`` — ``frames`` is one ``(driven, actions)``
+            pair per sub-step: ``driven`` the list of robots commanded this
+            sub-step, ``actions`` the full (N, 2) [lin, ang] sim input as
+            nested lists.
+        """
+        st, _, frames = self._precise_rollout(
+            ms, record=False, record_frames=True
+        )
+        return st, frames
 
     def _precise_rollout(
-        self, ms: ModelState, record: bool
-    ) -> tuple[ModelState, list]:
-        """Shared body of ``precise_next`` / ``precise_rollout``."""
+        self, ms: ModelState, record: bool, record_frames: bool = False
+    ) -> tuple[ModelState, list, list]:
+        """Shared body of ``precise_next`` / ``precise_rollout`` / ``precise_frames``."""
         poses = ms.poses.copy()
         last = ms.last_actions.copy()
         path: list = [(-1, poses[:, :2].copy())] if record else []
+        frames: list = []
         # Robots already at goal are skipped (mirrors the env; they are also
         # not charged by the precise pricing).  Membership is frozen at entry —
         # a robot arriving mid-decision still finishes its own sub-steps.
@@ -385,13 +422,17 @@ class ForwardModel14:
                 last = sim_actions
                 if record:
                     path.append((int(r), poses[:, :2].copy()))
-        return ModelState(poses=poses, last_actions=last), path
+                if record_frames:
+                    frames.append(([int(r)], sim_actions.tolist()))
+        return ModelState(poses=poses, last_actions=last), path, frames
 
     # ------------------------------------------------------------------
     # Per-group precise transitions (redesign §3 — configs B/C)
     # ------------------------------------------------------------------
 
-    def precise_group_next(self, ms: ModelState, pgroup: int) -> ModelState:
+    def precise_group_next(
+        self, ms: ModelState, pgroup: int, return_frames: bool = False
+    ):
         """
         Next state after one precise decision driving precise-group ``pgroup``:
         the group's *unreached* members are driven **simultaneously** by their
@@ -403,15 +444,34 @@ class ForwardModel14:
         A budgeted transition (``n_precise_expansions``), one per edge — note
         it costs ``|driven| × selection_interval`` GAT-driven sub-steps versus
         ``n_unreached × selection_interval`` for the legacy precise-all edge.
+
+        ``return_frames=True`` → ``(next_state, frames)``; see
+        :meth:`precise_next`.
         """
         self.n_precise_expansions += 1
-        return self._precise_group_rollout(ms, pgroup, record=False)[0]
+        st, _, frames = self._precise_group_rollout(
+            ms, pgroup, record=False, record_frames=return_frames
+        )
+        return (st, frames) if return_frames else st
 
     def precise_group_rollout(
         self, ms: ModelState, pgroup: int
     ) -> tuple[ModelState, list]:
         """Un-budgeted variant returning the swept path (diagnostics only)."""
-        return self._precise_group_rollout(ms, pgroup, record=True)
+        st, path, _ = self._precise_group_rollout(ms, pgroup, record=True)
+        return st, path
+
+    def precise_group_frames(
+        self, ms: ModelState, pgroup: int
+    ) -> tuple[ModelState, list]:
+        """
+        Un-budgeted variant returning the executed sub-step controls — the
+        per-group counterpart of :meth:`precise_frames`, same frame format.
+        """
+        st, _, frames = self._precise_group_rollout(
+            ms, pgroup, record=False, record_frames=True
+        )
+        return st, frames
 
     def driven_members(self, ms: ModelState, pgroup: int) -> np.ndarray:
         """Unreached members of precise-group ``pgroup`` at ``ms``."""
@@ -420,17 +480,19 @@ class ForwardModel14:
         return members[dist[members] > self.goal_threshold]
 
     def _precise_group_rollout(
-        self, ms: ModelState, pgroup: int, record: bool
-    ) -> tuple[ModelState, list]:
-        """Shared body of ``precise_group_next`` / ``precise_group_rollout``."""
+        self, ms: ModelState, pgroup: int, record: bool,
+        record_frames: bool = False,
+    ) -> tuple[ModelState, list, list]:
+        """Shared body of ``precise_group_next`` / ``_rollout`` / ``_frames``."""
         if self.precise_groups is None:
             raise ValueError("precise_group_next requires precise_groups")
         poses = ms.poses.copy()
         last = ms.last_actions.copy()
         path: list = [(-1, poses[:, :2].copy())] if record else []
+        frames: list = []
         driven = self.driven_members(ms, pgroup)
         if driven.size == 0:          # all members reached — a no-op edge
-            return ModelState(poses=poses, last_actions=last), path
+            return ModelState(poses=poses, last_actions=last), path, frames
         driven_list = [int(r) for r in driven]
         for _ in range(self.selection_interval):
             rs = self.robot_state(ModelState(poses=poses, last_actions=last))
@@ -450,7 +512,9 @@ class ForwardModel14:
             last = sim_actions
             if record:
                 path.append((driven_list, poses[:, :2].copy()))
-        return ModelState(poses=poses, last_actions=last), path
+            if record_frames:
+                frames.append((driven_list, sim_actions.tolist()))
+        return ModelState(poses=poses, last_actions=last), path, frames
 
     def _integrate(self, poses: np.ndarray, sim_actions: np.ndarray) -> np.ndarray:
         """One unicycle sub-step for all robots (forward Euler, pre-update heading)."""

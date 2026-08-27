@@ -37,9 +37,12 @@ refuted edges is lost, which the paper explicitly permits (Σ π(n'|n) ≤ 1).
 
 **Plan-to-goal, not receding horizon.**  ``BestFirstSearch14.run`` searches
 from the root state to an in-model ``all_reached`` node and returns the whole
-decision path.  ``PlanToGoalSwitcher14`` replays that plan through the env
-one decision per ``decide`` call and re-plans from the live state only when
-the plan is exhausted before the episode ends (model–sim drift).  A
+decision path.  Every decision carries the sub-step controls recorded when
+its edge was materialised (coarse: the vetted frames; precise: the rollout's
+executed actions), so ``PlanToGoalSwitcher14`` replays the plan through the
+env **verbatim** — one decision per ``decide`` call, no GAT forward at
+execution time — and re-plans from the live state only when the plan is
+exhausted before the episode ends.  A
 transition cap bounds each planning call; on cap-hit the best generated goal
 node (if any — still an exact in-model plan) or the best partial path by
 g + h is returned and the shortfall is flagged.  Search effort is reported in
@@ -220,10 +223,18 @@ class BestFirstSearch14:
             nan = float("nan")
             for a, b in enumerate(branches):
                 if b.mode == PRECISE:
-                    child_ms = (
-                        model.precise_next(node.ms) if b.pgroup is None
-                        else model.precise_group_next(node.ms, b.pgroup)
-                    )
+                    # Record the rollout's executed controls on the stub: the
+                    # plan is replayed verbatim (the CUDA GAT forward is
+                    # non-deterministic, so a live re-decide at execution time
+                    # could not reproduce the searched transition).
+                    if b.pgroup is None:
+                        child_ms, b.frames = model.precise_next(
+                            node.ms, return_frames=True
+                        )
+                    else:
+                        child_ms, b.frames = model.precise_group_next(
+                            node.ms, b.pgroup, return_frames=True
+                        )
                     clearance = nan
                 else:
                     mv = model.coarse_move(node.ms, b.group)
@@ -313,6 +324,14 @@ class PlanToGoalSwitcher14:
     ``n_cap_hits``, ``n_fallbacks``) are diffed per episode by the eval
     harness; ``decision_transitions`` gets the planning call's transition
     count on planning decisions and 0 on replay decisions.
+
+    **Execution is verbatim**: every decision — coarse *and* precise — carries
+    the sub-step controls recorded at search materialisation, and the env
+    replays them exactly (``SwitcherEnv.step(frames=...)``).  No GAT forward
+    runs at execution time, the executed trajectory is the searched one to
+    float32-snapshot precision (~5e-7 m), and a collision during replay is a
+    property of the *plan* (the model does not vet precise sub-steps), not of
+    execution noise.  Only the empty-plan precise fallback executes live.
     """
 
     def __init__(

@@ -205,9 +205,11 @@ def main() -> None:
                     choices=["all", "pairs", "singles"], default="all",
                     help="precise action set for baseline rendering "
                          "(pairs/singles: per-group precise edges)")
-    ap.add_argument("--coupled-precise", action="store_true",
+    ap.add_argument("--coupled-precise", nargs="?", const="pinv",
+                    default=None, choices=["pinv", "group"],
                     help="physics fix (redesign §2): precise rotation couples "
-                         "through the actuation matrix")
+                         "through the actuation matrix — 'pinv' (bare-flag "
+                         "default) or 'group' (uniform block rotation)")
     ap.add_argument("--eager", action="store_true",
                     help="render GAZ14-E (GumbelSwitcher14Eager + "
                          "HeuristicPrior14) instead of the lazy switcher")
@@ -298,7 +300,7 @@ def main() -> None:
 
         print(
             f"Env: {sim.num_robots} robots, precise-only "
-            f"({'COUPLED rotation' if args.coupled_precise else 'legacy uncoupled'}), "
+            f"({'COUPLED rotation (' + args.coupled_precise + ')' if args.coupled_precise else 'legacy uncoupled'}), "
             f"precise_unit={cost.precise_unit}, device={device}\n"
             f"World: {'corridor ' + str(layout.band) if layout else 'scattered'}"
         )
@@ -359,7 +361,7 @@ def main() -> None:
             f"Env: {sim.num_robots} robots, {len(MOVE_GROUPS)} coarse groups, "
             f"precise_unit={cost.precise_unit}, "
             f"max_transitions={args.max_transitions}, device={device}\n"
-            f"Variant: baseline {args.baseline} (plan-to-goal)\n"
+            f"Variant: baseline {args.baseline} (plan-to-goal, verbatim replay)\n"
             f"World: {'corridor ' + str(layout.band) if layout else 'scattered'}\n"
             f"Prior: {args.prior_model or 'uniform'}\n"
             f"Leaf: {args.value_model or 'analytic'}"

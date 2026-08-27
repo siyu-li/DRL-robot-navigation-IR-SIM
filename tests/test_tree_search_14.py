@@ -147,9 +147,11 @@ class StubModel:
             return _StubMove(_StubCandidate(group, safe=False), None)
         return _StubMove(_StubCandidate(group, safe=True), self.state(nxt))
 
-    def precise_next(self, ms: StubState) -> StubState:
+    def precise_next(self, ms: StubState, return_frames: bool = False):
         self.n_precise_expansions += 1
-        return self.state(self._precise_next[ms.name])
+        st = self.state(self._precise_next[ms.name])
+        # Stub frames stand in for the rollout's recorded sub-step controls.
+        return (st, [f"pframes-{ms.name}"]) if return_frames else st
 
     # --- Exhaustive reference (pruning semantics: unsafe edges absent) --
 
