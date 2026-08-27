@@ -24,3 +24,4 @@ robot_nav/models/MARL/switcher/runs/switcher/len1200_decouple_couple_urgency_suc
 robot_nav/relational_encoder
 *.npz
 robot_nav/models/MARL/switcher/runs/switcher/len1500_decouple_min_success_withscalar/config.json
+*.log
