@@ -444,13 +444,14 @@ class TD3Obstacle:
             next_action = (next_action + noise).clamp(-self.max_action, self.max_action)
 
             # Target Q values
-            target_Q1, target_Q2, _, _, _, _, _, _, _ = self.critic_target(
-                next_robot_state, next_obstacle_state, next_action
-            )
-            target_Q = torch.min(target_Q1, target_Q2)
-            av_Q += target_Q.mean()
-            max_Q = max(max_Q, target_Q.max().item())
-            target_Q = reward + ((1 - done) * discount * target_Q).detach()
+            with torch.no_grad():
+                target_Q1, target_Q2, _, _, _, _, _, _, _ = self.critic_target(
+                    next_robot_state, next_obstacle_state, next_action
+                )
+                target_Q = torch.min(target_Q1, target_Q2)
+                av_Q += target_Q.mean().item()
+                max_Q = max(max_Q, target_Q.max().item())
+                target_Q = reward + (1 - done) * discount * target_Q
 
             # Critic update
             (
@@ -488,15 +489,15 @@ class TD3Obstacle:
                 hard_logits_ro.flatten(), targets_ro
             )
 
-            av_critic_bce_loss_rr.append(bce_loss_rr)
-            av_critic_bce_loss_ro.append(bce_loss_ro)
+            av_critic_bce_loss_rr.append(bce_loss_rr.item())
+            av_critic_bce_loss_ro.append(bce_loss_ro.item())
 
             total_loss = (
                 critic_loss
                 - entropy_weight * mean_entropy
                 + bce_weight * (bce_loss_rr + bce_loss_ro)
             )
-            av_critic_entropy.append(mean_entropy)
+            av_critic_entropy.append(mean_entropy.item())
 
             self.critic_optimizer.zero_grad()
             total_loss.backward()
@@ -534,8 +535,8 @@ class TD3Obstacle:
                     hard_logits_ro.flatten(), targets_ro
                 )
 
-                av_actor_bce_loss_rr.append(bce_loss_rr)
-                av_actor_bce_loss_ro.append(bce_loss_ro)
+                av_actor_bce_loss_rr.append(bce_loss_rr.item())
+                av_actor_bce_loss_ro.append(bce_loss_ro.item())
 
                 actor_Q, _, _, _, _, _, _, _, _ = self.critic(
                     robot_state, obstacle_state, action_pred
@@ -548,7 +549,7 @@ class TD3Obstacle:
                     - entropy_weight * mean_entropy
                     + bce_weight * (bce_loss_rr + bce_loss_ro)
                 )
-                av_actor_entropy.append(mean_entropy)
+                av_actor_entropy.append(mean_entropy.item())
 
                 self.actor_optimizer.zero_grad()
                 total_loss.backward()
