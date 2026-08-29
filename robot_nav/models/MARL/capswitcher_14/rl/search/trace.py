@@ -27,7 +27,14 @@ constants) and one ``plan_<ep>_<dec>.npz`` per planning call:
               br_group / br_pgroup (int16, −1 = n/a), br_step_cost (f32),
               br_safe (bool), br_clearance (f32, NaN for precise),
               br_child_g / br_child_h (f32, NaN if refuted/dead-end),
-              br_child_terminal / br_child_collision (bool)
+              br_child_terminal / br_child_collision (bool),
+              br_child_poses (f32 [B,N,3]) / br_child_last (f32 [B,N,2]) —
+              the materialised child *state* exactly as the search scored it
+              (collision dead-ends included; NaN only for refuted coarse
+              vets, which never materialise).  Stored because the CUDA GAT
+              forward is non-bit-reproducible: precise children cannot be
+              regenerated exactly, and sub-searches / sibling resolution must
+              start from the state the teacher actually evaluated.
     plan:     solved, cap_hit (bool), plan_cost (f32),
               goal_parent_row / goal_aidx (int32, −1 = none; the goal/best
               node is a *generated* child — terminals are never expanded —
@@ -37,7 +44,8 @@ constants) and one ``plan_<ep>_<dec>.npz`` per planning call:
               goals (f32 [N,2]), obstacle_xy (f32 [M_o,2]),
               obstacle_r (f32 [M_o]), rho (f32)
 
-Cost: an expanded node is ~1.2 KB; a cap-5000 A* plan is a few hundred KB.
+Cost: an expanded node is ~1.2 KB + ~6.4 KB of child states (23 × 280 B);
+a cap-5000 A* plan is ~1–1.5 MB compressed.
 """
 
 from __future__ import annotations
@@ -92,18 +100,25 @@ class TraceRecorder:
         self._poses: list[np.ndarray] = []
         self._last: list[np.ndarray] = []
         self._branches: list[tuple] = []
+        self._bposes: list[np.ndarray | None] = []
+        self._blast: list[np.ndarray | None] = []
         self._goals = np.asarray(model.goals, dtype=np.float32)
         self._obstacle_xy = np.asarray(model.geom.obstacle_xy, dtype=np.float32)
         self._obstacle_r = np.asarray(model.geom.obstacle_r, dtype=np.float32)
         self._rho = float(model.geom.rho)
 
-    def record_expansion(self, node, branch_rows: list[tuple]) -> None:
+    def record_expansion(
+        self, node, branch_rows: list[tuple], branch_states: list | None = None
+    ) -> None:
         """
         Register ``node`` (a ``BFSNode`` being expanded) and its branch table.
 
         ``branch_rows`` entries: ``(mode, group, pgroup, step_cost, safe,
         clearance, child_g, child_h, child_terminal, child_collision)`` —
         one per stub, in stub order (so branch indices match the search's).
+        ``branch_states`` (parallel to ``branch_rows``): the materialised
+        child ``ModelState`` per stub, or ``None`` where no child exists
+        (refuted coarse vet).
         """
         if not self._active:
             return
@@ -115,8 +130,17 @@ class TraceRecorder:
         )
         self._poses.append(np.asarray(node.ms.poses, dtype=np.float32))
         self._last.append(np.asarray(node.ms.last_actions, dtype=np.float32))
-        for b in branch_rows:
+        if branch_states is None:
+            branch_states = [None] * len(branch_rows)
+        for b, cms in zip(branch_rows, branch_states):
             self._branches.append((row, *b))
+            self._bposes.append(
+                None if cms is None else np.asarray(cms.poses, dtype=np.float32)
+            )
+            self._blast.append(
+                None if cms is None
+                else np.asarray(cms.last_actions, dtype=np.float32)
+            )
 
     def end_plan(self, result, goal_node) -> None:
         """
@@ -158,6 +182,8 @@ class TraceRecorder:
             br_child_h=np.array([r[8] for r in b], dtype=np.float32),
             br_child_terminal=np.array([r[9] for r in b], dtype=bool),
             br_child_collision=np.array([r[10] for r in b], dtype=bool),
+            br_child_poses=_stack_optional(self._bposes, self._poses, 3),
+            br_child_last=_stack_optional(self._blast, self._last, 2),
             solved=np.bool_(result.solved),
             cap_hit=np.bool_(result.cap_hit),
             plan_cost=np.float32(result.plan_cost),
@@ -183,6 +209,21 @@ class TraceRecorder:
             return -1, -1
         parent_row = self._rows.get(id(node.parent), -1)
         return parent_row, int(getattr(node, "aidx", -1))
+
+
+def _stack_optional(
+    items: list, node_arrays: list, dim: int
+) -> np.ndarray:
+    """
+    Stack per-branch child arrays into ``(B, N, dim)`` f32, NaN rows where a
+    branch materialised no child.  ``node_arrays`` supplies N (robot count).
+    """
+    n = node_arrays[0].shape[0] if node_arrays else 0
+    out = np.full((len(items), n, dim), np.nan, dtype=np.float32)
+    for i, x in enumerate(items):
+        if x is not None:
+            out[i] = x
+    return out
 
 
 def load_plan(path: str | Path) -> dict:

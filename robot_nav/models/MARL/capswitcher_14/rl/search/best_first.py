@@ -210,8 +210,10 @@ class BestFirstSearch14:
                 np.asarray(self.prior(model, node.ms, branches), dtype=np.float64)
             )
             branch_rows: list[tuple] = []       # recorder rows, stub order
+            branch_states = []                  # child ModelState/None, stub order
 
-            def rec(b, safe, clearance, child_g, child_h, terminal, collision):
+            def rec(b, safe, clearance, child_g, child_h, terminal, collision,
+                    child_ms=None):
                 branch_rows.append((
                     b.mode,
                     -1 if b.group is None else b.group,
@@ -219,6 +221,7 @@ class BestFirstSearch14:
                     b.step_cost, safe, clearance,
                     child_g, child_h, terminal, collision,
                 ))
+                branch_states.append(child_ms)
 
             nan = float("nan")
             for a, b in enumerate(branches):
@@ -248,7 +251,7 @@ class BestFirstSearch14:
                 terminal = model.all_reached(child_ms)
                 if not terminal and model.collision_pred(child_ms):
                     rec(b, True, clearance, node.g + b.step_cost, nan,
-                        False, True)
+                        False, True, child_ms)
                     continue              # dead end (precise is never vetted)
                 child = BFSNode(
                     child_ms,
@@ -261,7 +264,8 @@ class BestFirstSearch14:
                     terminal=terminal,
                     aidx=a,
                 )
-                rec(b, True, clearance, child.g, child.h, terminal, False)
+                rec(b, True, clearance, child.g, child.h, terminal, False,
+                    child_ms)
                 if terminal and (best_goal is None or child.g < best_goal.g):
                     best_goal = child
                 if child.g + child.h < best_partial.g + best_partial.h:
@@ -271,7 +275,7 @@ class BestFirstSearch14:
                 tiebreak += 1
             expansions += 1
             if self.recorder is not None:
-                self.recorder.record_expansion(node, branch_rows)
+                self.recorder.record_expansion(node, branch_rows, branch_states)
 
         def finish(result: PlanResult, goal_node: BFSNode | None) -> PlanResult:
             if self.recorder is not None:

@@ -242,16 +242,37 @@ Split **by episode**, stratified by world (never straddle a plan).  Gates:
 ## 5. Sibling resolution (subsample; runs while training starts)
 
 The only source of **exact** off-path values: for a stratified subsample of
-on-path nodes (~2–5/solved episode, stratified by depth × n_unreached),
-reconstruct each of the 23 children (replay the branch action through
-`ForwardModel14` from the stored parent poses/last_actions — deterministic),
-and run an independent A\* from each child to convergence at the main cap.
-Store per node: 23 × (solved, plan_cost) → exact sibling values.
+expanded nodes, run an independent A\* from each of the 23 children to
+convergence at the main cap.  Store per node: 23 × (solved, plan_cost) →
+exact sibling values.
+
+* **Child states come from the traces, not regeneration** (schema 2,
+  2026-08-29): `br_child_poses`/`br_child_last` store every materialised
+  child exactly as the search scored it — collision dead-ends included, NaN
+  only for refuted coarse vets.  This exists because the CUDA GAT forward is
+  non-bit-reproducible: precise children cannot be re-rolled exactly.
+  Verified: NaN placement matches refuted vets; stored child states are
+  bit-exact against the node rows of children that were later expanded.
+  Shard meta now records `backbone_ckpt`/`device`/`torch_version`.
+  **Pilot traces are schema 1 (no child states)** — usable for value/
+  ranking/hinge/feasibility labels, but sibling resolution runs on
+  schema-2 corpus traces only.
+* **Stratify toward plateau nodes**, not uniformly along paths: the
+  seed-2004 dissection showed cap-hit endgame plans flood BFS-like shells
+  where f spreads only ~1–2 decision costs across 218 expansions — exactly
+  the blocking/jiggle states where Σd has no gradient, labels don't exist,
+  and sibling ranking is the value net's actual job.  Plateau nodes are
+  identifiable offline (low f-spread across a node's children / across the
+  plan's expansions); sample ~half the resolution budget from them,
+  the rest by depth × n_unreached.
 
 Needs a small new script (`collect_sibling_values.py`: read trace shards +
-meta, rebuild model per plan constants, loop).  Cost ≈ 23 × a main-corpus
-search per resolved node — budget from pilot wall-clock; ~1–2k resolved
-nodes is the target for the ranking gate + high-weight training slice.
+meta, rebuild model per plan constants, seed sub-searches from the stored
+child states, loop).  Consistency gate per resolved node: recompute h and
+terminal/collision flags from the stored child state and compare to the
+logged `br_child_h`/flags — disagreement → drop the node.  Cost ≈ 23 × a
+main-corpus search per resolved node — budget from pilot wall-clock; ~1–2k
+resolved nodes is the target for the ranking gate + high-weight slice.
 
 ## 6. Round 1+ (after first net)
 

@@ -442,6 +442,12 @@ def main() -> None:
                     "analytic_alpha_scale": args.analytic_alpha_scale,
                     "prior_model": args.prior_model,
                     "base_seed": args.seed,
+                    # Provenance for regenerating/auditing child states: the
+                    # precise children are functions of the GAT weights.
+                    "backbone_ckpt": args.backbone_ckpt,
+                    "device": str(device),
+                    "torch_version": __import__("torch").__version__,
+                    "trace_schema": 2,
                     "episodes": args.episodes,
                     "world": "corridor" if layout is not None else "scattered",
                 },
