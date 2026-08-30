@@ -448,6 +448,10 @@ def main() -> None:
                     "device": str(device),
                     "torch_version": __import__("torch").__version__,
                     "trace_schema": 3,
+                    # Precise rollouts truncate at the first colliding
+                    # sub-step; shards collected without this flag explored
+                    # branches this search prunes — do not mix corpora.
+                    "substep_collision": True,
                     # Offline model reconstruction (collect_sibling_values):
                     "step_time": getattr(coarse, "step_time", 0.3),
                     "lin_max": getattr(coarse, "lin_max", 0.5),

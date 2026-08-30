@@ -248,11 +248,14 @@ class BestFirstSearch14:
                     b.frames = mv.candidate.frames
                     b.candidate = mv.candidate
                     child_ms = mv.next_state
-                terminal = model.all_reached(child_ms)
-                if not terminal and model.collision_pred(child_ms):
+                # Collision wins over goal-reached (the sim ends a colliding
+                # episode as a failure): with sub-step truncation a precise
+                # child's end state is the colliding state itself.
+                if model.collision_pred(child_ms):
                     rec(b, True, clearance, node.g + b.step_cost, nan,
                         False, True, child_ms)
-                    continue              # dead end (precise is never vetted)
+                    continue              # dead end (no d_safe margin on precise)
+                terminal = model.all_reached(child_ms)
                 child = BFSNode(
                     child_ms,
                     g=node.g + b.step_cost,
@@ -332,10 +335,11 @@ class PlanToGoalSwitcher14:
     **Execution is verbatim**: every decision — coarse *and* precise — carries
     the sub-step controls recorded at search materialisation, and the env
     replays them exactly (``SwitcherEnv.step(frames=...)``).  No GAT forward
-    runs at execution time, the executed trajectory is the searched one to
-    float32-snapshot precision (~5e-7 m), and a collision during replay is a
-    property of the *plan* (the model does not vet precise sub-steps), not of
-    execution noise.  Only the empty-plan precise fallback executes live.
+    runs at execution time and the executed trajectory is the searched one to
+    float32-snapshot precision (~5e-7 m).  Precise rollouts collision-check
+    every sub-step endpoint (the same states the sim evaluates), so a replayed
+    plan cannot collide except through that ~5e-7 snapshot error on a
+    razor-thin margin.  Only the empty-plan precise fallback executes live.
     """
 
     def __init__(

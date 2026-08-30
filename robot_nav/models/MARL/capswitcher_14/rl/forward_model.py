@@ -264,6 +264,28 @@ class ForwardModel14:
                 return True
         return False
 
+    def _substep_collision(self, poses: np.ndarray, driven: np.ndarray) -> bool:
+        """
+        :meth:`collision_pred` restricted to the robots that moved this
+        sub-step.  Bystanders never translate inside a precise rollout, so a
+        pair not involving a driven robot cannot have changed since the entry
+        state (which the search already knows is collision-free) — checking
+        driven-vs-all covers every pair the sub-step could have broken.
+        """
+        pos = poses[:, :2]
+        dpos = pos[driven]
+        d = np.linalg.norm(dpos[:, None, :] - pos[None, :, :], axis=2)
+        d[np.arange(len(driven)), driven] = np.inf
+        if d.min() < 2.0 * self.geom.rho:
+            return True
+        if self.geom.obstacle_xy.shape[0] > 0:
+            od = np.linalg.norm(
+                dpos[:, None, :] - self.geom.obstacle_xy[None, :, :], axis=2
+            )
+            if (od - self.geom.obstacle_r[None, :] - self.geom.rho).min() < 0.0:
+                return True
+        return False
+
     # ------------------------------------------------------------------
     # Transitions (single-edge — the budgeted operations)
     # ------------------------------------------------------------------
@@ -331,7 +353,10 @@ class ForwardModel14:
         """
         Next state after one precise-all decision: resolve robots one at a time,
         each driven by its frozen GAT action for ``selection_interval`` sub-steps
-        while the others hold still, integrating unicycle dynamics.
+        while the others hold still, integrating unicycle dynamics.  The rollout
+        truncates at the first colliding sub-step, so a mid-decision clip
+        surfaces as a colliding end state (caught by the search's endpoint
+        ``collision_pred``) instead of being integrated through.
 
         This is the budgeted transition (``n_precise_expansions``); the
         unbudgeted :meth:`precise_rollout` shares its body.
@@ -353,11 +378,12 @@ class ForwardModel14:
         Same transition as :meth:`precise_next`, additionally returning the
         swept path — **not** charged to the transition budget (diagnostics only).
 
-        Unlike coarse, precise is never shield-vetted: the search only sees the
-        end state (via :meth:`collision_pred`), so the sub-steps in between are
-        invisible to it.  The path exposes them, letting an offline vet score
-        precise with the same swept-clearance criterion the shield applies to
-        coarse (``robot_nav/eval_feasibility_14.py``).
+        Precise is not shield-vetted (no ``d_safe`` margin), but every sub-step
+        endpoint is collision-checked and the rollout truncates at the first
+        hit — exactly the states the sim evaluates during verbatim replay, so
+        an in-model-clean rollout cannot collide in the sim.  The path exposes
+        the sub-steps for offline scoring with the shield's swept-clearance
+        criterion (``robot_nav/eval_feasibility_14.py``).
 
         Returns:
             ``(next_state, path)`` where ``path`` is a list of
@@ -424,6 +450,12 @@ class ForwardModel14:
                     path.append((int(r), poses[:, :2].copy()))
                 if record_frames:
                     frames.append(([int(r)], sim_actions.tolist()))
+                # The sim evaluates collision at every sub-step state; a
+                # rollout that clips a robot/obstacle mid-decision truncates
+                # here, so the returned end state *is* the colliding state and
+                # the search's endpoint collision_pred flags the branch.
+                if self._substep_collision(poses, np.array([int(r)])):
+                    return ModelState(poses=poses, last_actions=last), path, frames
         return ModelState(poses=poses, last_actions=last), path, frames
 
     # ------------------------------------------------------------------
@@ -514,6 +546,10 @@ class ForwardModel14:
                 path.append((driven_list, poses[:, :2].copy()))
             if record_frames:
                 frames.append((driven_list, sim_actions.tolist()))
+            # Truncate at the first colliding sub-step (see _precise_rollout);
+            # driven-vs-all also covers driven-vs-driven pairs.
+            if self._substep_collision(poses, driven):
+                break
         return ModelState(poses=poses, last_actions=last), path, frames
 
     def _integrate(self, poses: np.ndarray, sim_actions: np.ndarray) -> np.ndarray:

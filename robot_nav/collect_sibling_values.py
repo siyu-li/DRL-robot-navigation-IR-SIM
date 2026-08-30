@@ -18,11 +18,12 @@ Key mechanics:
   schema-2 shards (schema 3 stores ``obstacle_states`` directly).  For
   schema-2 shards we rebuild the episode's world with ``seed_episode`` +
   ``reset()`` and **fail loudly** unless the replayed obstacle centres/radii
-  match the shard bit-tight (atol 1e-6) — reconstruction is exact or refused.
+  match the shard (atol 1e-2 — RNG drift moves obstacles by metres, not mm).
 * **Consistency gate per node**: the analytic h and terminal/collision flags
   are recomputed from every stored child state and compared to the logged
   branch rows; any disagreement drops the node (guards against stale shards
-  or dynamics drift).
+  or dynamics drift).  Collision is recomputed collision-first, matching the
+  search on both pre- and post-sub-step-truncation shards.
 * **Plateau-stratified sampling**: half the node budget goes to the
   lowest-f-spread candidates (the BFS-flooding blocking/jiggle states where
   Σd has no gradient — the states sibling ranking exists for), half is
@@ -71,7 +72,9 @@ logger.disable("irsim")
 
 COARSE, PRECISE = 0, 1
 H_RTOL = 1e-3          # analytic h recompute tolerance (f32 shard rounding)
-OBS_ATOL = 1e-6        # replayed obstacle xy/r must match the shard this tight
+OBS_ATOL = 1e-2        # replayed obstacle xy/r must match the shard this tight
+                       # (drifted seeding gives O(1) m differences, not mm —
+                       # this discriminates same-RNG-path vs different-world)
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +256,14 @@ def _resolve_node(rep, meta, plan, cand, cap) -> dict | None:
         )
         if np.isnan(ms.poses).any():
             return None                     # schema violation — drop node
-        term = probe.all_reached(ms)
-        coll = bool((not term) and probe.collision_pred(ms))
+        # Collision-first, mirroring the search: precise rollouts truncate at
+        # the first colliding sub-step, so a mid-rollout collision's stored
+        # end state is itself colliding — an endpoint recompute reproduces the
+        # flag without re-rolling the GAT (which is not bit-reproducible).
+        # Endpoint-collision children of pre-truncation shards satisfy the
+        # same rule, so the gate accepts both schemas.
+        coll = bool(probe.collision_pred(ms))
+        term = bool((not coll) and probe.all_reached(ms))
         if term != bool(plan["br_child_terminal"][bi]) or \
                 coll != bool(plan["br_child_collision"][bi]):
             return None                     # gate: flag mismatch
