@@ -42,7 +42,12 @@ constants) and one ``plan_<ep>_<dec>.npz`` per planning call:
               expansions, n_coarse_vets, n_precise_expansions (int32),
               episode, seed, decision_index (int32),
               goals (f32 [N,2]), obstacle_xy (f32 [M_o,2]),
-              obstacle_r (f32 [M_o]), rho (f32)
+              obstacle_r (f32 [M_o]), rho (f32),
+              obstacle_states (f32 [M_o,4], schema 3+) — the [x, y, cosθ,
+              sinθ] observations the GAT consumed.  θ is world-random and
+              NOT derivable from obstacle_xy, so schema-2 shards need the
+              seed_episode-replay reconstruction in
+              ``collect_sibling_values.py`` to rebuild GAT inputs.
 
 Cost: an expanded node is ~1.2 KB + ~6.4 KB of child states (23 × 280 B);
 a cap-5000 A* plan is ~1–1.5 MB compressed.
@@ -106,6 +111,7 @@ class TraceRecorder:
         self._obstacle_xy = np.asarray(model.geom.obstacle_xy, dtype=np.float32)
         self._obstacle_r = np.asarray(model.geom.obstacle_r, dtype=np.float32)
         self._rho = float(model.geom.rho)
+        self._obstacle_states = np.asarray(model.obstacle_states, dtype=np.float32)
 
     def record_expansion(
         self, node, branch_rows: list[tuple], branch_states: list | None = None
@@ -199,6 +205,7 @@ class TraceRecorder:
             obstacle_xy=self._obstacle_xy,
             obstacle_r=self._obstacle_r,
             rho=np.float32(self._rho),
+            obstacle_states=self._obstacle_states,
         )
 
     # -- helpers ---------------------------------------------------------

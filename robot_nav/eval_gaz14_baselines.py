@@ -447,7 +447,16 @@ def main() -> None:
                     "backbone_ckpt": args.backbone_ckpt,
                     "device": str(device),
                     "torch_version": __import__("torch").__version__,
-                    "trace_schema": 2,
+                    "trace_schema": 3,
+                    # Offline model reconstruction (collect_sibling_values):
+                    "step_time": getattr(coarse, "step_time", 0.3),
+                    "lin_max": getattr(coarse, "lin_max", 0.5),
+                    "ang_max": getattr(coarse, "ang_max", 1.0),
+                    "cost_config": args.cost_config,
+                    "group_costs": {
+                        int(g): env.cost.coarse_cost(g)
+                        for g in coarse.selectable_groups()
+                    },
                     "episodes": args.episodes,
                     "world": "corridor" if layout is not None else "scattered",
                 },
