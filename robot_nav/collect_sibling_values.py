@@ -340,8 +340,9 @@ def main() -> None:
         raise SystemExit("learned-h teacher traces are out of scope")
     cap = args.max_transitions or int(meta["max_transitions"])
     device = resolve_device(args.device)
-    cost = SwitcherCost.from_yaml(meta.get(
-        "cost_config", "robot_nav/models/MARL/capswitcher_14/cost_14robots.yaml"))
+    cost = SwitcherCost.from_yaml(
+        meta.get("cost_config")      # schema-2 shards store an explicit null
+        or "robot_nav/models/MARL/capswitcher_14/cost_14robots.yaml")
     assert abs(cost.precise_unit - meta["precise_unit"]) < 1e-9, \
         "cost YAML drifted from the shard meta"
 
