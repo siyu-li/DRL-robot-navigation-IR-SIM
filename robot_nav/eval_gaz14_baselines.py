@@ -44,10 +44,33 @@ Usage (run on the GPU box — local irsim step crashes; see project memory):
         --prior-model runs/gaz14_value/cycle_05_prior/prior_best.pt \
         --value-model robot_nav/models/MARL/capswitcher/checkpoint/value_local/value_geometry.pt
 
-    # 4 workers over the same 100 episodes (disjoint seed blocks), then merge:
+    # 4 workers over the same 100 episodes (disjoint seed blocks), then merge.
+    # Only --seed differs between workers; every planner flag (here
+    # --max-transitions, --prior-model, --value-model — plus any world flags)
+    # must be identical, or the merged rows mix configurations.
+    mkdir -p runs/baselines14
     for S in 1000 1025 1050 1075; do
         python -m robot_nav.eval_gaz14_baselines --algos astar --episodes 25 \
-            --seed $S --out runs/baselines14 <shared flags> &
+            --seed $S --max-transitions 5000 \
+            --prior-model runs/gaz14_value/cycle_05_prior/prior_best.pt \
+            --value-model robot_nav/models/MARL/capswitcher/checkpoint/value_local/value_geometry.pt \
+            --out runs/baselines14 > runs/baselines14/astart_$S.log 2>&1 &
+    done; wait
+    
+    for S in 1000 1025 1050 1075; do
+        python -m robot_nav.eval_gaz14_baselines --algos phs --episodes 25 \
+            --seed $S --max-transitions 5000 \
+            --prior-model runs/gaz14_value/cycle_05_prior/prior_best.pt \
+            --value-model robot_nav/models/MARL/capswitcher/checkpoint/value_local/value_geometry.pt \
+            --out runs/baselines14 > runs/baselines14/phs_$S.log 2>&1 &
+    done; wait
+    
+    for S in 1000 1025 1050 1075; do
+        python -m robot_nav.eval_gaz14_baselines --algos phs-star --episodes 25 \
+            --seed $S --max-transitions 5000 \
+            --prior-model runs/gaz14_value/cycle_05_prior/prior_best.pt \
+            --value-model robot_nav/models/MARL/capswitcher/checkpoint/value_local/value_geometry.pt \
+            --out runs/baselines14 > runs/baselines14/phs-star_$S.log 2>&1 &
     done; wait
     python -m robot_nav.eval_gaz14_baselines --merge runs/baselines14
 """
