@@ -24,10 +24,14 @@ Key mechanics:
   branch rows; any disagreement drops the node (guards against stale shards
   or dynamics drift).  Collision is recomputed collision-first, matching the
   search on both pre- and post-sub-step-truncation shards.
-* **Plateau-stratified sampling**: half the node budget goes to the
-  lowest-f-spread candidates (the BFS-flooding blocking/jiggle states where
-  Σd has no gradient — the states sibling ranking exists for), half is
-  stratified over depth × n_unreached buckets.
+* **Endgame sampling** (2026-08-30, replacing the earlier lowest-f-spread
+  plateau pool): candidates are filtered to the **second half of their
+  episode** — a node's position is (decisions executed before its plan +
+  its depth in the plan tree) / the episode's executed decisions.  Trace
+  analysis showed search confusion (flat-f nodes, fallback decisions) is an
+  endgame phenomenon, while low *coarse* f-spread early in episodes is
+  benign symmetry.  Within the second half, sampling is stratified over
+  depth × n_unreached buckets (``f_spread`` is still logged per node).
 
 Output: one JSON line per resolved node in ``<out>/resolution_<shard>.jsonl``
 with the trace file, node row, and per-child ``(aidx, mode, group, status,
@@ -46,6 +50,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -110,44 +115,49 @@ def _node_candidates(plan: dict, path: str, goal_threshold: float) -> list[dict]
     return out
 
 
+def _n_executed(plan: dict) -> int:
+    """Executed decisions of one planning call: the on-path chain length
+    (root -> goal/best node), or 1 for an empty plan (live fallback)."""
+    n, r = 0, int(plan["goal_parent_row"])
+    while r != -1:
+        n += 1
+        r = int(plan["parent_row"][r])
+    return max(1, n)
+
+
 def _sample_nodes(
-    cands: list[dict], n_nodes: int, plateau_frac: float, rng, per_plan: int
+    cands: list[dict], n_nodes: int, min_frac: float, rng, per_plan: int
 ) -> list[dict]:
-    """Half budget from lowest f-spread, rest stratified depth × n_unreached."""
-    # cap per plan so coverage spreads across episodes
+    """Endgame nodes (episode position >= min_frac), stratified over
+    depth × n_unreached terciles with a per-plan cap."""
+    endgame = [c for c in cands if c["ep_frac"] >= min_frac]
     by_plan: dict[str, int] = {}
     kept = []
-    order = rng.permutation(len(cands))
+    order = rng.permutation(len(endgame))
     for i in order:
-        c = cands[i]
+        c = endgame[i]
         if by_plan.get(c["file"], 0) < per_plan:
             by_plan[c["file"]] = by_plan.get(c["file"], 0) + 1
             kept.append(c)
-    n_plateau = int(round(n_nodes * plateau_frac))
-    kept.sort(key=lambda c: c["f_spread"])
-    plateau = kept[:n_plateau]
-    rest = kept[n_plateau:]
-    if not rest:
-        return plateau
-    # stratify remainder over depth/n_unreached terciles
-    depths = np.array([c["depth"] for c in rest])
-    unre = np.array([c["n_unreached"] for c in rest])
+    if len(kept) <= n_nodes:
+        return kept
+    depths = np.array([c["depth"] for c in kept])
+    unre = np.array([c["n_unreached"] for c in kept])
     db = np.searchsorted(np.quantile(depths, [1 / 3, 2 / 3]), depths)
     ub = np.searchsorted(np.quantile(unre, [1 / 3, 2 / 3]), unre)
     buckets: dict[tuple, list] = {}
-    for c, b in zip(rest, zip(db, ub)):
+    for c, b in zip(kept, zip(db, ub)):
         buckets.setdefault(b, []).append(c)
     for b in buckets.values():
         rng.shuffle(b)
-    picked, i = [], 0
-    while len(picked) < n_nodes - len(plateau) and any(buckets.values()):
+    picked: list[dict] = []
+    while len(picked) < n_nodes and any(buckets.values()):
         for b in list(buckets):
             if buckets[b]:
                 picked.append(buckets[b].pop())
-                if len(picked) >= n_nodes - len(plateau):
+                if len(picked) >= n_nodes:
                     break
-        i += 1
-    return plateau + picked
+    return picked
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +305,7 @@ def _resolve_node(rep, meta, plan, cand, cap) -> dict | None:
     return {
         "file": cand["file"], "row": row, "depth": cand["depth"],
         "n_unreached": cand["n_unreached"], "f_spread": cand["f_spread"],
+        "ep_frac": cand["ep_frac"],
         "episode": int(plan["episode"]), "seed": int(plan["seed"]),
         "decision_index": int(plan["decision_index"]),
         "children": children,
@@ -308,7 +319,9 @@ def main() -> None:
     ap.add_argument("--out", type=str, required=True)
     ap.add_argument("--nodes", type=int, default=200,
                     help="total nodes to resolve (across all shards)")
-    ap.add_argument("--plateau-frac", type=float, default=0.5)
+    ap.add_argument("--min-episode-frac", type=float, default=0.5,
+                    help="keep only nodes in this tail of the episode "
+                         "(0.5 = second half, the confusion endgame)")
     ap.add_argument("--per-plan", type=int, default=2,
                     help="max sampled nodes per planning call")
     ap.add_argument("--max-transitions", type=int, default=0,
@@ -334,15 +347,31 @@ def main() -> None:
 
     files = sorted(glob.glob(str(Path(args.traces) / "*" / "plan_*.npz")))
     print(f"{len(files)} plans; enumerating candidates ...")
-    cands = []
+    # group planning calls by episode so each node gets an episode position:
+    # (decisions executed before its plan + node depth) / total decisions
+    episodes: dict[tuple, list[str]] = {}
     for f in files:
-        plan = load_plan(f)
-        if "br_child_poses" not in plan:
+        m = re.search(r"plan_ep(\d+)_d(\d+)\.npz$", f)
+        episodes.setdefault((str(Path(f).parent), int(m.group(1))), []).append(f)
+    cands = []
+    for key in sorted(episodes):
+        eps_files = sorted(episodes[key],
+                           key=lambda f: int(re.search(r"_d(\d+)\.npz$", f)
+                                             .group(1)))
+        plans = [load_plan(f) for f in eps_files]
+        if any("br_child_poses" not in p for p in plans):
             continue                        # schema-1 shard: cannot resolve
-        cands.extend(_node_candidates(plan, f, float(meta["goal_threshold"])))
+        lengths = [_n_executed(p) for p in plans]
+        total = sum(lengths)
+        offset = 0
+        for f, plan, ln in zip(eps_files, plans, lengths):
+            for c in _node_candidates(plan, f, float(meta["goal_threshold"])):
+                c["ep_frac"] = (offset + c["depth"]) / total
+                cands.append(c)
+            offset += ln
     print(f"{len(cands)} candidate nodes")
     rng = np.random.default_rng(args.sample_seed)
-    sampled = _sample_nodes(cands, args.nodes, args.plateau_frac, rng,
+    sampled = _sample_nodes(cands, args.nodes, args.min_episode_frac, rng,
                             args.per_plan)
     mine = [c for i, c in enumerate(sampled)
             if i % args.num_shards == args.shard_index]
@@ -365,6 +394,7 @@ def main() -> None:
             n_done += 1
             print(f"[{n_done}/{len(mine)}] row {rec['row']} "
                   f"seed {rec['seed']} d{rec['decision_index']} "
+                  f"ep_frac {rec['ep_frac']:.2f} "
                   f"f_spread {rec['f_spread']:.1f}")
     print(f"done: {n_done} resolved, {n_dropped} dropped (gate), -> {out_path}")
 
